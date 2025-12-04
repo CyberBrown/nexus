@@ -1,0 +1,207 @@
+// Environment bindings
+export interface Env {
+  DB: D1Database;
+  KV: KVNamespace;
+  ENVIRONMENT: string;
+  INBOX_MANAGER: DurableObjectNamespace;
+  ANTHROPIC_API_KEY: string;
+}
+
+// AI Classification types
+export interface ClassificationResult {
+  type: 'task' | 'event' | 'idea' | 'reference' | 'someday';
+  domain: 'work' | 'personal' | 'side_project' | 'family' | 'health';
+  title: string;
+  description: string | null;
+  urgency: number; // 1-5
+  importance: number; // 1-5
+  due_date: string | null; // ISO date
+  due_time: string | null; // ISO time
+  contexts: string[]; // ["@phone", "@computer", "@errands"]
+  people: string[]; // names mentioned
+  project_id: string | null; // matched project
+  confidence_score: number; // 0-1
+}
+
+// Context variables (set by middleware)
+export interface Variables {
+  tenantId: string;
+  userId: string;
+}
+
+// App type for Hono
+export type AppType = { Bindings: Env; Variables: Variables };
+
+// Base entity with common fields
+export interface BaseEntity {
+  id: string;
+  tenant_id: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
+// Tenant
+export interface Tenant extends Omit<BaseEntity, 'tenant_id'> {
+  name: string;
+  encryption_key_ref: string;
+  settings: string | null;
+}
+
+// User
+export interface User extends BaseEntity {
+  user_id?: string; // Some tables use user_id
+  email: string;
+  name: string;
+  role: string;
+  preferences: string | null;
+  timezone: string;
+}
+
+// Inbox Item
+export interface InboxItem extends BaseEntity {
+  user_id: string;
+  source_type: string;
+  source_id: string | null;
+  source_platform: string | null;
+  raw_content: string; // encrypted
+  processed_content: string | null; // encrypted
+  ai_classification: string | null;
+  confidence_score: number | null;
+  status: 'pending' | 'processed' | 'dismissed' | 'promoted';
+  promoted_to_type: string | null;
+  promoted_to_id: string | null;
+  user_overrides: string | null;
+  captured_at: string;
+  processed_at: string | null;
+}
+
+// Task
+export interface Task extends BaseEntity {
+  user_id: string;
+  title: string; // encrypted
+  description: string | null; // encrypted
+  parent_task_id: string | null;
+  project_id: string | null;
+  domain: string;
+  area: string | null;
+  contexts: string | null;
+  tags: string | null;
+  due_date: string | null;
+  due_time: string | null;
+  start_date: string | null;
+  completed_at: string | null;
+  time_estimate_minutes: number | null;
+  actual_time_minutes: number | null;
+  recurrence_rule: string | null;
+  recurrence_parent_id: string | null;
+  urgency: number;
+  importance: number;
+  energy_required: 'low' | 'medium' | 'high';
+  status: 'inbox' | 'next' | 'scheduled' | 'waiting' | 'someday' | 'completed' | 'cancelled';
+  assigned_by_id: string | null;
+  assigned_by_name: string | null;
+  delegated_to_id: string | null;
+  delegated_to_name: string | null;
+  waiting_on: string | null;
+  waiting_since: string | null;
+  source_type: string | null;
+  source_inbox_item_id: string | null;
+  source_reference: string | null;
+  calendar_event_id: string | null;
+  calendar_source: string | null;
+}
+
+// Project
+export interface Project extends BaseEntity {
+  user_id: string;
+  name: string; // encrypted
+  description: string | null; // encrypted
+  objective: string | null; // encrypted
+  domain: string;
+  area: string | null;
+  tags: string | null;
+  status: 'planning' | 'active' | 'on_hold' | 'completed' | 'cancelled';
+  health: 'on_track' | 'at_risk' | 'off_track' | null;
+  target_date: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  parent_project_id: string | null;
+  external_id: string | null;
+  external_source: string | null;
+}
+
+// Idea
+export interface Idea extends BaseEntity {
+  user_id: string;
+  title: string; // encrypted
+  description: string | null; // encrypted
+  category: string;
+  domain: string | null;
+  tags: string | null;
+  excitement_level: number | null;
+  feasibility: number | null;
+  potential_impact: number | null;
+  last_reviewed_at: string | null;
+  next_review_at: string | null;
+  review_count: number;
+  promoted_to_project_id: string | null;
+  archived_at: string | null;
+  archive_reason: string | null;
+  source_inbox_item_id: string | null;
+}
+
+// Person
+export interface Person extends BaseEntity {
+  user_id: string;
+  name: string; // encrypted
+  email: string | null; // encrypted
+  phone: string | null; // encrypted
+  relationship: string | null;
+  organization: string | null;
+  role: string | null;
+  preferred_contact: string | null;
+  google_contact_id: string | null;
+  notes: string | null; // encrypted
+}
+
+// Commitment
+export interface Commitment extends BaseEntity {
+  user_id: string;
+  direction: 'waiting_for' | 'owed_to';
+  person_id: string | null;
+  person_name: string | null;
+  description: string; // encrypted
+  context_type: string | null;
+  context_reference: string | null;
+  requested_at: string;
+  due_date: string | null;
+  reminded_at: string | null;
+  reminder_count: number;
+  status: 'open' | 'fulfilled' | 'cancelled';
+  fulfilled_at: string | null;
+  task_id: string | null;
+}
+
+// API response types
+export interface ApiResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
+
+export interface ListResponse<T> {
+  success: boolean;
+  data: T[];
+  total?: number;
+}
+
+// Create/Update DTOs
+export type CreateTaskInput = Omit<Task, 'id' | 'tenant_id' | 'created_at' | 'updated_at' | 'deleted_at'>;
+export type UpdateTaskInput = Partial<CreateTaskInput>;
+
+export type CreateProjectInput = Omit<Project, 'id' | 'tenant_id' | 'created_at' | 'updated_at' | 'deleted_at'>;
+export type UpdateProjectInput = Partial<CreateProjectInput>;
+
+export type CreateInboxItemInput = Omit<InboxItem, 'id' | 'tenant_id' | 'created_at' | 'updated_at' | 'deleted_at'>;
+export type UpdateInboxItemInput = Partial<CreateInboxItemInput>;

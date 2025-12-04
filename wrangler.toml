@@ -1,0 +1,26 @@
+name = "nexus"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[dev]
+port = 8787
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nexus-db"
+database_id = "1210076d-a443-443c-8623-a02b5ff4de9f"
+
+[vars]
+ENVIRONMENT = "development"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "4a9097857e284189a3f0dc6211b7fb3f"
+
+[[durable_objects.bindings]]
+name = "INBOX_MANAGER"
+class_name = "InboxManager"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["InboxManager"]
