@@ -206,6 +206,117 @@ export type CaptureInput = z.infer<typeof captureInputSchema>;
 export type BatchCaptureInput = z.infer<typeof batchCaptureInputSchema>;
 
 // ============================================
+// SyncManager schemas
+// ============================================
+
+export const deviceInfoSchema = z.object({
+  device_id: z.string().uuid().optional(),
+  device_name: z.string().min(1).max(200),
+  platform: z.string().min(1).max(100),
+  device_type: z.enum(['mobile', 'desktop', 'web', 'tablet']).optional(),
+  last_sequence: z.number().int().min(0).optional().default(0),
+});
+
+export const changeLogEntrySchema = z.object({
+  entity_type: z.enum(['task', 'project', 'inbox_item', 'idea', 'person', 'commitment']),
+  entity_id: uuidSchema,
+  operation: z.enum(['create', 'update', 'delete']),
+  changes: z.record(z.unknown()),
+  device_id: z.string().uuid(),
+  user_id: uuidSchema,
+});
+
+export const syncPushRequestSchema = z.object({
+  device_id: z.string().uuid(),
+  device_name: z.string().min(1).max(200),
+  platform: z.string().min(1).max(100),
+  last_sequence: z.number().int().min(0),
+  changes: z.array(changeLogEntrySchema).min(1).max(1000),
+});
+
+export const syncPullRequestSchema = z.object({
+  device_id: z.string().uuid(),
+  since_sequence: z.number().int().min(0),
+});
+
+export const registerDeviceSchema = z.object({
+  tenant_id: uuidSchema,
+  user_id: uuidSchema,
+  device_id: z.string().uuid().optional(),
+  device_name: z.string().min(1).max(200),
+  device_type: z.enum(['mobile', 'desktop', 'web', 'tablet']),
+  platform: z.string().min(1).max(100),
+});
+
+export const syncChangesSchema = z.object({
+  tenant_id: uuidSchema,
+  user_id: uuidSchema,
+  device_id: z.string().uuid(),
+  changes: z.array(changeLogEntrySchema).min(1).max(1000),
+});
+
+export type DeviceInfoInput = z.infer<typeof deviceInfoSchema>;
+export type ChangeLogEntryInput = z.infer<typeof changeLogEntrySchema>;
+export type SyncPushRequestInput = z.infer<typeof syncPushRequestSchema>;
+export type SyncPullRequestInput = z.infer<typeof syncPullRequestSchema>;
+export type RegisterDeviceInput = z.infer<typeof registerDeviceSchema>;
+export type SyncChangesInput = z.infer<typeof syncChangesSchema>;
+
+// ============================================
+// UserSession schemas (for session lifecycle)
+// ============================================
+
+export const createAuthSessionSchema = z.object({
+  tenant_id: uuidSchema,
+  user_id: uuidSchema,
+  device_id: uuidSchema,
+  ttl_seconds: z.number().int().positive().max(30 * 24 * 60 * 60).optional(), // max 30 days
+});
+
+export const refreshAuthSessionSchema = z.object({
+  session_id: uuidSchema,
+  extend_ttl: z.boolean().optional().default(true),
+  ttl_seconds: z.number().int().positive().max(30 * 24 * 60 * 60).optional(),
+});
+
+export const revokeAuthSessionSchema = z.object({
+  session_id: uuidSchema,
+});
+
+export const revokeAllAuthSessionsSchema = z.object({
+  except_session_id: uuidSchema.optional(),
+});
+
+export type CreateAuthSessionInput = z.infer<typeof createAuthSessionSchema>;
+export type RefreshAuthSessionInput = z.infer<typeof refreshAuthSessionSchema>;
+export type RevokeAuthSessionInput = z.infer<typeof revokeAuthSessionSchema>;
+export type RevokeAllAuthSessionsInput = z.infer<typeof revokeAllAuthSessionsSchema>;
+
+// ============================================
+// CaptureBuffer schemas
+// ============================================
+
+export const bufferChunkSchema = z.object({
+  tenant_id: uuidSchema,
+  user_id: uuidSchema,
+  content: z.string().min(1).max(50000),
+  source_type: z.enum(['voice', 'text']).default('voice'),
+  source_platform: z.string().max(50).optional().nullable(),
+  source_id: z.string().max(200).optional().nullable(),
+  is_final: z.boolean().optional(),
+  metadata: z.record(z.unknown()).optional(),
+});
+
+export const bufferConfigSchema = z.object({
+  maxChunks: z.number().int().min(1).max(1000).optional(),
+  maxAgeMs: z.number().int().min(100).max(60000).optional(),
+  mergeWindowMs: z.number().int().min(0).max(10000).optional(),
+});
+
+export type BufferChunkInput = z.infer<typeof bufferChunkSchema>;
+export type BufferConfigInput = z.infer<typeof bufferConfigSchema>;
+
+// ============================================
 // Validation helper
 // ============================================
 

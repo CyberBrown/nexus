@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
-import type { AppType } from './types/index.ts';
+import type { AppType, Env, ScheduledEvent } from './types/index.ts';
 import { authMiddleware, generateDevToken, getAuth } from './lib/auth.ts';
 import { generateTenantKey } from './lib/encryption.ts';
 import { AppError, ValidationError, isOperationalError } from './lib/errors.ts';
@@ -11,12 +11,27 @@ import projectsRoutes from './routes/projects.ts';
 import ideasRoutes from './routes/ideas.ts';
 import peopleRoutes from './routes/people.ts';
 import commitmentsRoutes from './routes/commitments.ts';
+import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 
 // Re-export Durable Objects
 export { InboxManager } from './durable-objects/InboxManager.ts';
 export { CaptureBuffer } from './durable-objects/CaptureBuffer.ts';
 export { SyncManager } from './durable-objects/SyncManager.ts';
 export { UserSession } from './durable-objects/UserSession.ts';
+
+// Scheduled handler for Cloudflare Cron Triggers
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return app.fetch(request, env, ctx);
+  },
+
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    console.log(`Cron trigger fired at ${new Date(event.scheduledTime).toISOString()}`);
+
+    // Process recurring tasks
+    ctx.waitUntil(processRecurringTasks(env));
+  },
+};
 
 const app = new Hono<AppType>();
 
@@ -323,6 +338,52 @@ api.post('/buffer/configure', async (c) => {
   }
 });
 
+// Clear buffer
+api.post('/buffer/clear', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const id = c.env.CAPTURE_BUFFER.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.CAPTURE_BUFFER.get(id);
+
+    const response = await stub.fetch(new Request('http://do/clear', {
+      method: 'POST',
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Buffer clear error:', error);
+    return c.json({ success: false, error: 'Failed to clear buffer' }, 500);
+  }
+});
+
+// WebSocket endpoint for real-time buffer updates
+api.get('/buffer/ws', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  // Check for WebSocket upgrade
+  const upgradeHeader = c.req.header('Upgrade');
+  if (upgradeHeader !== 'websocket') {
+    return c.json({ success: false, error: 'Expected WebSocket upgrade' }, 426);
+  }
+
+  try {
+    const id = c.env.CAPTURE_BUFFER.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.CAPTURE_BUFFER.get(id);
+
+    // Forward WebSocket upgrade to DO
+    const url = new URL(c.req.url);
+    url.searchParams.set('userId', userId);
+
+    return stub.fetch(new Request(url.toString(), {
+      headers: c.req.raw.headers,
+    }));
+  } catch (error) {
+    console.error('Buffer WebSocket error:', error);
+    return c.json({ success: false, error: 'WebSocket connection failed' }, 500);
+  }
+});
+
 // ========================================
 // UserSession Durable Object Routes
 // ========================================
@@ -507,6 +568,165 @@ api.get('/session/ws', async (c) => {
 });
 
 // ========================================
+// UserSession Auth Session Lifecycle Routes
+// ========================================
+
+// Create a new auth session
+api.post('/session/auth/create', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json();
+
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/session/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: tenantId,
+        user_id: userId,
+        ...body,
+      }),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Create auth session error:', error);
+    return c.json({ success: false, error: 'Failed to create auth session' }, 500);
+  }
+});
+
+// Refresh an auth session
+api.post('/session/auth/refresh', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json();
+
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/session/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Refresh auth session error:', error);
+    return c.json({ success: false, error: 'Failed to refresh auth session' }, 500);
+  }
+});
+
+// Validate an auth session
+api.get('/session/auth/validate', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const sessionId = c.req.query('session_id');
+
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const url = new URL('http://do/session/validate');
+    if (sessionId) {
+      url.searchParams.set('session_id', sessionId);
+    }
+
+    const response = await stub.fetch(new Request(url.toString()));
+    return response;
+  } catch (error) {
+    console.error('Validate auth session error:', error);
+    return c.json({ success: false, error: 'Failed to validate auth session' }, 500);
+  }
+});
+
+// Revoke an auth session
+api.post('/session/auth/revoke', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json();
+
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/session/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Revoke auth session error:', error);
+    return c.json({ success: false, error: 'Failed to revoke auth session' }, 500);
+  }
+});
+
+// Revoke all auth sessions
+api.post('/session/auth/revoke-all', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/session/revoke-all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Revoke all auth sessions error:', error);
+    return c.json({ success: false, error: 'Failed to revoke all auth sessions' }, 500);
+  }
+});
+
+// List all auth sessions
+api.get('/session/auth/list', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/session/list'));
+    return response;
+  } catch (error) {
+    console.error('List auth sessions error:', error);
+    return c.json({ success: false, error: 'Failed to list auth sessions' }, 500);
+  }
+});
+
+// Delete an auth session
+api.delete('/session/auth/:sessionId', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const sessionId = c.req.param('sessionId');
+
+  try {
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request(`http://do/session/${sessionId}`, {
+      method: 'DELETE',
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Delete auth session error:', error);
+    return c.json({ success: false, error: 'Failed to delete auth session' }, 500);
+  }
+});
+
+// ========================================
 // SyncManager Durable Object Routes
 // ========================================
 
@@ -671,5 +891,3 @@ app.onError((err, c) => {
     error: { message, code: 'INTERNAL_ERROR' },
   }, 500);
 });
-
-export default app;
