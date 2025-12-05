@@ -4,9 +4,13 @@ import { logger } from 'hono/logger';
 import type { AppType } from './types/index.ts';
 import { authMiddleware, generateDevToken, getAuth } from './lib/auth.ts';
 import { generateTenantKey } from './lib/encryption.ts';
+import { AppError, ValidationError, isOperationalError } from './lib/errors.ts';
 import inboxRoutes from './routes/inbox.ts';
 import tasksRoutes from './routes/tasks.ts';
 import projectsRoutes from './routes/projects.ts';
+import ideasRoutes from './routes/ideas.ts';
+import peopleRoutes from './routes/people.ts';
+import commitmentsRoutes from './routes/commitments.ts';
 
 // Re-export Durable Object
 export { InboxManager } from './durable-objects/InboxManager.ts';
@@ -73,9 +77,14 @@ app.post('/setup', async (c) => {
 // API routes (protected)
 const api = new Hono<AppType>();
 api.use('*', authMiddleware());
+
+// CRUD routes
 api.route('/inbox', inboxRoutes);
 api.route('/tasks', tasksRoutes);
 api.route('/projects', projectsRoutes);
+api.route('/ideas', ideasRoutes);
+api.route('/people', peopleRoutes);
+api.route('/commitments', commitmentsRoutes);
 
 // ========================================
 // InboxManager Durable Object Routes
@@ -203,10 +212,30 @@ app.notFound((c) => {
   return c.json({ success: false, error: 'Not found' }, 404);
 });
 
-// Error handler
+// Global error handler
 app.onError((err, c) => {
+  // Handle validation errors
+  if (err instanceof ValidationError) {
+    return c.json(err.toJSON(), err.statusCode);
+  }
+
+  // Handle known operational errors
+  if (isOperationalError(err)) {
+    return c.json(err.toJSON(), err.statusCode);
+  }
+
+  // Log unexpected errors
   console.error('Unhandled error:', err);
-  return c.json({ success: false, error: 'Internal server error' }, 500);
+
+  // Don't expose internal error details in production
+  const message = c.env.ENVIRONMENT === 'development'
+    ? err.message
+    : 'Internal server error';
+
+  return c.json({
+    success: false,
+    error: { message, code: 'INTERNAL_ERROR' },
+  }, 500);
 });
 
 export default app;

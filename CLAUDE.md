@@ -1,3 +1,4 @@
+<!-- Developer Guides MCP Setup v1.1.0 - Check for updates: docs/CLAUDE-MD-SETUP.md -->
 # CLAUDE.md - Nexus Project Instructions
 
 ## Project Overview
@@ -12,6 +13,76 @@ Nexus is a Personal AI Command Center - a voice-first, AI-native productivity sy
 - **Package Manager**: Bun (NOT npm)
 - **Language**: TypeScript
 
+## Developer Guidelines (MCP Server)
+
+### Required: Check Before Implementing
+
+ALWAYS search the developer guides before:
+- Writing new functions or modules
+- Implementing error handling
+- Adding validation logic
+- Creating API endpoints
+- Writing database queries
+- Adding authentication or security features
+
+This is not optional - established patterns must be followed for consistency and security.
+
+### Quick Reference
+
+| Task | Search Query |
+|------|-------------|
+| Input validation | `query="zod validation"` |
+| Error handling | `query="error classes"` |
+| API security | `query="authentication middleware"` |
+| Database queries | `query="parameterized queries"` |
+| Testing patterns | `query="unit test"` |
+| Logging/monitoring | `query="observability"` |
+
+### How to Access
+
+Search by topic:
+```
+mcp__developer-guides__search_developer_guides query="validation"
+```
+
+Get specific guide:
+```
+mcp__developer-guides__get_guide guideId="guide-07-security"
+mcp__developer-guides__get_guide guideId="guide-01-fundamentals"
+```
+
+List all available guides:
+```
+mcp__developer-guides__list_guides
+```
+
+### Available Guides
+
+| Guide | Use For |
+|-------|---------|
+| `guide-01-fundamentals` | Code organization, naming, error handling, types |
+| `guide-02-11-arch-devops` | Architecture patterns, CI/CD, deployment |
+| `guide-05-10-db-perf` | Database schemas, queries, performance |
+| `guide-07-security` | Validation, auth, secrets, CORS, rate limiting |
+| `guide-09-testing` | Unit, integration, E2E testing patterns |
+| `Cloudflare-Workers-Guide` | Cloudflare Workers patterns, bindings, KV, D1 |
+| `Frontend-Development-Guide` | Frontend patterns, components, state management |
+| `AI and Observability-Guide` | AI integration, logging, monitoring, tracing |
+
+### Key Patterns to Follow
+- Use Zod schemas for all input validation
+- Use custom error classes (`AppError`, `ValidationError`, `NotFoundError`)
+- Never concatenate SQL queries - use parameterized queries
+- Store secrets in environment variables, never in code
+
+### Improving the Guides
+
+If you find gaps, outdated patterns, or better approaches while working:
+```
+mcp__developer-guides__propose_guide_change guideId="guide-07-security" section="Authentication" currentText="..." proposedText="..." rationale="Found a better pattern for..."
+```
+Proposals help keep the guides current and comprehensive.
+
 ## Architecture Decisions (Already Made)
 
 1. **D1 with encryption** - Sensitive fields encrypted at app layer before storage
@@ -20,144 +91,62 @@ Nexus is a Personal AI Command Center - a voice-first, AI-native productivity sy
 4. **Soft deletes** - Never hard delete, use `deleted_at` timestamps
 5. **Durable Objects for state** - UserSession, InboxManager, SyncManager, CaptureBuffer
 
-## Current Task: Foundation Setup
+## Project Status: Foundation Complete ✅
 
-### Step 1: Create D1 Database
+The core foundation has been built and tested. Current capabilities:
 
-```bash
-# Use Cloudflare dashboard or wrangler
-wrangler d1 create nexus-db
-```
+### Implemented Features
 
-Note the database ID for wrangler.toml.
+- **Full CRUD API** for all entities (tasks, projects, inbox, ideas, people, commitments)
+- **App-layer encryption** for sensitive fields (AES-256-GCM)
+- **Zod validation** on all inputs with detailed error messages
+- **Custom error classes** (AppError, ValidationError, NotFoundError, etc.)
+- **InboxManager Durable Object** with capture, batch capture, queue, and WebSocket
+- **AI Classification** via Claude API (auto-creates tasks with ≥80% confidence)
+- **Dev token auth** for development
+- **Test suite** with 53 passing tests
 
-### Step 2: Scaffold Worker Project
-
-```bash
-bunx create-cloudflare@latest nexus --type worker-ts
-cd nexus
-```
-
-### Step 3: Configure wrangler.toml
-
-```toml
-name = "nexus"
-main = "src/index.ts"
-compatibility_date = "2024-01-01"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "nexus-db"
-database_id = "<YOUR_DATABASE_ID>"
-
-[vars]
-ENVIRONMENT = "development"
-
-# KV for encryption keys (create this too)
-[[kv_namespaces]]
-binding = "KV"
-id = "<YOUR_KV_ID>"
-```
-
-### Step 4: Deploy Schema
-
-```bash
-wrangler d1 execute nexus-db --file=./schema.sql
-```
-
-The schema file is `nexus-schema.sql` in this directory.
-
-### Step 5: Create Encryption Utilities
-
-Create `src/lib/encryption.ts`:
-
-```typescript
-// AES-256-GCM encryption for sensitive fields
-// Key stored in KV, referenced by tenant
-
-export async function getEncryptionKey(kv: KVNamespace, tenantId: string): Promise<CryptoKey> {
-  const keyData = await kv.get(`tenant:${tenantId}:key`, 'arrayBuffer');
-  if (!keyData) {
-    throw new Error('Encryption key not found for tenant');
-  }
-  
-  return crypto.subtle.importKey(
-    'raw',
-    keyData,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-export async function encryptField(value: string, key: CryptoKey): Promise<string> {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(value);
-  
-  const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    encoded
-  );
-  
-  const combined = new Uint8Array(iv.length + encrypted.byteLength);
-  combined.set(iv);
-  combined.set(new Uint8Array(encrypted), iv.length);
-  
-  return btoa(String.fromCharCode(...combined));
-}
-
-export async function decryptField(encrypted: string, key: CryptoKey): Promise<string> {
-  const combined = Uint8Array.from(atob(encrypted), c => c.charCodeAt(0));
-  const iv = combined.slice(0, 12);
-  const data = combined.slice(12);
-  
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    data
-  );
-  
-  return new TextDecoder().decode(decrypted);
-}
-
-export async function generateTenantKey(kv: KVNamespace, tenantId: string): Promise<void> {
-  const key = crypto.getRandomValues(new Uint8Array(32));
-  await kv.put(`tenant:${tenantId}:key`, key);
-}
-```
-
-### Step 6: Create Basic API Structure
+### API Structure
 
 ```
 src/
-├── index.ts              # Main worker entry, router
+├── index.ts                    # Main worker entry, Hono router
 ├── lib/
-│   ├── encryption.ts     # Encryption utilities
-│   ├── auth.ts           # Auth middleware
-│   └── db.ts             # D1 helpers with tenant scoping
+│   ├── auth.ts                 # Auth middleware (dev JWT)
+│   ├── classifier.ts           # Claude AI classification
+│   ├── db.ts                   # D1 helpers with tenant scoping
+│   ├── encryption.ts           # AES-256-GCM encryption
+│   ├── errors.ts               # Custom error classes
+│   └── validation.ts           # Zod schemas for all entities
 ├── routes/
-│   ├── inbox.ts          # Inbox CRUD
-│   ├── tasks.ts          # Tasks CRUD
-│   └── projects.ts       # Projects CRUD
+│   ├── inbox.ts                # Inbox CRUD
+│   ├── tasks.ts                # Tasks CRUD
+│   ├── projects.ts             # Projects CRUD
+│   ├── ideas.ts                # Ideas CRUD
+│   ├── people.ts               # People CRUD
+│   └── commitments.ts          # Commitments CRUD
+├── durable-objects/
+│   └── InboxManager.ts         # Real-time capture & classification
 └── types/
-    └── index.ts          # TypeScript interfaces
+    └── index.ts                # TypeScript interfaces
 ```
 
-### Step 7: Implement Basic CRUD
+### API Endpoints
 
-For each entity (inbox_items, tasks, projects), implement:
-- `GET /api/{entity}` - List with tenant filtering
-- `GET /api/{entity}/:id` - Get single
-- `POST /api/{entity}` - Create
-- `PATCH /api/{entity}/:id` - Update
-- `DELETE /api/{entity}/:id` - Soft delete
-
-All routes must:
-1. Check auth (simple JWT for now)
-2. Scope queries by tenant_id
-3. Encrypt sensitive fields before write
-4. Decrypt sensitive fields after read
+| Endpoint | Methods | Description |
+|----------|---------|-------------|
+| `/api/tasks` | GET, POST, PATCH, DELETE | Task management |
+| `/api/projects` | GET, POST, PATCH, DELETE | Project management |
+| `/api/inbox` | GET, POST, PATCH, DELETE | Inbox items |
+| `/api/ideas` | GET, POST, PATCH, DELETE | Ideas/someday-maybe |
+| `/api/people` | GET, POST, PATCH, DELETE | Contacts |
+| `/api/commitments` | GET, POST, PATCH, DELETE | Waiting-for/owed-to |
+| `/api/capture` | POST | Capture with AI classification |
+| `/api/capture/batch` | POST | Batch capture |
+| `/api/capture/status` | GET | InboxManager status |
+| `/api/capture/queue` | GET | Classification queue |
+| `/api/capture/ws` | WebSocket | Real-time updates |
+| `/setup` | POST | Dev-only: create tenant/user |
 
 ## Fields to Encrypt
 
@@ -168,11 +157,59 @@ All routes must:
 - `people.name`, `people.email`, `people.phone`, `people.notes`
 - `commitments.description`
 
+## Secrets Management
+
+**All secrets are stored in Cloudflare Workers Secrets** - never in code or `.env` files.
+
+### Required Secrets
+
+| Secret | Description |
+|--------|-------------|
+| `ANTHROPIC_API_KEY` | Claude API key for AI classification |
+
+### Managing Secrets
+
+```bash
+# List all secrets
+npm run secret:list
+
+# Add/update a secret
+npm run secret:put ANTHROPIC_API_KEY
+# (prompts for value)
+
+# Or directly with wrangler
+npx wrangler secret put ANTHROPIC_API_KEY
+```
+
+### Local Development with Secrets
+
+For local dev, you have two options:
+
+1. **Use remote bindings** (recommended - uses production secrets):
+   ```bash
+   npm run dev:remote
+   ```
+
+2. **Create `.dev.vars`** (local-only secrets):
+   ```bash
+   echo "ANTHROPIC_API_KEY=sk-ant-..." > .dev.vars
+   ```
+   Note: `.dev.vars` is gitignored and should never be committed.
+
 ## Testing
 
 ```bash
-# Run locally
-bun run dev
+# Run unit tests
+npm test
+
+# Watch mode
+npm run test:watch
+
+# Run local dev server
+npm run dev
+
+# Run with remote bindings (for secrets/D1)
+npm run dev:remote
 
 # Test endpoints
 curl http://localhost:8787/api/tasks
@@ -181,9 +218,11 @@ curl http://localhost:8787/api/tasks
 ## Deployment
 
 ```bash
-bun run deploy
-# or
-wrangler deploy
+# Deploy to Cloudflare
+npm run deploy
+
+# Deploy schema to remote D1
+npm run db:migrate:remote
 ```
 
 ## Important Notes
@@ -194,10 +233,16 @@ wrangler deploy
 - Log errors but don't expose internals to client
 - All timestamps in ISO 8601 format
 
-## Next Phase (Don't Build Yet)
+## Next Phase
 
-After foundation is solid:
-- Durable Objects for real-time sync
-- Android client with continuous capture
-- AI classification pipeline
-- Calendar/email integrations
+Ready to build:
+- **Production Auth** - Replace dev JWT with OAuth/Clerk
+- **Remaining Durable Objects** - UserSession, SyncManager, CaptureBuffer
+- **Recurring Tasks** - Logic to spawn recurring task instances
+- **Web Dashboard** - UI for reviewing/organizing captured items
+
+Future phases:
+- Android client with continuous voice capture
+- Google Calendar integration
+- Email integration (Gmail/IMAP)
+- Cross-device sync

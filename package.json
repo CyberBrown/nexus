@@ -5,18 +5,28 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
+    "dev:remote": "wrangler dev --remote",
     "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 execute nexus-db --file=./schema.sql"
+    "db:migrate": "wrangler d1 execute nexus-db --file=./schema.sql",
+    "db:migrate:remote": "wrangler d1 execute nexus-db --file=./schema.sql --remote",
+    "secret:list": "wrangler secret list",
+    "secret:put": "wrangler secret put",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.10.14",
     "@cloudflare/workers-types": "^4.20251202.0",
     "@types/bun": "latest",
+    "vitest": "^3.2.0",
     "wrangler": "^4.52.1"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "hono": "^4.10.7"
+    "hono": "^4.10.7",
+    "zod": "^4.1.13"
   }
 }
