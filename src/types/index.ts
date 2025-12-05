@@ -4,6 +4,9 @@ export interface Env {
   KV: KVNamespace;
   ENVIRONMENT: string;
   INBOX_MANAGER: DurableObjectNamespace;
+  CAPTURE_BUFFER: DurableObjectNamespace;
+  SYNC_MANAGER: DurableObjectNamespace;
+  USER_SESSION: DurableObjectNamespace;
   ANTHROPIC_API_KEY: string;
 }
 

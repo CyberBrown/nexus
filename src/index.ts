@@ -12,8 +12,11 @@ import ideasRoutes from './routes/ideas.ts';
 import peopleRoutes from './routes/people.ts';
 import commitmentsRoutes from './routes/commitments.ts';
 
-// Re-export Durable Object
+// Re-export Durable Objects
 export { InboxManager } from './durable-objects/InboxManager.ts';
+export { CaptureBuffer } from './durable-objects/CaptureBuffer.ts';
+export { SyncManager } from './durable-objects/SyncManager.ts';
+export { UserSession } from './durable-objects/UserSession.ts';
 
 const app = new Hono<AppType>();
 
@@ -202,6 +205,437 @@ api.get('/capture/ws', async (c) => {
   } catch (error) {
     console.error('WebSocket error:', error);
     return c.json({ success: false, error: 'WebSocket connection failed' }, 500);
+  }
+});
+
+// ========================================
+// CaptureBuffer Durable Object Routes
+// ========================================
+
+// Append a chunk to the capture buffer
+api.post('/buffer/append', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json();
+
+    // Get the DO instance for this user (one buffer per user)
+    const id = c.env.CAPTURE_BUFFER.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.CAPTURE_BUFFER.get(id);
+
+    // Forward to DO
+    const response = await stub.fetch(new Request('http://do/append', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: tenantId,
+        user_id: userId,
+        ...body,
+      }),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Buffer append error:', error);
+    return c.json({ success: false, error: 'Buffer append failed' }, 500);
+  }
+});
+
+// Force flush the buffer
+api.post('/buffer/flush', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+
+    const id = c.env.CAPTURE_BUFFER.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.CAPTURE_BUFFER.get(id);
+
+    const response = await stub.fetch(new Request('http://do/flush', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: tenantId,
+        user_id: userId,
+        ...body,
+      }),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Buffer flush error:', error);
+    return c.json({ success: false, error: 'Buffer flush failed' }, 500);
+  }
+});
+
+// Get buffer status
+api.get('/buffer/status', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const id = c.env.CAPTURE_BUFFER.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.CAPTURE_BUFFER.get(id);
+
+    const response = await stub.fetch(new Request('http://do/status'));
+    return response;
+  } catch (error) {
+    console.error('Buffer status error:', error);
+    return c.json({ success: false, error: 'Failed to get buffer status' }, 500);
+  }
+});
+
+// Get current buffer contents
+api.get('/buffer', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const id = c.env.CAPTURE_BUFFER.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.CAPTURE_BUFFER.get(id);
+
+    const response = await stub.fetch(new Request('http://do/buffer'));
+    return response;
+  } catch (error) {
+    console.error('Buffer get error:', error);
+    return c.json({ success: false, error: 'Failed to get buffer' }, 500);
+  }
+});
+
+// Configure buffer settings
+api.post('/buffer/configure', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const config = await c.req.json();
+
+    const id = c.env.CAPTURE_BUFFER.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.CAPTURE_BUFFER.get(id);
+
+    const response = await stub.fetch(new Request('http://do/configure', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Buffer configure error:', error);
+    return c.json({ success: false, error: 'Failed to configure buffer' }, 500);
+  }
+});
+
+// ========================================
+// UserSession Durable Object Routes
+// ========================================
+
+// Get session status
+api.get('/session/status', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/status'));
+    return response;
+  } catch (error) {
+    console.error('Session status error:', error);
+    return c.json({ success: false, error: 'Failed to get session status' }, 500);
+  }
+});
+
+// Send heartbeat
+api.post('/session/heartbeat', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId,
+        tenantId,
+        ...body,
+      }),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Heartbeat error:', error);
+    return c.json({ success: false, error: 'Heartbeat failed' }, 500);
+  }
+});
+
+// Get connected devices
+api.get('/session/devices', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/devices'));
+    return response;
+  } catch (error) {
+    console.error('Get devices error:', error);
+    return c.json({ success: false, error: 'Failed to get devices' }, 500);
+  }
+});
+
+// Register a new device
+api.post('/session/device/register', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json();
+
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/device/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId,
+        tenantId,
+        ...body,
+      }),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Register device error:', error);
+    return c.json({ success: false, error: 'Failed to register device' }, 500);
+  }
+});
+
+// Disconnect a device
+api.delete('/session/device/:deviceId', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const deviceId = c.req.param('deviceId');
+
+  try {
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request(`http://do/device/${deviceId}`, {
+      method: 'DELETE',
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Disconnect device error:', error);
+    return c.json({ success: false, error: 'Failed to disconnect device' }, 500);
+  }
+});
+
+// Get user preferences
+api.get('/session/preferences', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/preferences'));
+    return response;
+  } catch (error) {
+    console.error('Get preferences error:', error);
+    return c.json({ success: false, error: 'Failed to get preferences' }, 500);
+  }
+});
+
+// Update user preferences
+api.post('/session/preferences', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json();
+
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    const response = await stub.fetch(new Request('http://do/preferences', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Update preferences error:', error);
+    return c.json({ success: false, error: 'Failed to update preferences' }, 500);
+  }
+});
+
+// WebSocket endpoint for real-time presence updates
+api.get('/session/ws', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  // Check for WebSocket upgrade
+  const upgradeHeader = c.req.header('Upgrade');
+  if (upgradeHeader !== 'websocket') {
+    return c.json({ success: false, error: 'Expected WebSocket upgrade' }, 426);
+  }
+
+  try {
+    const id = c.env.USER_SESSION.idFromName(`${tenantId}:${userId}`);
+    const stub = c.env.USER_SESSION.get(id);
+
+    // Get deviceId from query params
+    const url = new URL(c.req.url);
+    url.searchParams.set('userId', userId);
+
+    // Forward deviceId if provided
+    const deviceId = url.searchParams.get('deviceId');
+    if (!deviceId) {
+      return c.json({ success: false, error: 'Missing deviceId parameter' }, 400);
+    }
+
+    // Forward WebSocket upgrade to DO
+    return stub.fetch(new Request(url.toString(), {
+      headers: c.req.raw.headers,
+    }));
+  } catch (error) {
+    console.error('Session WebSocket error:', error);
+    return c.json({ success: false, error: 'WebSocket connection failed' }, 500);
+  }
+});
+
+// ========================================
+// SyncManager Durable Object Routes
+// ========================================
+
+// Push changes to sync manager (device -> server)
+api.post('/sync/push', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json();
+
+    // Get the DO instance for this tenant
+    const id = c.env.SYNC_MANAGER.idFromName(tenantId);
+    const stub = c.env.SYNC_MANAGER.get(id);
+
+    // Forward to DO
+    const response = await stub.fetch(new Request('http://do/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: tenantId,
+        user_id: userId,
+        push: body,
+      }),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Sync push error:', error);
+    return c.json({ success: false, error: 'Sync push failed' }, 500);
+  }
+});
+
+// Pull changes from sync manager (server -> device)
+api.post('/sync/pull', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json();
+
+    const id = c.env.SYNC_MANAGER.idFromName(tenantId);
+    const stub = c.env.SYNC_MANAGER.get(id);
+
+    const response = await stub.fetch(new Request('http://do/pull', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: tenantId,
+        user_id: userId,
+        pull: body,
+      }),
+    }));
+
+    return response;
+  } catch (error) {
+    console.error('Sync pull error:', error);
+    return c.json({ success: false, error: 'Sync pull failed' }, 500);
+  }
+});
+
+// Get sync status
+api.get('/sync/status', async (c) => {
+  const { tenantId } = getAuth(c);
+
+  try {
+    const id = c.env.SYNC_MANAGER.idFromName(tenantId);
+    const stub = c.env.SYNC_MANAGER.get(id);
+
+    const response = await stub.fetch(new Request('http://do/status'));
+    return response;
+  } catch (error) {
+    console.error('Sync status error:', error);
+    return c.json({ success: false, error: 'Failed to get sync status' }, 500);
+  }
+});
+
+// Get pending changes for a device
+api.get('/sync/pending', async (c) => {
+  const { tenantId } = getAuth(c);
+
+  try {
+    const deviceId = c.req.query('deviceId');
+    if (!deviceId) {
+      return c.json({ success: false, error: 'Missing deviceId parameter' }, 400);
+    }
+
+    const id = c.env.SYNC_MANAGER.idFromName(tenantId);
+    const stub = c.env.SYNC_MANAGER.get(id);
+
+    const url = new URL('http://do/pending');
+    url.searchParams.set('deviceId', deviceId);
+
+    const response = await stub.fetch(new Request(url.toString()));
+    return response;
+  } catch (error) {
+    console.error('Sync pending error:', error);
+    return c.json({ success: false, error: 'Failed to get pending changes' }, 500);
+  }
+});
+
+// WebSocket endpoint for real-time sync notifications
+api.get('/sync/ws', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  // Check for WebSocket upgrade
+  const upgradeHeader = c.req.header('Upgrade');
+  if (upgradeHeader !== 'websocket') {
+    return c.json({ success: false, error: 'Expected WebSocket upgrade' }, 426);
+  }
+
+  try {
+    const deviceId = c.req.query('deviceId');
+    if (!deviceId) {
+      return c.json({ success: false, error: 'Missing deviceId parameter' }, 400);
+    }
+
+    const id = c.env.SYNC_MANAGER.idFromName(tenantId);
+    const stub = c.env.SYNC_MANAGER.get(id);
+
+    // Forward WebSocket upgrade to DO
+    const url = new URL(c.req.url);
+    url.searchParams.set('userId', userId);
+    url.searchParams.set('deviceId', deviceId);
+
+    return stub.fetch(new Request(url.toString(), {
+      headers: c.req.raw.headers,
+    }));
+  } catch (error) {
+    console.error('Sync WebSocket error:', error);
+    return c.json({ success: false, error: 'Sync WebSocket connection failed' }, 500);
   }
 });
 
