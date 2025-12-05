@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types/index.ts';
+import { ValidationError } from '../lib/errors.ts';
 
 interface CaptureChunk {
   id: string;
@@ -28,11 +29,30 @@ interface BufferConfig {
   mergeWindowMs: number; // Time window to merge related captures
 }
 
+interface WebSocketSession {
+  webSocket: WebSocket;
+  userId: string;
+  connectedAt: string;
+}
+
+interface BufferStats {
+  total_buffered: number;
+  total_flushed: number;
+  total_errors: number;
+  last_flush_at: string | null;
+  buffer_size_bytes: number;
+}
+
 const DEFAULT_CONFIG: BufferConfig = {
   maxChunks: 50,
   maxAgeMs: 5000, // 5 seconds
   mergeWindowMs: 2000, // 2 seconds - merge captures within 2s of each other
 };
+
+// Rate limiting constants
+const MAX_RATE_PER_MINUTE = 300; // Max 300 captures per minute per tenant
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
+const MAX_BUFFER_SIZE_BYTES = 1024 * 1024; // 1MB max buffer size
 
 export class CaptureBuffer extends DurableObject<Env> {
   private buffer: BufferedCapture[] = [];
@@ -40,6 +60,17 @@ export class CaptureBuffer extends DurableObject<Env> {
   private tenantId: string | null = null;
   private flushInProgress = false;
   private nextAlarmTime: number | null = null;
+  private sessions: Map<string, WebSocketSession> = new Map();
+  private stats: BufferStats = {
+    total_buffered: 0,
+    total_flushed: 0,
+    total_errors: 0,
+    last_flush_at: null,
+    buffer_size_bytes: 0,
+  };
+
+  // Rate limiting
+  private requestTimestamps: number[] = [];
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -49,6 +80,10 @@ export class CaptureBuffer extends DurableObject<Env> {
       this.tenantId = await this.ctx.storage.get('tenantId') ?? null;
       this.buffer = await this.ctx.storage.get('buffer') ?? [];
       this.config = await this.ctx.storage.get('config') ?? DEFAULT_CONFIG;
+      this.stats = await this.ctx.storage.get('stats') ?? this.stats;
+
+      // Calculate buffer size
+      this.calculateBufferSize();
 
       // Resume alarm if there were buffered items
       if (this.buffer.length > 0) {
@@ -73,29 +108,124 @@ export class CaptureBuffer extends DurableObject<Env> {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    switch (request.method) {
-      case 'POST':
-        if (path === '/append') {
-          return this.handleAppend(request);
-        }
-        if (path === '/flush') {
-          return this.handleFlush(request);
-        }
-        if (path === '/configure') {
-          return this.handleConfigure(request);
-        }
-        break;
-      case 'GET':
-        if (path === '/status') {
-          return this.handleStatus();
-        }
-        if (path === '/buffer') {
-          return this.handleGetBuffer();
-        }
-        break;
+    // WebSocket upgrade
+    if (request.headers.get('Upgrade') === 'websocket') {
+      return this.handleWebSocket(request);
     }
 
-    return new Response('Not found', { status: 404 });
+    try {
+      switch (request.method) {
+        case 'POST':
+          if (path === '/append' || path === '/buffer') {
+            return await this.handleAppend(request);
+          }
+          if (path === '/flush') {
+            return await this.handleFlush(request);
+          }
+          if (path === '/configure') {
+            return await this.handleConfigure(request);
+          }
+          if (path === '/clear') {
+            return await this.handleClear();
+          }
+          break;
+        case 'GET':
+          if (path === '/status') {
+            return this.handleStatus();
+          }
+          if (path === '/buffer' || path === '/') {
+            return this.handleGetBuffer();
+          }
+          break;
+      }
+
+      return Response.json({ success: false, error: 'Not found' }, { status: 404 });
+    } catch (error) {
+      console.error('CaptureBuffer error:', error);
+      this.stats.total_errors++;
+
+      if (error instanceof ValidationError) {
+        return Response.json(
+          { success: false, error: error.message, details: error.details },
+          { status: error.statusCode }
+        );
+      }
+
+      return Response.json(
+        { success: false, error: 'Internal error' },
+        { status: 500 }
+      );
+    }
+  }
+
+  // Handle WebSocket connections for real-time updates
+  private async handleWebSocket(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const userId = url.searchParams.get('userId');
+
+    if (!userId) {
+      return new Response('Missing userId parameter', { status: 400 });
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    // Accept the WebSocket
+    this.ctx.acceptWebSocket(server);
+
+    const sessionId = crypto.randomUUID();
+    this.sessions.set(sessionId, {
+      webSocket: server,
+      userId,
+      connectedAt: new Date().toISOString(),
+    });
+
+    // Store session ID on the WebSocket for later reference
+    (server as unknown as Record<string, string>).__sessionId = sessionId;
+
+    // Send initial state
+    server.send(JSON.stringify({
+      type: 'connected',
+      sessionId,
+      bufferSize: this.buffer.length,
+      stats: this.stats,
+      config: this.config,
+    }));
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // Handle WebSocket messages
+  override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    try {
+      const data = JSON.parse(message as string);
+
+      switch (data.type) {
+        case 'ping':
+          ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+          break;
+        case 'get_status':
+          ws.send(JSON.stringify({
+            type: 'status',
+            bufferSize: this.buffer.length,
+            stats: this.stats,
+            config: this.config,
+          }));
+          break;
+      }
+    } catch {
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
+    }
+  }
+
+  // Handle WebSocket close
+  override async webSocketClose(ws: WebSocket, code: number, _reason: string): Promise<void> {
+    const sessionId = (ws as unknown as Record<string, string>).__sessionId;
+    if (sessionId) {
+      this.sessions.delete(sessionId);
+    }
+    console.log(`CaptureBuffer WebSocket closed with code ${code}`);
   }
 
   // Append a chunk to the buffer
@@ -114,12 +244,46 @@ export class CaptureBuffer extends DurableObject<Env> {
       const { tenant_id, user_id, content, source_type, source_platform, is_final, metadata } = body;
 
       if (!tenant_id || !user_id || !content || !source_type) {
-        return Response.json({ success: false, error: 'Missing required fields' }, { status: 400 });
+        throw new ValidationError('Missing required fields', [
+          { field: 'tenant_id', message: 'Required' },
+          { field: 'user_id', message: 'Required' },
+          { field: 'content', message: 'Required' },
+          { field: 'source_type', message: 'Required' },
+        ]);
       }
 
       // Initialize tenant if not set
       if (!this.tenantId) {
         await this.initialize(tenant_id);
+      } else if (this.tenantId !== tenant_id) {
+        throw new ValidationError('Tenant ID mismatch');
+      }
+
+      // Check rate limiting
+      if (!this.checkRateLimit()) {
+        return Response.json(
+          {
+            success: false,
+            error: 'Rate limit exceeded',
+            code: 'RATE_LIMIT_EXCEEDED',
+            retry_after: this.getRateLimitRetryAfter(),
+          },
+          { status: 429 }
+        );
+      }
+
+      // Check backpressure - if buffer is too large, reject
+      if (this.stats.buffer_size_bytes >= MAX_BUFFER_SIZE_BYTES) {
+        return Response.json(
+          {
+            success: false,
+            error: 'Buffer full - backpressure active',
+            code: 'BUFFER_FULL',
+            buffer_size: this.buffer.length,
+            buffer_size_bytes: this.stats.buffer_size_bytes,
+          },
+          { status: 503 }
+        );
       }
 
       const now = new Date().toISOString();
@@ -153,12 +317,26 @@ export class CaptureBuffer extends DurableObject<Env> {
           status: 'accumulating',
         };
         this.buffer.push(capture);
+        this.stats.total_buffered++;
       }
 
+      // Recalculate buffer size
+      this.calculateBufferSize();
+
       await this.ctx.storage.put('buffer', this.buffer);
+      await this.ctx.storage.put('stats', this.stats);
+
+      // Broadcast to connected clients
+      this.broadcast({
+        type: 'chunk_buffered',
+        chunk_id: chunk.id,
+        buffer_size: this.buffer.length,
+        buffer_size_bytes: this.stats.buffer_size_bytes,
+      }, user_id);
 
       // Check if we should auto-flush
-      const shouldFlush = this.shouldAutoFlush(recentCapture || this.buffer[this.buffer.length - 1]);
+      const targetCapture = recentCapture || this.buffer[this.buffer.length - 1];
+      const shouldFlush = targetCapture ? this.shouldAutoFlush(targetCapture) : false;
 
       if (shouldFlush) {
         // Flush immediately
@@ -237,15 +415,22 @@ export class CaptureBuffer extends DurableObject<Env> {
     return Response.json({
       success: true,
       data: {
-        tenantId: this.tenantId,
+        tenant_id: this.tenantId,
         buffer_length: this.buffer.length,
         total_chunks: totalChunks,
+        buffer_size_bytes: this.stats.buffer_size_bytes,
+        connected_clients: this.sessions.size,
         oldest_capture_age_ms: oldestCapture
           ? Date.now() - new Date(oldestCapture.first_chunk_at).getTime()
           : null,
         flush_in_progress: this.flushInProgress,
         next_alarm: this.nextAlarmTime,
+        stats: this.stats,
         config: this.config,
+        rate_limit: {
+          max_per_minute: MAX_RATE_PER_MINUTE,
+          current_count: this.requestTimestamps.length,
+        },
       },
     });
   }
@@ -309,7 +494,7 @@ export class CaptureBuffer extends DurableObject<Env> {
 
     // Check if last chunk was marked as final (for voice)
     const lastChunk = capture.chunks[capture.chunks.length - 1];
-    if (lastChunk.is_final) {
+    if (lastChunk && lastChunk.is_final) {
       return true;
     }
 
@@ -412,7 +597,22 @@ export class CaptureBuffer extends DurableObject<Env> {
 
       // Remove flushed captures from buffer
       this.buffer = this.buffer.filter(c => !flushedIds.has(c.id));
+
+      // Update stats
+      this.stats.total_flushed += flushedIds.size;
+      this.stats.last_flush_at = new Date().toISOString();
+      this.calculateBufferSize();
+
       await this.ctx.storage.put('buffer', this.buffer);
+      await this.ctx.storage.put('stats', this.stats);
+
+      // Broadcast flush event
+      this.broadcast({
+        type: 'buffer_flushed',
+        flushed_count: flushedIds.size,
+        remaining: this.buffer.length,
+        stats: this.stats,
+      });
 
       // Reschedule alarm if buffer still has items
       if (this.buffer.length > 0) {
@@ -437,7 +637,7 @@ export class CaptureBuffer extends DurableObject<Env> {
     const oldestCapture = this.buffer.length > 0
       ? this.buffer.reduce((oldest, capture) =>
           capture.first_chunk_at < oldest.first_chunk_at ? capture : oldest
-        )
+        , this.buffer[0])
       : null;
 
     if (!oldestCapture) {
@@ -478,6 +678,86 @@ export class CaptureBuffer extends DurableObject<Env> {
     // Reschedule if more captures remain
     if (this.buffer.length > 0) {
       await this.scheduleFlush();
+    }
+  }
+
+  // Handle clear buffer request
+  private async handleClear(): Promise<Response> {
+    const clearedCount = this.buffer.length;
+
+    this.buffer = [];
+    this.stats.buffer_size_bytes = 0;
+
+    if (this.nextAlarmTime) {
+      await this.ctx.storage.deleteAlarm();
+      this.nextAlarmTime = null;
+    }
+
+    await this.ctx.storage.put('buffer', this.buffer);
+    await this.ctx.storage.put('stats', this.stats);
+
+    this.broadcast({
+      type: 'buffer_cleared',
+      count: clearedCount,
+    });
+
+    return Response.json({
+      success: true,
+      data: { cleared_count: clearedCount },
+    });
+  }
+
+  // Rate limiting logic
+  private checkRateLimit(): boolean {
+    const now = Date.now();
+    const windowStart = now - RATE_LIMIT_WINDOW_MS;
+
+    // Remove old timestamps outside the window
+    this.requestTimestamps = this.requestTimestamps.filter(ts => ts > windowStart);
+
+    // Check if we're over the limit
+    if (this.requestTimestamps.length >= MAX_RATE_PER_MINUTE) {
+      return false;
+    }
+
+    // Add current request timestamp
+    this.requestTimestamps.push(now);
+    return true;
+  }
+
+  // Get retry-after time in seconds for rate limiting
+  private getRateLimitRetryAfter(): number {
+    if (this.requestTimestamps.length === 0) return 0;
+
+    const oldestTimestamp = this.requestTimestamps[0];
+    if (!oldestTimestamp) return 0;
+
+    const retryAfterMs = RATE_LIMIT_WINDOW_MS - (Date.now() - oldestTimestamp);
+
+    return Math.ceil(retryAfterMs / 1000);
+  }
+
+  // Calculate buffer size in bytes
+  private calculateBufferSize(): void {
+    this.stats.buffer_size_bytes = this.buffer.reduce((sum, capture) => {
+      const captureSize = JSON.stringify(capture).length;
+      return sum + captureSize;
+    }, 0);
+  }
+
+  // Broadcast message to connected clients
+  private broadcast(message: Record<string, unknown>, userId?: string): void {
+    const payload = JSON.stringify(message);
+
+    for (const session of this.sessions.values()) {
+      // If userId specified, only send to that user's sessions
+      if (userId && session.userId !== userId) continue;
+
+      try {
+        session.webSocket.send(payload);
+      } catch {
+        // WebSocket might be closed, will be cleaned up on next close event
+      }
     }
   }
 }

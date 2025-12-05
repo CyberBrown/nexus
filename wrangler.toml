@@ -35,16 +35,20 @@ class_name = "UserSession"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["InboxManager"]
+new_sqlite_classes = ["InboxManager"]
 
 [[migrations]]
 tag = "v2"
-new_classes = ["CaptureBuffer"]
+new_sqlite_classes = ["CaptureBuffer"]
 
 [[migrations]]
 tag = "v3"
-new_classes = ["SyncManager"]
+new_sqlite_classes = ["SyncManager"]
 
 [[migrations]]
 tag = "v4"
-new_classes = ["UserSession"]
+new_sqlite_classes = ["UserSession"]
+
+# Cron Triggers
+[triggers]
+crons = ["0 0 * * *"]  # Run daily at midnight UTC

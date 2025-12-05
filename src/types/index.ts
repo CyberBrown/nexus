@@ -10,6 +10,12 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
 }
 
+// Cloudflare Scheduled Event
+export interface ScheduledEvent {
+  scheduledTime: number;
+  cron: string;
+}
+
 // AI Classification types
 export interface ClassificationResult {
   type: 'task' | 'event' | 'idea' | 'reference' | 'someday';
@@ -208,3 +214,45 @@ export type UpdateProjectInput = Partial<CreateProjectInput>;
 
 export type CreateInboxItemInput = Omit<InboxItem, 'id' | 'tenant_id' | 'created_at' | 'updated_at' | 'deleted_at'>;
 export type UpdateInboxItemInput = Partial<CreateInboxItemInput>;
+
+// SyncManager types
+export interface DeviceInfo {
+  device_id: string;
+  device_name: string;
+  platform: string;
+  last_sync: string;
+  last_sequence: number;
+  connected: boolean;
+}
+
+export interface ChangeLogEntry {
+  sequence: number;
+  timestamp: string;
+  device_id: string;
+  entity_type: 'task' | 'project' | 'inbox_item' | 'idea' | 'person' | 'commitment';
+  entity_id: string;
+  operation: 'create' | 'update' | 'delete';
+  changes: Record<string, unknown>;
+  user_id: string;
+}
+
+export interface SyncPushRequest {
+  device_id: string;
+  device_name: string;
+  platform: string;
+  last_sequence: number;
+  changes: Omit<ChangeLogEntry, 'sequence' | 'timestamp'>[];
+}
+
+export interface SyncPullRequest {
+  device_id: string;
+  since_sequence: number;
+}
+
+export interface ConflictInfo {
+  entity_type: string;
+  entity_id: string;
+  conflicting_changes: ChangeLogEntry[];
+  resolution: 'last_write_wins' | 'manual_required';
+  winning_change?: ChangeLogEntry;
+}
