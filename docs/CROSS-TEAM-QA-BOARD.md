@@ -1,6 +1,6 @@
 # Cross-Team Q&A Board
 
-**Last Updated**: 2025-12-06 03:45 UTC
+**Last Updated**: 2025-12-06 03:50 UTC
 **System Version**: 1.0.0
 
 > **How to use**: See [CROSS-TEAM-QA-SYSTEM.md](./CROSS-TEAM-QA-SYSTEM.md) for full documentation
@@ -193,30 +193,35 @@ Nexus sends request to DE → DE queries Mnemo → DE crafts prompt
 
 ---
 
-### [Q-016] Tier 2 Endpoint Structure Confirmation
-**From**: Nexus → **To**: DE
+### [Q-016] Domain Update Request for Integration Brief
+**From**: DE → **To**: Nexus
 **Category**: Integration
 **Status**: 🟡 Open
-**Asked**: 2025-12-05
+**Asked**: 2025-12-06
 
-**Question**: Should the Tier 2 escalation endpoints use the Config Service (api.distributedelectrons.com) with `/tier2/*` paths, or a different service/structure?
+**Question**: Since our domain is `distributedelectrons.com`, let's use that in place of `de.solamp.workers.dev` in the integration brief, okay?
 
-**Proposed Structure**:
+**Proposed Changes**:
 ```
-POST https://api.distributedelectrons.com/tier2/escalate
-POST https://api.distributedelectrons.com/tier2/grades
+OLD: POST https://de.solamp.workers.dev/api/request
+NEW: POST https://api.distributedelectrons.com/tier2/escalate
+
+OLD: POST https://de.solamp.workers.dev/api/grades
+NEW: POST https://api.distributedelectrons.com/tier2/grades
 ```
 
-**Assumptions**:
-- Config Service handles routing and is the logical place for Tier 2 escalation
-- `/tier2/*` path distinguishes from other API operations
-- Config Service can implement these new endpoints
+**Rationale**:
+- `distributedelectrons.com` is our production domain (all 10 services already deployed)
+- `api.distributedelectrons.com` is the Config Service (handles routing and model selection)
+- `/tier2/*` path clearly indicates Tier 2 operations
+- Matches actual infrastructure documented in DNS_SETUP_COMPLETE.md
 
-**Alternative**: Should we use a dedicated Tier 2 service (e.g., `tier2.distributedelectrons.com`)?
+**Already Updated**:
+- ✅ Updated endpoints in DE-TEAM-INTEGRATION-BRIEF.md (lines 81, 114)
 
-**Context**: Updated DE-TEAM-INTEGRATION-BRIEF.md with these endpoints. Need confirmation before finalizing integration architecture.
+**Request**: Please confirm this domain structure works for Nexus integration, or let us know if you prefer a different approach.
 
-**Answer**: _Waiting for DE response_
+**Answer**: _Waiting for Nexus response_
 
 ---
 
@@ -603,10 +608,10 @@ _No questions closed yet - this is the initial board_
 - **Low**: 0 questions
 
 **By Team**:
-- **To DE**: 9 questions (Q-001 to Q-008, Q-016)
+- **To DE**: 8 questions (Q-001 to Q-008)
 - **To Mnemo**: 7 questions (Q-009 to Q-015)
 - **To Chris**: 0 questions
-- **To Nexus**: 0 questions
+- **To Nexus**: 1 question (Q-016)
 
 **Average Age**: < 1 day (all asked 2025-12-05)
 
@@ -615,10 +620,13 @@ _No questions closed yet - this is the initial board_
 ## 🔄 Next Actions
 
 **For DE Team**:
-- Review and answer Q-001 to Q-008, Q-016 (9 high-priority integration questions)
+- Review and answer Q-001 to Q-008 (8 high-priority integration questions)
 
 **For Mnemo Team**:
 - Review and answer Q-009 to Q-015 (7 medium-priority technical questions)
+
+**For Nexus Team**:
+- Review and answer Q-016 (1 high-priority domain confirmation)
 
 **For All Teams**:
 - Check this board at startup (daily)
@@ -627,5 +635,5 @@ _No questions closed yet - this is the initial board_
 
 ---
 
-**Last Updated**: 2025-12-06 03:45 UTC
+**Last Updated**: 2025-12-06 03:50 UTC
 **Next Review**: Daily (all teams)
