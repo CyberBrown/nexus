@@ -1,22 +1,80 @@
 import type { Context, Next } from 'hono';
-import type { AppType } from '../types/index.ts';
+import { jwtVerify, createRemoteJWKSet, type JWTPayload } from 'jose';
+import type { AppType, Env } from '../types/index.ts';
+import { generateTenantKey } from './encryption.ts';
 
-// Simple JWT-like auth for now
-// In production, use proper JWT validation with jose or similar
+// Cloudflare Access JWT payload
+interface AccessJWTPayload extends JWTPayload {
+  email: string;
+  sub: string; // User ID from Access
+  aud: string[];
+  iss: string;
+  iat: number;
+  exp: number;
+  type?: string;
+  identity_nonce?: string;
+  name?: string;
+  country?: string;
+}
 
-interface TokenPayload {
+// Cache JWKS to avoid fetching on every request
+let jwksCache: ReturnType<typeof createRemoteJWKSet> | null = null;
+let jwksCacheTeamDomain: string | null = null;
+
+function getJWKS(teamDomain: string) {
+  // Return cached JWKS if same team domain
+  if (jwksCache && jwksCacheTeamDomain === teamDomain) {
+    return jwksCache;
+  }
+
+  // Create new JWKS and cache it
+  jwksCache = createRemoteJWKSet(
+    new URL(`${teamDomain}/cdn-cgi/access/certs`)
+  );
+  jwksCacheTeamDomain = teamDomain;
+  return jwksCache;
+}
+
+// Validate Cloudflare Access JWT
+async function validateAccessToken(
+  token: string,
+  env: Env
+): Promise<AccessJWTPayload | null> {
+  const teamDomain = env.TEAM_DOMAIN;
+  const policyAud = env.POLICY_AUD;
+
+  if (!teamDomain || !policyAud) {
+    console.error('Missing TEAM_DOMAIN or POLICY_AUD environment variables');
+    return null;
+  }
+
+  try {
+    const JWKS = getJWKS(teamDomain);
+
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: teamDomain,
+      audience: policyAud,
+    });
+
+    return payload as AccessJWTPayload;
+  } catch (error) {
+    console.error('Access JWT validation failed:', error);
+    return null;
+  }
+}
+
+// Legacy dev token (for development only)
+interface DevTokenPayload {
   tenant_id: string;
   user_id: string;
   exp: number;
 }
 
-// Decode a simple base64-encoded JSON token (NOT secure - for dev only)
-// Replace with proper JWT validation in production
-function decodeToken(token: string): TokenPayload | null {
+function decodeDevToken(token: string): DevTokenPayload | null {
   try {
     const payload = JSON.parse(atob(token));
     if (payload.tenant_id && payload.user_id && payload.exp) {
-      return payload as TokenPayload;
+      return payload as DevTokenPayload;
     }
     return null;
   } catch {
@@ -24,54 +82,148 @@ function decodeToken(token: string): TokenPayload | null {
   }
 }
 
-// Auth middleware
+// Find or create user from Access JWT
+async function findOrCreateUser(
+  db: D1Database,
+  kv: KVNamespace,
+  payload: AccessJWTPayload
+): Promise<{ tenantId: string; userId: string; isNewUser: boolean } | null> {
+  const email = payload.email;
+
+  if (!email) {
+    console.error('No email in Access JWT payload');
+    return null;
+  }
+
+  // Try to find existing user by email
+  const existingUser = await db.prepare(`
+    SELECT u.id as user_id, u.tenant_id
+    FROM users u
+    WHERE u.email = ? AND u.deleted_at IS NULL
+  `).bind(email).first<{ user_id: string; tenant_id: string }>();
+
+  if (existingUser) {
+    return {
+      tenantId: existingUser.tenant_id,
+      userId: existingUser.user_id,
+      isNewUser: false,
+    };
+  }
+
+  // User doesn't exist - auto-provision on first login
+  const now = new Date().toISOString();
+  const tenantId = crypto.randomUUID();
+  const userId = crypto.randomUUID();
+
+  // Create tenant
+  await db.prepare(`
+    INSERT INTO tenants (id, name, encryption_key_ref, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(tenantId, `${email}'s Workspace`, `tenant:${tenantId}:key`, now, now).run();
+
+  // Generate encryption key for tenant
+  await generateTenantKey(kv, tenantId);
+
+  // Create user
+  const name = payload.name || email.split('@')[0];
+  await db.prepare(`
+    INSERT INTO users (id, tenant_id, email, name, role, timezone, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(userId, tenantId, email, name, 'owner', 'UTC', now, now).run();
+
+  console.log(`Auto-provisioned new user: ${email} (tenant: ${tenantId}, user: ${userId})`);
+
+  return { tenantId, userId, isNewUser: true };
+}
+
+// Auth middleware - supports both Cloudflare Access and dev tokens
 export function authMiddleware() {
   return async (c: Context<AppType>, next: Next) => {
-    const authHeader = c.req.header('Authorization');
+    const env = c.env;
 
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ success: false, error: 'Missing or invalid authorization header' }, 401);
+    // Check for Cloudflare Access JWT first (production)
+    const accessToken = c.req.header('Cf-Access-Jwt-Assertion');
+
+    if (accessToken && env.TEAM_DOMAIN && env.POLICY_AUD) {
+      const payload = await validateAccessToken(accessToken, env);
+
+      if (!payload) {
+        return c.json({ success: false, error: 'Invalid Access token' }, 401);
+      }
+
+      // Find or create user
+      const user = await findOrCreateUser(env.DB, env.KV, payload);
+
+      if (!user) {
+        return c.json({ success: false, error: 'User provisioning failed' }, 500);
+      }
+
+      c.set('tenantId', user.tenantId);
+      c.set('userId', user.userId);
+      c.set('userEmail', payload.email);
+
+      await next();
+      return;
     }
 
-    const token = authHeader.slice(7);
-    const payload = decodeToken(token);
+    // Fall back to dev token (development only)
+    if (env.ENVIRONMENT === 'development') {
+      const authHeader = c.req.header('Authorization');
 
-    if (!payload) {
-      return c.json({ success: false, error: 'Invalid token' }, 401);
+      if (!authHeader?.startsWith('Bearer ')) {
+        return c.json({
+          success: false,
+          error: 'Missing authorization. Use Cloudflare Access or dev token.'
+        }, 401);
+      }
+
+      const token = authHeader.slice(7);
+      const payload = decodeDevToken(token);
+
+      if (!payload) {
+        return c.json({ success: false, error: 'Invalid dev token' }, 401);
+      }
+
+      if (payload.exp < Date.now()) {
+        return c.json({ success: false, error: 'Dev token expired' }, 401);
+      }
+
+      // Verify tenant exists
+      const tenant = await env.DB.prepare(
+        'SELECT id FROM tenants WHERE id = ? AND deleted_at IS NULL'
+      ).bind(payload.tenant_id).first();
+
+      if (!tenant) {
+        return c.json({ success: false, error: 'Invalid tenant' }, 401);
+      }
+
+      c.set('tenantId', payload.tenant_id);
+      c.set('userId', payload.user_id);
+
+      await next();
+      return;
     }
 
-    if (payload.exp < Date.now()) {
-      return c.json({ success: false, error: 'Token expired' }, 401);
-    }
-
-    // Verify tenant exists
-    const tenant = await c.env.DB.prepare(
-      'SELECT id FROM tenants WHERE id = ? AND deleted_at IS NULL'
-    ).bind(payload.tenant_id).first();
-
-    if (!tenant) {
-      return c.json({ success: false, error: 'Invalid tenant' }, 401);
-    }
-
-    // Attach auth info to context
-    c.set('tenantId', payload.tenant_id);
-    c.set('userId', payload.user_id);
-
-    await next();
+    // No valid auth found
+    return c.json({
+      success: false,
+      error: 'Authentication required. Enable Cloudflare Access for this application.'
+    }, 401);
   };
 }
 
 // Helper to get auth info from context
-export function getAuth(c: Context<AppType>): { tenantId: string; userId: string } {
+export function getAuth(c: Context<AppType>): { tenantId: string; userId: string; userEmail?: string } {
   return {
     tenantId: c.get('tenantId'),
     userId: c.get('userId'),
+    userEmail: c.get('userEmail'),
   };
 }
 
-// Generate a dev token (for testing only)
+// Generate a dev token (for testing only - development environment)
 export function generateDevToken(tenantId: string, userId: string, expiresInMs = 86400000): string {
-  const payload: TokenPayload = {
+  const payload: DevTokenPayload = {
     tenant_id: tenantId,
     user_id: userId,
     exp: Date.now() + expiresInMs,

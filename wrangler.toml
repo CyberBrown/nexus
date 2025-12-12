@@ -12,6 +12,9 @@ database_id = "1210076d-a443-443c-8623-a02b5ff4de9f"
 
 [vars]
 ENVIRONMENT = "development"
+# Cloudflare Access - set these for production auth
+# TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
+# POLICY_AUD = "your-application-audience-tag"
 
 [[kv_namespaces]]
 binding = "KV"

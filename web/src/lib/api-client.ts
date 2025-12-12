@@ -374,6 +374,14 @@ export class ApiClient {
     });
   }
 
+  // Auth API
+  async getMe(): Promise<{ user: any; tenant: any }> {
+    const response = await this.request<ApiResponse<{ user: any; tenant: any }>>(
+      '/auth/me'
+    );
+    return response.data;
+  }
+
   // WebSocket for real-time updates
   createWebSocket(): WebSocket | null {
     if (typeof window === 'undefined') return null;
