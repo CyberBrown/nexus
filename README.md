@@ -126,48 +126,30 @@ Nexus exposes an MCP (Model Context Protocol) server that allows Claude.ai to in
 | `nexus_list_tasks` | List tasks with filtering |
 | `nexus_capture` | Capture raw input for AI classification |
 
-### Connecting from Claude.ai
+### Connecting from Claude Code
 
-1. **Configure MCP in Claude Desktop** (claude_desktop_config.json):
+Use `mcp-manager` to enable the Nexus server:
+
+```bash
+mcp-manager enable nexus
+```
+
+Or manually configure in `.claude.json`:
 
 ```json
 {
   "mcpServers": {
     "nexus": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://nexus.solamp.workers.dev/api/mcp"],
-      "env": {
-        "CF_ACCESS_CLIENT_ID": "your-client-id.access",
-        "CF_ACCESS_CLIENT_SECRET": "your-client-secret"
-      }
+      "args": [
+        "mcp-remote",
+        "https://nexus.solamp.workers.dev/mcp",
+        "--header", "CF-Access-Client-Id: YOUR_CLIENT_ID",
+        "--header", "CF-Access-Client-Secret: YOUR_CLIENT_SECRET"
+      ]
     }
   }
 }
-```
-
-2. **Or use direct HTTP** (for custom integrations):
-
-```bash
-# Initialize connection
-curl -X POST https://nexus.solamp.workers.dev/api/mcp \
-  -H "Content-Type: application/json" \
-  -H "CF-Access-Client-Id: your-client-id.access" \
-  -H "CF-Access-Client-Secret: your-client-secret" \
-  -d '{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1.0"}}}'
-
-# List available tools
-curl -X POST https://nexus.solamp.workers.dev/api/mcp \
-  -H "Content-Type: application/json" \
-  -H "CF-Access-Client-Id: your-client-id.access" \
-  -H "CF-Access-Client-Secret: your-client-secret" \
-  -d '{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}'
-
-# Call a tool
-curl -X POST https://nexus.solamp.workers.dev/api/mcp \
-  -H "Content-Type: application/json" \
-  -H "CF-Access-Client-Id: your-client-id.access" \
-  -H "CF-Access-Client-Secret: your-client-secret" \
-  -d '{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "nexus_list_ideas", "arguments": {"limit": 5}}}'
 ```
 
 ### Authentication

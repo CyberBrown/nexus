@@ -12,7 +12,7 @@ import ideasRoutes from './routes/ideas.ts';
 import peopleRoutes from './routes/people.ts';
 import commitmentsRoutes from './routes/commitments.ts';
 import executionRoutes from './routes/execution.ts';
-import mcpRoutes from './mcp/index.ts';
+import { createNexusMcpHandler } from './mcp/index.ts';
 import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 
 // Re-export Durable Objects
@@ -122,8 +122,6 @@ api.route('/people', peopleRoutes);
 api.route('/commitments', commitmentsRoutes);
 api.route('/execution', executionRoutes);
 
-// MCP endpoint for Claude.ai integration
-api.route('/mcp', mcpRoutes);
 
 // ========================================
 // Auth Routes
@@ -932,6 +930,15 @@ api.get('/sync/ws', async (c) => {
 });
 
 app.route('/api', api);
+
+// ========================================
+// MCP Server Endpoint (root level for mcp-remote compatibility)
+// ========================================
+app.all('/mcp', authMiddleware(), async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const handler = createNexusMcpHandler(c.env, tenantId, userId);
+  return handler(c.req.raw, c.env, c.executionCtx);
+});
 
 // 404 handler
 app.notFound((c) => {
