@@ -8,6 +8,9 @@ export interface Env {
   SYNC_MANAGER: DurableObjectNamespace;
   USER_SESSION: DurableObjectNamespace;
   ANTHROPIC_API_KEY: string;
+  // Cloudflare Access
+  TEAM_DOMAIN?: string; // e.g., https://your-team.cloudflareaccess.com
+  POLICY_AUD?: string; // Application Audience (AUD) tag
 }
 
 // Cloudflare Scheduled Event
@@ -36,6 +39,7 @@ export interface ClassificationResult {
 export interface Variables {
   tenantId: string;
   userId: string;
+  userEmail?: string; // Available with Cloudflare Access auth
 }
 
 // App type for Hono

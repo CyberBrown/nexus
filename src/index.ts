@@ -105,6 +105,57 @@ api.route('/people', peopleRoutes);
 api.route('/commitments', commitmentsRoutes);
 
 // ========================================
+// Auth Routes
+// ========================================
+
+// Get current user info
+api.get('/auth/me', async (c) => {
+  const { tenantId, userId, userEmail } = getAuth(c);
+
+  try {
+    // Get user details from database
+    const user = await c.env.DB.prepare(`
+      SELECT id, email, name, role, timezone, created_at
+      FROM users
+      WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+    `).bind(userId, tenantId).first();
+
+    if (!user) {
+      return c.json({ success: false, error: 'User not found' }, 404);
+    }
+
+    // Get tenant info
+    const tenant = await c.env.DB.prepare(`
+      SELECT id, name, created_at
+      FROM tenants
+      WHERE id = ? AND deleted_at IS NULL
+    `).bind(tenantId).first();
+
+    return c.json({
+      success: true,
+      data: {
+        user: {
+          id: user.id,
+          email: user.email || userEmail,
+          name: user.name,
+          role: user.role,
+          timezone: user.timezone,
+          created_at: user.created_at,
+        },
+        tenant: tenant ? {
+          id: tenant.id,
+          name: tenant.name,
+          created_at: tenant.created_at,
+        } : null,
+      },
+    });
+  } catch (error) {
+    console.error('Get user error:', error);
+    return c.json({ success: false, error: 'Failed to get user info' }, 500);
+  }
+});
+
+// ========================================
 // InboxManager Durable Object Routes
 // ========================================
 

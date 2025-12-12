@@ -141,8 +141,10 @@ The core foundation has been built and tested. Current capabilities:
 - **Custom error classes** (AppError, ValidationError, NotFoundError, etc.)
 - **InboxManager Durable Object** with capture, batch capture, queue, and WebSocket
 - **AI Classification** via Claude API (auto-creates tasks with ≥80% confidence)
-- **Dev token auth** for development
-- **Test suite** with 53 passing tests
+- **Cloudflare Access auth** for production (JWT validation via jose)
+- **Dev token auth** for development (fallback)
+- **Auto user provisioning** on first login
+- **Test suite** with 97 passing tests
 
 ### API Structure
 
@@ -150,7 +152,7 @@ The core foundation has been built and tested. Current capabilities:
 src/
 ├── index.ts                    # Main worker entry, Hono router
 ├── lib/
-│   ├── auth.ts                 # Auth middleware (dev JWT)
+│   ├── auth.ts                 # Auth middleware (Cloudflare Access + dev JWT)
 │   ├── classifier.ts           # Claude AI classification
 │   ├── db.ts                   # D1 helpers with tenant scoping
 │   ├── encryption.ts           # AES-256-GCM encryption
@@ -184,6 +186,7 @@ src/
 | `/api/capture/status` | GET | InboxManager status |
 | `/api/capture/queue` | GET | Classification queue |
 | `/api/capture/ws` | WebSocket | Real-time updates |
+| `/api/auth/me` | GET | Current user and tenant info |
 | `/setup` | POST | Dev-only: create tenant/user |
 
 ## Fields to Encrypt
@@ -195,6 +198,70 @@ src/
 - `people.name`, `people.email`, `people.phone`, `people.notes`
 - `commitments.description`
 
+## Authentication
+
+Nexus uses **Cloudflare Access** for production authentication. Access handles the OAuth flow and injects a JWT into requests via the `Cf-Access-Jwt-Assertion` header.
+
+### How It Works
+
+1. User visits the app URL protected by Cloudflare Access
+2. Access redirects to login (Google, GitHub, email OTP, etc.)
+3. After auth, Access injects JWT into all requests
+4. Worker validates JWT using jose library against Access JWKS
+5. On first login, user/tenant auto-provisioned with encryption key
+
+### Setting Up Cloudflare Access (Production)
+
+1. **Create Access Application**:
+   - Go to [Cloudflare One Dashboard](https://one.dash.cloudflare.com/)
+   - Navigate to **Access** → **Applications** → **Add an application**
+   - Choose **Self-hosted** and enter your Worker URL
+   - Configure authentication methods (Google, GitHub, email OTP, etc.)
+
+2. **Get Your Configuration**:
+   - Copy **Team Domain** (e.g., `https://your-team.cloudflareaccess.com`)
+   - Copy **Application Audience (AUD) Tag** from application settings
+
+3. **Set Environment Variables**:
+   ```bash
+   # Add to wrangler.toml [vars] section or set as secrets
+   npx wrangler secret put TEAM_DOMAIN
+   # Enter: https://your-team.cloudflareaccess.com
+
+   npx wrangler secret put POLICY_AUD
+   # Enter: your-application-aud-tag
+   ```
+
+4. **Deploy**:
+   ```bash
+   npm run deploy
+   ```
+
+### Development Mode
+
+In development (`ENVIRONMENT=development`), the dev token flow still works:
+
+```bash
+# Start dev server
+npm run dev
+
+# Create a dev user and get token
+curl -X POST http://localhost:8787/setup
+
+# Use the returned token
+curl -H "Authorization: Bearer <token>" http://localhost:8787/api/tasks
+```
+
+### Auth Flow Diagram
+
+```
+Production (Cloudflare Access):
+Browser → Access Login → Access injects JWT → Worker validates → Auto-provision user
+
+Development:
+POST /setup → Returns dev token → Use Bearer token → Worker validates
+```
+
 ## Secrets Management
 
 **All secrets are stored in Cloudflare Workers Secrets** - never in code or `.env` files.
@@ -204,6 +271,8 @@ src/
 | Secret | Description |
 |--------|-------------|
 | `ANTHROPIC_API_KEY` | Claude API key for AI classification |
+| `TEAM_DOMAIN` | Cloudflare Access team domain (production) |
+| `POLICY_AUD` | Cloudflare Access application audience tag (production) |
 
 ### Managing Secrets
 
@@ -271,11 +340,16 @@ npm run db:migrate:remote
 - Log errors but don't expose internals to client
 - All timestamps in ISO 8601 format
 
-## Next Phase
+## Project Status
 
-Ready to build:
-- **Production Auth** - Replace dev JWT with OAuth/Clerk
-- **Complete Web Dashboard** - Projects, Ideas, People, Commitments pages
+### Completed
+- **Production Auth** - Cloudflare Access JWT validation ✅
+- **Durable Objects** - UserSession, SyncManager, CaptureBuffer, InboxManager ✅
+- **Recurring Tasks** - Scheduler with cron triggers ✅
+- **Web Dashboard Foundation** - Qwik app with core pages ✅
+
+### In Progress
+- **Web Dashboard Completion** - Finish placeholder pages (Projects, Ideas, People, Commitments)
 - **Mnemo Integration** - Context orchestration (Nexus tells Mnemo what to load)
 - **Email Integration** - Gmail/IMAP ingestion and classification
 
@@ -368,7 +442,7 @@ Autonomous development organization with Chris as CEO:
 - Chris provides direction, taste, and key decisions
 - System learns from decisions to improve prioritization
 
-Future phases:
+### Future Phases
 - Google Calendar integration
 - Cross-device sync
 - Mobile clients (via Bridge project)

@@ -1,6 +1,6 @@
 /**
  * Authentication context for Qwik
- * Provides auth state and methods throughout the app
+ * Supports Cloudflare Access (production) and dev tokens (development)
  */
 
 import {
@@ -19,20 +19,29 @@ export interface AuthUser {
   id: string;
   email: string;
   name: string;
-  tenant_id: string;
+  role: string;
+  timezone: string;
+}
+
+export interface AuthTenant {
+  id: string;
+  name: string;
 }
 
 export interface AuthState {
   user: AuthUser | null;
+  tenant: AuthTenant | null;
   isAuthenticated: boolean;
   isLoading: boolean;
+  authMethod: 'access' | 'dev' | null;
 }
 
 export interface AuthContextValue {
   state: AuthState;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<boolean>;
   logout: () => void;
-  setToken: (token: string) => void;
+  setDevToken: (token: string) => void;
+  checkAuth: () => Promise<boolean>;
 }
 
 // Create context
@@ -41,82 +50,113 @@ export const AuthContext = createContextId<AuthContextValue>('auth-context');
 // Auth provider component
 export const AuthProvider = component$(() => {
   const user = useSignal<AuthUser | null>(null);
+  const tenant = useSignal<AuthTenant | null>(null);
   const isAuthenticated = useSignal(false);
   const isLoading = useSignal(true);
+  const authMethod = useSignal<'access' | 'dev' | null>(null);
 
-  // Check for existing token on mount
-  useVisibleTask$(({ track }) => {
-    track(() => isLoading.value);
+  // Check authentication status on mount
+  useVisibleTask$(async () => {
+    try {
+      // Try to fetch /auth/me - works with both Access and dev tokens
+      const response = await apiClient.getMe();
 
-    if (typeof window !== 'undefined') {
-      const token = localStorage.getItem('nexus_token');
-      if (token) {
-        apiClient.setToken(token);
-        // In a real app, validate token with API
-        // For dev, just mark as authenticated
+      if (response.user) {
+        user.value = response.user;
+        tenant.value = response.tenant;
         isAuthenticated.value = true;
-
-        // Try to get user info
-        const userJson = localStorage.getItem('nexus_user');
-        if (userJson) {
-          try {
-            user.value = JSON.parse(userJson);
-          } catch (e) {
-            console.error('Failed to parse user data', e);
-          }
-        }
+        // Determine auth method based on whether we have a dev token stored
+        authMethod.value = localStorage.getItem('nexus_token') ? 'dev' : 'access';
       }
+    } catch (error) {
+      // Not authenticated or API not available
+      console.log('Auth check failed:', error);
+      isAuthenticated.value = false;
+      user.value = null;
+      tenant.value = null;
+    } finally {
       isLoading.value = false;
     }
   });
 
-  const login = $(async (email: string, password: string) => {
-    // TODO: Implement proper login API call
-    // For now, this is a placeholder for dev JWT auth
-    console.log('Login not fully implemented - using dev mode');
+  // Dev login (for development environment only)
+  const login = $(async (email: string, _password: string): Promise<boolean> => {
+    try {
+      // Call the /setup endpoint to create a dev user and get a token
+      const response = await fetch('/setup', { method: 'POST' });
 
-    // In dev mode, accept any login and use dev token
-    const devToken = 'dev-token-placeholder';
-    const devUser: AuthUser = {
-      id: 'user_dev',
-      email: email,
-      name: 'Dev User',
-      tenant_id: 'tenant_dev',
-    };
+      if (!response.ok) {
+        console.error('Dev setup failed - may not be in development mode');
+        return false;
+      }
 
-    apiClient.setToken(devToken);
-    user.value = devUser;
-    isAuthenticated.value = true;
+      const data = await response.json();
 
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('nexus_user', JSON.stringify(devUser));
+      if (data.success && data.data?.token) {
+        apiClient.setToken(data.data.token);
+        authMethod.value = 'dev';
+
+        // Now fetch user info
+        const meResponse = await apiClient.getMe();
+        user.value = meResponse.user;
+        tenant.value = meResponse.tenant;
+        isAuthenticated.value = true;
+
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error('Login error:', error);
+      return false;
     }
   });
 
   const logout = $(() => {
     apiClient.clearToken();
     user.value = null;
+    tenant.value = null;
     isAuthenticated.value = false;
+    authMethod.value = null;
 
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem('nexus_user');
-    }
+    // If using Cloudflare Access, redirect to logout URL
+    // Access logout: https://<team-domain>/cdn-cgi/access/logout
+    // For now, just clear local state - Access handles session via cookies
   });
 
-  const setToken = $((token: string) => {
+  const setDevToken = $((token: string) => {
     apiClient.setToken(token);
-    isAuthenticated.value = true;
+    authMethod.value = 'dev';
+  });
+
+  const checkAuth = $(async (): Promise<boolean> => {
+    try {
+      const response = await apiClient.getMe();
+      if (response.user) {
+        user.value = response.user;
+        tenant.value = response.tenant;
+        isAuthenticated.value = true;
+        return true;
+      }
+      return false;
+    } catch {
+      isAuthenticated.value = false;
+      return false;
+    }
   });
 
   const contextValue: AuthContextValue = {
     state: {
       user: user.value,
+      tenant: tenant.value,
       isAuthenticated: isAuthenticated.value,
       isLoading: isLoading.value,
+      authMethod: authMethod.value,
     },
     login,
     logout,
-    setToken,
+    setDevToken,
+    checkAuth,
   };
 
   useContextProvider(AuthContext, contextValue);
