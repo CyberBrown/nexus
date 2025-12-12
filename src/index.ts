@@ -12,6 +12,7 @@ import ideasRoutes from './routes/ideas.ts';
 import peopleRoutes from './routes/people.ts';
 import commitmentsRoutes from './routes/commitments.ts';
 import executionRoutes from './routes/execution.ts';
+import mcpRoutes from './mcp/index.ts';
 import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 
 // Re-export Durable Objects
@@ -120,6 +121,9 @@ api.route('/ideas', ideasRoutes);
 api.route('/people', peopleRoutes);
 api.route('/commitments', commitmentsRoutes);
 api.route('/execution', executionRoutes);
+
+// MCP endpoint for Claude.ai integration
+api.route('/mcp', mcpRoutes);
 
 // ========================================
 // Auth Routes

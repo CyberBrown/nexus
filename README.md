@@ -102,6 +102,81 @@ bun run deploy
 | `/api/capture/ws` | WebSocket | Real-time updates |
 | `/api/sync/*` | Various | Cross-device sync |
 | `/api/session/*` | Various | Session management |
+| `/api/execution/*` | Various | Idea execution pipeline |
+| `/api/mcp` | POST | MCP server for Claude.ai |
+
+## MCP Server (Claude.ai Integration)
+
+Nexus exposes an MCP (Model Context Protocol) server that allows Claude.ai to interact with your task and idea management system directly.
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `nexus_create_idea` | Create a new idea for future planning |
+| `nexus_plan_idea` | Generate an AI execution plan for an idea |
+| `nexus_execute_idea` | Create tasks from a planned idea |
+| `nexus_get_status` | Get execution status for an idea |
+| `nexus_list_ideas` | List all ideas with filtering |
+| `nexus_list_active` | List active executions |
+| `nexus_list_blocked` | List blocked executions needing input |
+| `nexus_resolve_blocker` | Resolve a blocker on an execution |
+| `nexus_cancel_execution` | Cancel an in-progress execution |
+| `nexus_log_decision` | Log a CEO decision |
+| `nexus_list_tasks` | List tasks with filtering |
+| `nexus_capture` | Capture raw input for AI classification |
+
+### Connecting from Claude.ai
+
+1. **Configure MCP in Claude Desktop** (claude_desktop_config.json):
+
+```json
+{
+  "mcpServers": {
+    "nexus": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://nexus.solamp.workers.dev/api/mcp"],
+      "env": {
+        "CF_ACCESS_CLIENT_ID": "your-client-id.access",
+        "CF_ACCESS_CLIENT_SECRET": "your-client-secret"
+      }
+    }
+  }
+}
+```
+
+2. **Or use direct HTTP** (for custom integrations):
+
+```bash
+# Initialize connection
+curl -X POST https://nexus.solamp.workers.dev/api/mcp \
+  -H "Content-Type: application/json" \
+  -H "CF-Access-Client-Id: your-client-id.access" \
+  -H "CF-Access-Client-Secret: your-client-secret" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1.0"}}}'
+
+# List available tools
+curl -X POST https://nexus.solamp.workers.dev/api/mcp \
+  -H "Content-Type: application/json" \
+  -H "CF-Access-Client-Id: your-client-id.access" \
+  -H "CF-Access-Client-Secret: your-client-secret" \
+  -d '{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}'
+
+# Call a tool
+curl -X POST https://nexus.solamp.workers.dev/api/mcp \
+  -H "Content-Type: application/json" \
+  -H "CF-Access-Client-Id: your-client-id.access" \
+  -H "CF-Access-Client-Secret: your-client-secret" \
+  -d '{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "nexus_list_ideas", "arguments": {"limit": 5}}}'
+```
+
+### Authentication
+
+The MCP endpoint requires Cloudflare Access service token authentication. Headers required:
+- `CF-Access-Client-Id`: Your service token client ID
+- `CF-Access-Client-Secret`: Your service token client secret
+
+Get service tokens from [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Access → Service Auth.
 
 ## Roadmap
 
