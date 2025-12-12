@@ -3,7 +3,45 @@
 
 ## Project Overview
 
-Nexus is a Personal AI Command Center - a voice-first, AI-native productivity system that captures, organizes, prioritizes, and surfaces the right information at the right time.
+Nexus is **The Brain** of the AI infrastructure ecosystem - the orchestration layer that handles Tier 1 processing, memory management, and coordinates all other services.
+
+### Ecosystem Role
+
+| Pillar | Role |
+|--------|------|
+| **Nexus** (this) | The Brain - orchestration, Tier 1 processing, memory management |
+| [Mnemo](https://github.com/Logos-Flux/mnemo) | Working Memory - context caching only (no decision-making) |
+| [DE](https://github.com/CyberBrown/distributed-electrons) | Arms & Legs - Tier 2+ execution, LLM routing, media services |
+| Bridge (future) | User Interface - voice, text, graphics, all user-facing |
+
+### Nexus Core Responsibilities
+
+**Tier 1 Processing:**
+- Fast/cheap edge AI classification
+- Input triage and routing
+- Decide when to escalate to Tier 2 (DE)
+
+**Active Memory Manager (AMM):**
+- Entity detection in conversations
+- Session awareness and context tracking
+- Proactive context loading triggers
+- Decides WHAT context Mnemo should load
+- Manages memory tiers (HOT/WARM/COLD)
+
+**Long-term Memory:**
+- Persistent storage and retrieval
+- Cross-session knowledge
+- User preferences and patterns
+
+**Orchestration:**
+- Coordinates Mnemo (tells it what to load)
+- Coordinates DE (sends Tier 2 requests)
+- Input/output routing
+
+**NOT Nexus's Job:**
+- Voice/UI (that's Bridge)
+- Context caching mechanics (that's Mnemo)
+- LLM execution (that's DE)
 
 ## Tech Stack
 
@@ -237,12 +275,11 @@ npm run db:migrate:remote
 
 Ready to build:
 - **Production Auth** - Replace dev JWT with OAuth/Clerk
-- **Remaining Durable Objects** - UserSession, SyncManager, CaptureBuffer
-- **Recurring Tasks** - Logic to spawn recurring task instances
-- **Web Dashboard** - UI for reviewing/organizing captured items
+- **Complete Web Dashboard** - Projects, Ideas, People, Commitments pages
+- **Mnemo Integration** - Context orchestration (Nexus tells Mnemo what to load)
+- **Email Integration** - Gmail/IMAP ingestion and classification
 
 Future phases:
-- Android client with continuous voice capture
 - Google Calendar integration
-- Email integration (Gmail/IMAP)
 - Cross-device sync
+- Mobile clients (via Bridge project)
