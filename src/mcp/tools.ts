@@ -253,3 +253,71 @@ export const tools: MCPTool[] = [
 export function getToolByName(name: string): MCPTool | undefined {
   return tools.find(t => t.name === name);
 }
+
+/**
+ * MCP Prompts - These become slash commands in Claude Code
+ * Usage: /mcp__nexus__<prompt_name> [args]
+ */
+export interface MCPPrompt {
+  name: string;
+  description: string;
+  arguments?: Array<{
+    name: string;
+    description: string;
+    required?: boolean;
+  }>;
+}
+
+export const prompts: MCPPrompt[] = [
+  {
+    name: 'quick_capture',
+    description: 'Quickly capture content to Nexus inbox for AI classification',
+    arguments: [
+      {
+        name: 'content',
+        description: 'The content to capture (will be AI-classified)',
+        required: true,
+      },
+    ],
+  },
+  {
+    name: 'new_idea',
+    description: 'Create a new idea in Nexus',
+    arguments: [
+      {
+        name: 'title',
+        description: 'Title of the idea',
+        required: true,
+      },
+      {
+        name: 'description',
+        description: 'Detailed description of the idea',
+        required: false,
+      },
+      {
+        name: 'category',
+        description: 'Category: feature, improvement, bug, documentation, research, infrastructure, random',
+        required: false,
+      },
+    ],
+  },
+  {
+    name: 'check_status',
+    description: 'Check Nexus status - active executions, blocked items, and recent ideas',
+  },
+  {
+    name: 'plan_and_execute',
+    description: 'Plan an idea and optionally execute it to create tasks',
+    arguments: [
+      {
+        name: 'idea_id',
+        description: 'UUID of the idea to plan',
+        required: true,
+      },
+    ],
+  },
+  {
+    name: 'daily_review',
+    description: 'Do a daily review - see blocked items, in-progress work, inbox, and recent ideas',
+  },
+];

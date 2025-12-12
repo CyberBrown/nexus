@@ -8,7 +8,7 @@
 import { Hono } from 'hono';
 import type { AppType } from '../types/index.ts';
 import { getAuth } from '../lib/auth.ts';
-import { tools, getToolByName } from './tools.ts';
+import { tools, getToolByName, prompts } from './tools.ts';
 import { getEncryptionKey, encryptField, decryptField } from '../lib/encryption.ts';
 
 // MCP Protocol types
@@ -56,6 +56,7 @@ mcpRoutes.post('/', async (c) => {
           },
           capabilities: {
             tools: {},
+            prompts: {},
           },
         },
       } as MCPResponse);
@@ -71,6 +72,18 @@ mcpRoutes.post('/', async (c) => {
 
     case 'tools/call':
       return handleToolCall(c, body);
+
+    case 'prompts/list':
+      return c.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: {
+          prompts: prompts,
+        },
+      } as MCPResponse);
+
+    case 'prompts/get':
+      return handlePromptGet(c, body);
 
     case 'notifications/initialized':
       // Client acknowledged initialization
@@ -91,6 +104,129 @@ mcpRoutes.post('/', async (c) => {
       } as MCPResponse);
   }
 });
+
+/**
+ * Handle prompt get requests
+ */
+async function handlePromptGet(c: any, request: MCPRequest): Promise<Response> {
+  const params = request.params as { name: string; arguments?: Record<string, string> };
+  const prompt = prompts.find(p => p.name === params.name);
+
+  if (!prompt) {
+    return c.json({
+      jsonrpc: '2.0',
+      id: request.id,
+      error: {
+        code: -32602,
+        message: `Unknown prompt: ${params.name}`,
+      },
+    } as MCPResponse);
+  }
+
+  // Generate the prompt messages based on the prompt type
+  let messages: Array<{ role: string; content: { type: string; text: string } }> = [];
+  const args = params.arguments || {};
+
+  switch (params.name) {
+    case 'quick_capture':
+      messages = [{
+        role: 'user',
+        content: {
+          type: 'text',
+          text: `Capture this to Nexus: "${args.content || ''}"
+
+Use the nexus_capture tool to save this content. Then briefly confirm what was captured.`,
+        },
+      }];
+      break;
+
+    case 'new_idea':
+      messages = [{
+        role: 'user',
+        content: {
+          type: 'text',
+          text: `Create a new idea in Nexus:
+Title: ${args.title || 'Untitled'}
+${args.description ? `Description: ${args.description}` : ''}
+${args.category ? `Category: ${args.category}` : ''}
+
+Use the nexus_create_idea tool with these details. Then confirm the idea was created and suggest next steps (planning, adding more details, etc).`,
+        },
+      }];
+      break;
+
+    case 'check_status':
+      messages = [{
+        role: 'user',
+        content: {
+          type: 'text',
+          text: `Check my Nexus status. Use the following tools:
+1. nexus_list_active - Show active executions
+2. nexus_list_blocked - Show anything blocked needing my input
+3. nexus_list_ideas with status="no_execution" and limit=5 - Show recent unplanned ideas
+
+Summarize what needs my attention and what's in progress.`,
+        },
+      }];
+      break;
+
+    case 'plan_and_execute':
+      messages = [{
+        role: 'user',
+        content: {
+          type: 'text',
+          text: `Plan and execute idea: ${args.idea_id}
+
+1. First use nexus_get_status to see if there's already a plan
+2. If no plan exists, use nexus_plan_idea to generate one
+3. Show me the plan and ask if I want to proceed
+4. If I confirm, use nexus_execute_idea to create tasks`,
+        },
+      }];
+      break;
+
+    case 'daily_review':
+      messages = [{
+        role: 'user',
+        content: {
+          type: 'text',
+          text: `Do a daily review of my Nexus system:
+
+1. Use nexus_list_blocked to check for blockers needing resolution
+2. Use nexus_list_active to see in-progress work
+3. Use nexus_list_tasks with status="inbox" to see new tasks
+4. Use nexus_list_ideas with limit=10 to see recent ideas
+
+Give me a summary in this format:
+- 🚫 Blocked (need my input)
+- ⏳ In Progress
+- 📥 New in Inbox
+- 💡 Recent Ideas
+
+Then suggest what I should focus on.`,
+        },
+      }];
+      break;
+
+    default:
+      messages = [{
+        role: 'user',
+        content: {
+          type: 'text',
+          text: `Execute Nexus prompt: ${params.name}`,
+        },
+      }];
+  }
+
+  return c.json({
+    jsonrpc: '2.0',
+    id: request.id,
+    result: {
+      description: prompt.description,
+      messages,
+    },
+  } as MCPResponse);
+}
 
 /**
  * Handle tool calls
