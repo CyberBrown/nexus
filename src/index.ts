@@ -11,6 +11,7 @@ import projectsRoutes from './routes/projects.ts';
 import ideasRoutes from './routes/ideas.ts';
 import peopleRoutes from './routes/people.ts';
 import commitmentsRoutes from './routes/commitments.ts';
+import executionRoutes from './routes/execution.ts';
 import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 
 // Re-export Durable Objects
@@ -18,6 +19,10 @@ export { InboxManager } from './durable-objects/InboxManager.ts';
 export { CaptureBuffer } from './durable-objects/CaptureBuffer.ts';
 export { SyncManager } from './durable-objects/SyncManager.ts';
 export { UserSession } from './durable-objects/UserSession.ts';
+
+// Re-export Workflows
+export { IdeaToPlanWorkflow } from './workflows/IdeaToPlanWorkflow.ts';
+export { TaskExecutorWorkflow } from './workflows/TaskExecutorWorkflow.ts';
 
 // Scheduled handler for Cloudflare Cron Triggers
 export default {
@@ -103,6 +108,7 @@ api.route('/projects', projectsRoutes);
 api.route('/ideas', ideasRoutes);
 api.route('/people', peopleRoutes);
 api.route('/commitments', commitmentsRoutes);
+api.route('/execution', executionRoutes);
 
 // ========================================
 // Auth Routes

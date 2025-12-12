@@ -20,6 +20,9 @@ import type {
   CreateIdeaInput,
   CreatePersonInput,
   CreateCommitmentInput,
+  IdeaStatus,
+  IdeaListItem,
+  IdeaTask,
 } from './types';
 
 export class ApiClientError extends Error {
@@ -390,6 +393,79 @@ export class ApiClient {
     const ws = new WebSocket(wsUrl);
 
     return ws;
+  }
+
+  // ========================================
+  // Execution API
+  // ========================================
+
+  // Get ideas with execution info
+  async getExecutionIdeas(status?: string): Promise<IdeaListItem[]> {
+    const query = status ? `?status=${status}` : '';
+    const response = await this.request<ApiResponse<IdeaListItem[]>>(
+      `/execution/ideas${query}`
+    );
+    return response.data;
+  }
+
+  // Get full execution status for an idea
+  async getIdeaStatus(ideaId: string): Promise<IdeaStatus> {
+    const response = await this.request<ApiResponse<IdeaStatus>>(
+      `/execution/ideas/${ideaId}/status`
+    );
+    return response.data;
+  }
+
+  // Trigger planning workflow for an idea
+  async planIdea(ideaId: string): Promise<{ execution_id: string; workflow_instance_id: string }> {
+    const response = await this.request<ApiResponse<{ execution_id: string; workflow_instance_id: string }>>(
+      `/execution/ideas/${ideaId}/plan`,
+      { method: 'POST' }
+    );
+    return response.data;
+  }
+
+  // Execute a specific task
+  async executeTask(taskId: string): Promise<{ task_id: string; workflow_instance_id: string }> {
+    const response = await this.request<ApiResponse<{ task_id: string; workflow_instance_id: string }>>(
+      `/execution/tasks/${taskId}/execute`,
+      { method: 'POST' }
+    );
+    return response.data;
+  }
+
+  // Execute all ready tasks for an idea
+  async executeAllTasks(ideaId: string): Promise<{ tasks_started: number }> {
+    const response = await this.request<ApiResponse<{ tasks_started: number }>>(
+      `/execution/ideas/${ideaId}/execute-all`,
+      { method: 'POST' }
+    );
+    return response.data;
+  }
+
+  // Get tasks requiring human input
+  async getNeedsInput(): Promise<(IdeaTask & { idea_title: string })[]> {
+    const response = await this.request<ApiResponse<(IdeaTask & { idea_title: string })[]>>(
+      '/execution/needs-input'
+    );
+    return response.data;
+  }
+
+  // Complete a human task
+  async completeTask(taskId: string, result?: string): Promise<void> {
+    await this.request<ApiResponse<void>>(
+      `/execution/tasks/${taskId}/complete`,
+      { method: 'POST', body: { result } }
+    );
+  }
+
+  // Retry a failed task
+  async retryTask(taskId: string): Promise<{ task_id: string; retry_count: number }> {
+    const response = await this.request<ApiResponse<{ task_id: string; retry_count: number }>>(
+      `/execution/tasks/${taskId}/retry`,
+      { method: 'POST' }
+    );
+    return response.data;
   }
 }
 
