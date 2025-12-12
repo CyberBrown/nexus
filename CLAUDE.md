@@ -344,14 +344,56 @@ npm run db:migrate:remote
 
 ### Completed
 - **Production Auth** - Cloudflare Access JWT validation ✅
-- **Durable Objects** - UserSession, SyncManager, CaptureBuffer, InboxManager ✅
+- **Service Token Auth** - CF Access service tokens for M2M auth ✅
+- **Durable Objects** - UserSession, SyncManager, CaptureBuffer, InboxManager, IdeaExecutor ✅
 - **Recurring Tasks** - Scheduler with cron triggers ✅
 - **Web Dashboard Foundation** - Qwik app with core pages ✅
+- **AI Classification** - Claude-powered inbox item classification ✅
+- **Execution Loop** - IdeaExecutionLoop with plan generation and task creation ✅
 
 ### In Progress
+- **Task Review Loop** - Triage framework for task routing (see `docs/TASK_REVIEW_LOOP.md`)
+- **CodeExecutionLoop** - Auto-execute code/documentation tasks
 - **Web Dashboard Completion** - Finish placeholder pages (Projects, Ideas, People, Commitments)
 - **Mnemo Integration** - Context orchestration (Nexus tells Mnemo what to load)
 - **Email Integration** - Gmail/IMAP ingestion and classification
+
+## Execution Loop Hierarchy
+
+Nexus operates through a hierarchy of execution loops for autonomous task processing.
+See `docs/TASK_REVIEW_LOOP.md` for full documentation.
+
+```
+                    ┌─────────────────────────┐
+                    │   IdeaExecutionLoop     │  ← Parent Loop (implemented)
+                    │   (Idea → Plan → Tasks) │
+                    └───────────┬─────────────┘
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+            ▼                   ▼                   ▼
+┌───────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ CodeExecutionLoop │ │  ResearchLoop   │ │  ContentLoop    │
+│ (Code/Docs tasks) │ │ (Investigation) │ │ (Writing/Media) │
+└───────────────────┘ └─────────────────┘ └─────────────────┘
+        (partial)          (planned)           (planned)
+```
+
+### Loop Trigger Flow
+1. Idea enters system → IdeaExecutionLoop generates plan
+2. Plan decomposes into tasks with `loop_type` (code, research, content)
+3. Tasks go through review (routing, SMART criteria, priority)
+4. Ready tasks trigger appropriate child loop
+5. Child loops execute autonomously until complete or blocked
+6. Blockers escalate: Child → Parent → Nexus → Bridge (human)
+
+### Current API Endpoints
+- `POST /api/execution/ideas/:id/plan` - Generate AI plan from idea
+- `POST /api/execution/ideas/:id/execute` - Create tasks from plan
+- `GET /api/execution/ideas/:id/status` - Get execution status
+- `GET /api/execution/active` - List all active executions
+- `POST /api/execution/ideas/:id/cancel` - Cancel execution
+- `GET /api/execution/decisions` - Decision log
 
 ## Idea Management System (Priority Feature)
 

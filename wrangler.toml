@@ -36,6 +36,10 @@ class_name = "SyncManager"
 name = "USER_SESSION"
 class_name = "UserSession"
 
+[[durable_objects.bindings]]
+name = "IDEA_EXECUTOR"
+class_name = "IdeaExecutor"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["InboxManager"]
@@ -51,6 +55,10 @@ new_sqlite_classes = ["SyncManager"]
 [[migrations]]
 tag = "v4"
 new_sqlite_classes = ["UserSession"]
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["IdeaExecutor"]
 
 # Cron Triggers
 [triggers]

@@ -3,18 +3,19 @@ import { jwtVerify, createRemoteJWKSet, type JWTPayload } from 'jose';
 import type { AppType, Env } from '../types/index.ts';
 import { generateTenantKey } from './encryption.ts';
 
-// Cloudflare Access JWT payload
+// Cloudflare Access JWT payload (user auth)
 interface AccessJWTPayload extends JWTPayload {
-  email: string;
-  sub: string; // User ID from Access
-  aud: string[];
+  email?: string; // Not present for service tokens
+  sub: string; // User ID from Access (empty for service tokens)
+  aud: string | string[];
   iss: string;
   iat: number;
   exp: number;
-  type?: string;
+  type?: string; // 'app' for service tokens
   identity_nonce?: string;
   name?: string;
   country?: string;
+  common_name?: string; // Service token client ID
 }
 
 // Cache JWKS to avoid fetching on every request
@@ -82,6 +83,33 @@ function decodeDevToken(token: string): DevTokenPayload | null {
   }
 }
 
+// Find service token by common_name (client ID in JWT)
+async function findServiceTokenByCommonName(
+  db: D1Database,
+  commonName: string
+): Promise<{ tenantId: string; userId: string; serviceName: string } | null> {
+  // common_name in the JWT contains the service token client ID
+  const token = await db.prepare(`
+    SELECT st.tenant_id, st.user_id, st.name
+    FROM service_tokens st
+    WHERE st.client_id = ? AND st.revoked_at IS NULL AND st.deleted_at IS NULL
+  `).bind(commonName).first<{
+    tenant_id: string;
+    user_id: string;
+    name: string;
+  }>();
+
+  if (!token) {
+    return null;
+  }
+
+  return {
+    tenantId: token.tenant_id,
+    userId: token.user_id,
+    serviceName: token.name,
+  };
+}
+
 // Find or create user from Access JWT
 async function findOrCreateUser(
   db: D1Database,
@@ -136,13 +164,19 @@ async function findOrCreateUser(
   return { tenantId, userId, isNewUser: true };
 }
 
-// Auth middleware - supports both Cloudflare Access and dev tokens
+// Auth middleware - supports Cloudflare Access (user + service token) and dev tokens
 export function authMiddleware() {
   return async (c: Context<AppType>, next: Next) => {
     const env = c.env;
 
-    // Check for Cloudflare Access JWT first (production)
+    // Check for Cloudflare Access JWT (handles both user auth and service tokens)
     const accessToken = c.req.header('Cf-Access-Jwt-Assertion');
+
+    console.log('Auth check:', {
+      hasAccessToken: !!accessToken,
+      hasTeamDomain: !!env.TEAM_DOMAIN,
+      hasPolicyAud: !!env.POLICY_AUD,
+    });
 
     if (accessToken && env.TEAM_DOMAIN && env.POLICY_AUD) {
       const payload = await validateAccessToken(accessToken, env);
@@ -151,7 +185,27 @@ export function authMiddleware() {
         return c.json({ success: false, error: 'Invalid Access token' }, 401);
       }
 
-      // Find or create user
+      // Check if this is a service token (type === 'app')
+      if (payload.type === 'app' && payload.common_name) {
+        // Service token auth - look up by common_name (client ID)
+        const serviceAuth = await findServiceTokenByCommonName(env.DB, payload.common_name);
+
+        if (!serviceAuth) {
+          return c.json({
+            success: false,
+            error: 'Service token not registered. Register the service token in the database.'
+          }, 401);
+        }
+
+        c.set('tenantId', serviceAuth.tenantId);
+        c.set('userId', serviceAuth.userId);
+        c.set('userEmail', `service:${serviceAuth.serviceName}`);
+
+        await next();
+        return;
+      }
+
+      // Regular user auth - find or create user by email
       const user = await findOrCreateUser(env.DB, env.KV, payload);
 
       if (!user) {

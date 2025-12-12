@@ -11,6 +11,7 @@ import projectsRoutes from './routes/projects.ts';
 import ideasRoutes from './routes/ideas.ts';
 import peopleRoutes from './routes/people.ts';
 import commitmentsRoutes from './routes/commitments.ts';
+import executionRoutes from './routes/execution.ts';
 import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 
 // Re-export Durable Objects
@@ -18,6 +19,7 @@ export { InboxManager } from './durable-objects/InboxManager.ts';
 export { CaptureBuffer } from './durable-objects/CaptureBuffer.ts';
 export { SyncManager } from './durable-objects/SyncManager.ts';
 export { UserSession } from './durable-objects/UserSession.ts';
+export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
 
 // Scheduled handler for Cloudflare Cron Triggers
 export default {
@@ -46,6 +48,20 @@ app.get('/', (c) => {
     version: '0.1.0',
     status: 'healthy',
   });
+});
+
+// Debug endpoint to see incoming headers
+app.get('/debug/headers', (c) => {
+  const headers: Record<string, string> = {};
+  c.req.raw.headers.forEach((value, key) => {
+    // Mask sensitive values
+    if (key.toLowerCase().includes('secret') || key.toLowerCase().includes('authorization')) {
+      headers[key] = value.substring(0, 8) + '...[masked]';
+    } else {
+      headers[key] = value;
+    }
+  });
+  return c.json({ headers });
 });
 
 // Dev-only: Setup endpoint to create initial tenant and user
@@ -103,6 +119,7 @@ api.route('/projects', projectsRoutes);
 api.route('/ideas', ideasRoutes);
 api.route('/people', peopleRoutes);
 api.route('/commitments', commitmentsRoutes);
+api.route('/execution', executionRoutes);
 
 // ========================================
 // Auth Routes

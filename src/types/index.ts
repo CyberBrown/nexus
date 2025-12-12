@@ -7,6 +7,7 @@ export interface Env {
   CAPTURE_BUFFER: DurableObjectNamespace;
   SYNC_MANAGER: DurableObjectNamespace;
   USER_SESSION: DurableObjectNamespace;
+  IDEA_EXECUTOR: DurableObjectNamespace;
   ANTHROPIC_API_KEY: string;
   // Cloudflare Access
   TEAM_DOMAIN?: string; // e.g., https://your-team.cloudflareaccess.com
