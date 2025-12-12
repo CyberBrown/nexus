@@ -111,6 +111,47 @@ bun run deploy
 3. **Mnemo integration** - Context orchestration
 4. **Email ingestion** - Gmail/IMAP integration
 
+### Idea Management System (Priority Feature)
+
+Core feature: Capture, organize, and execute on ideas with minimal friction.
+
+**Idea Inbox:**
+- Fast capture from any input (voice, text, API, Claude conversations)
+- Auto-tag and categorize via AI
+- Link to related projects/repos/conversations
+- No friction - dump now, organize later
+
+**Prioritization Engine:**
+- Weigh ideas against each other
+- Factor in: effort, impact, dependencies, mood/energy
+- Surface "ready to execute" ideas
+- Age/decay stale ideas, prompt for review
+
+**Idea → Execution Pipeline:**
+- Break ideas into specs/tasks
+- Assign to agent swarm (Claude API, local models, specialized agents)
+- Track progress async (24/7 execution)
+- Surface blockers for CEO decision
+- Aggregate results for review
+
+**CEO Dashboard:**
+- What's in progress
+- What needs my input
+- What's ready for review
+- Quick approve/reject/redirect
+
+**Decision Log:**
+- Record when ideas are acted on or killed
+- Capture reasoning for future reference
+- Learn patterns over time
+
+### Long-term Vision
+
+Autonomous development organization with Chris as CEO:
+- Agents work 24/7
+- Nexus orchestrates
+- Chris provides direction and taste
+
 ### Future
 - Google Calendar sync
 - Cross-device sync

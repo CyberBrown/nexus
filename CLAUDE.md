@@ -279,6 +279,95 @@ Ready to build:
 - **Mnemo Integration** - Context orchestration (Nexus tells Mnemo what to load)
 - **Email Integration** - Gmail/IMAP ingestion and classification
 
+## Idea Management System (Priority Feature)
+
+Core feature: Capture, organize, and execute on Chris's ideas with minimal friction.
+
+### Idea Inbox
+- Fast capture from any input (voice, text, API, Claude conversations)
+- Auto-tag and categorize via AI classification
+- Link to related projects/repos/conversations
+- No friction - dump now, organize later
+- Integrate with existing `/api/ideas` endpoint
+
+### Prioritization Engine
+- Weigh ideas against each other (pairwise comparison)
+- Scoring factors:
+  - Effort estimate (T-shirt sizing or hours)
+  - Impact potential (1-10)
+  - Dependencies (blocked by other ideas/tasks)
+  - Energy/mood fit (creative vs analytical vs maintenance)
+- Surface "ready to execute" ideas based on current context
+- Age/decay stale ideas, prompt for periodic review
+
+### Idea → Execution Pipeline
+- Break ideas into specs/tasks automatically
+- Assign to agent swarm:
+  - Claude API (via DE) for complex analysis
+  - Local models for quick tasks
+  - Specialized agents for specific domains
+- Track progress async (24/7 execution)
+- Surface blockers requiring CEO decision
+- Aggregate results for review
+
+### CEO Dashboard
+- What's in progress (active agent work)
+- What needs my input (blockers, decisions)
+- What's ready for review (completed work)
+- Quick approve/reject/redirect actions
+- Daily/weekly summaries
+
+### Decision Log
+- Record when ideas are acted on or killed
+- Capture reasoning for future reference
+- Learn patterns over time (what gets approved, what gets killed)
+- Enable "why did I decide X?" lookups
+
+### Database Schema Additions
+
+```sql
+-- Idea prioritization
+ALTER TABLE ideas ADD COLUMN effort_estimate TEXT; -- xs, s, m, l, xl
+ALTER TABLE ideas ADD COLUMN impact_score INTEGER; -- 1-10
+ALTER TABLE ideas ADD COLUMN energy_type TEXT; -- creative, analytical, maintenance
+ALTER TABLE ideas ADD COLUMN dependencies TEXT; -- JSON array of idea/task IDs
+ALTER TABLE ideas ADD COLUMN priority_score REAL; -- Calculated score
+
+-- Execution tracking
+CREATE TABLE idea_executions (
+  execution_id TEXT PRIMARY KEY,
+  idea_id TEXT NOT NULL,
+  tenant_id TEXT NOT NULL,
+  status TEXT NOT NULL, -- pending, in_progress, blocked, completed, failed
+  assigned_agent TEXT, -- agent identifier
+  started_at TEXT,
+  completed_at TEXT,
+  result TEXT, -- JSON result data
+  blockers TEXT, -- JSON array of blockers
+  FOREIGN KEY (idea_id) REFERENCES ideas(idea_id)
+);
+
+-- Decision log
+CREATE TABLE decisions (
+  decision_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL, -- idea, task, project
+  entity_id TEXT NOT NULL,
+  decision TEXT NOT NULL, -- approved, rejected, deferred, modified
+  reasoning TEXT,
+  context TEXT, -- JSON context at decision time
+  created_at TEXT NOT NULL
+);
+```
+
+### Long-term Vision
+
+Autonomous development organization with Chris as CEO:
+- Agents work 24/7, executing on approved ideas
+- Nexus orchestrates work distribution and progress tracking
+- Chris provides direction, taste, and key decisions
+- System learns from decisions to improve prioritization
+
 Future phases:
 - Google Calendar integration
 - Cross-device sync
