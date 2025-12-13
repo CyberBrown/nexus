@@ -20,11 +20,13 @@ export { InboxManager } from './durable-objects/InboxManager.ts';
 export { CaptureBuffer } from './durable-objects/CaptureBuffer.ts';
 export { SyncManager } from './durable-objects/SyncManager.ts';
 export { UserSession } from './durable-objects/UserSession.ts';
-export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
+// DEPRECATED: IdeaExecutor replaced by IdeaPlanningWorkflow
+// export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
 
 // Re-export Workflows
 export { IdeaToPlanWorkflow } from './workflows/IdeaToPlanWorkflow.ts';
 export { TaskExecutorWorkflow } from './workflows/TaskExecutorWorkflow.ts';
+export { IdeaPlanningWorkflow } from './workflows/idea-planning-workflow.ts';
 
 // Scheduled handler for Cloudflare Cron Triggers
 export default {

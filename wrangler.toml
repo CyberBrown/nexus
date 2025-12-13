@@ -16,6 +16,8 @@ ENVIRONMENT = "development"
 # Cloudflare Access - set these for production auth
 # TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 # POLICY_AUD = "your-application-audience-tag"
+# DE text-gen worker URL (for LLM routing)
+# TEXT_GEN_URL = "https://de-text-gen.your-domain.workers.dev"
 
 [[kv_namespaces]]
 binding = "KV"
@@ -37,9 +39,10 @@ class_name = "SyncManager"
 name = "USER_SESSION"
 class_name = "UserSession"
 
-[[durable_objects.bindings]]
-name = "IDEA_EXECUTOR"
-class_name = "IdeaExecutor"
+# DEPRECATED: IdeaExecutor DO replaced by IdeaPlanningWorkflow
+# [[durable_objects.bindings]]
+# name = "IDEA_EXECUTOR"
+# class_name = "IdeaExecutor"
 
 # Durable Objects migrations
 [[migrations]]
@@ -70,6 +73,10 @@ tag = "v6"
 tag = "v7"
 new_sqlite_classes = ["IdeaExecutor"]
 
+[[migrations]]
+tag = "v8"
+deleted_classes = ["IdeaExecutor"]
+
 # Cron Triggers
 [triggers]
 crons = ["0 0 * * *"]  # Run daily at midnight UTC
@@ -84,3 +91,8 @@ class_name = "IdeaToPlanWorkflow"
 name = "task-executor-workflow"
 binding = "TASK_EXECUTOR_WORKFLOW"
 class_name = "TaskExecutorWorkflow"
+
+[[workflows]]
+name = "idea-planning-workflow"
+binding = "IDEA_PLANNING_WORKFLOW"
+class_name = "IdeaPlanningWorkflow"

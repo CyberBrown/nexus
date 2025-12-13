@@ -26,14 +26,20 @@ export interface Env {
   CAPTURE_BUFFER: DurableObjectNamespace;
   SYNC_MANAGER: DurableObjectNamespace;
   USER_SESSION: DurableObjectNamespace;
-  IDEA_EXECUTOR: DurableObjectNamespace;
-  ANTHROPIC_API_KEY: string;
+  // DEPRECATED: IDEA_EXECUTOR DO replaced by IDEA_PLANNING_WORKFLOW
+  // IDEA_EXECUTOR: DurableObjectNamespace;
+  ANTHROPIC_API_KEY?: string; // Fallback if TEXT_GEN_URL not set
+  // DE text-gen worker URL (preferred for LLM routing)
+  TEXT_GEN_URL?: string;
+  // Write passphrase for MCP destructive operations
+  WRITE_PASSPHRASE?: string;
   // Cloudflare Access
   TEAM_DOMAIN?: string; // e.g., https://your-team.cloudflareaccess.com
   POLICY_AUD?: string; // Application Audience (AUD) tag
   // Workflows
   IDEA_TO_PLAN_WORKFLOW: Workflow;
   TASK_EXECUTOR_WORKFLOW: Workflow;
+  IDEA_PLANNING_WORKFLOW: Workflow;
 }
 
 // Cloudflare Scheduled Event

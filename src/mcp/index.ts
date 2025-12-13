@@ -91,13 +91,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_plan_idea
   server.tool(
     'nexus_plan_idea',
-    'Trigger AI planning for an idea. Generates an execution plan with steps, effort estimates, risks, and dependencies.',
+    'Trigger AI planning for an idea. Starts a workflow that generates an execution plan and waits for approval.',
     {
       idea_id: z.string().describe('The UUID of the idea to plan'),
     },
     async ({ idea_id }): Promise<CallToolResult> => {
       try {
-        // Get and decrypt the idea
+        // Verify idea exists
         const idea = await env.DB.prepare(`
           SELECT id, title, description FROM ideas
           WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
@@ -112,66 +112,45 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
         const decryptedTitle = idea.title ? await decryptField(idea.title, encryptionKey) : '';
-        const decryptedDescription = idea.description ? await decryptField(idea.description, encryptionKey) : '';
 
-        // Get or create DO instance
-        const doId = env.IDEA_EXECUTOR.idFromName(`${tenantId}:${idea_id}`);
-        const stub = env.IDEA_EXECUTOR.get(doId);
-
-        // Initialize
+        // Create execution record
         const executionId = crypto.randomUUID();
-        const initResponse = await stub.fetch(new Request('http://do/init', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            executionId,
-            ideaId: idea_id,
-            tenantId,
-            userId,
-            ideaTitle: decryptedTitle,
-            ideaDescription: decryptedDescription,
-          }),
-        }));
+        const now = new Date().toISOString();
 
-        if (!initResponse.ok) {
-          const error = await initResponse.json() as { error: string };
-          return {
-            content: [{ type: 'text', text: JSON.stringify({ success: false, error: error.error }) }],
-            isError: true
-          };
-        }
+        await env.DB.prepare(`
+          INSERT INTO idea_executions (
+            id, idea_id, tenant_id, user_id, status, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+        `).bind(executionId, idea_id, tenantId, userId, now, now).run();
 
-        // Generate plan
-        const planResponse = await stub.fetch(new Request('http://do/plan', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ideaTitle: decryptedTitle,
-            ideaDescription: decryptedDescription,
-          }),
-        }));
+        // Start the planning workflow
+        const instance = await env.IDEA_PLANNING_WORKFLOW.create({
+          id: executionId,
+          params: {
+            idea_id,
+            tenant_id: tenantId,
+            user_id: userId,
+            execution_id: executionId,
+          },
+        });
 
-        const result = await planResponse.json() as { success: boolean; data?: { plan: unknown }; error?: string };
-
-        if (result.success && result.data?.plan) {
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                success: true,
-                idea_id,
-                title: decryptedTitle,
-                execution_id: executionId,
-                plan: result.data.plan,
-                message: 'Plan generated. Use nexus_execute_idea to create tasks from this plan.',
-              }, null, 2)
-            }]
-          };
-        }
+        // Update execution with workflow instance ID
+        await env.DB.prepare(`
+          UPDATE idea_executions SET workflow_instance_id = ?, updated_at = ? WHERE id = ?
+        `).bind(instance.id, now, executionId).run();
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-          isError: !result.success
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea_id,
+              title: decryptedTitle,
+              execution_id: executionId,
+              workflow_id: instance.id,
+              message: 'Planning workflow started. The plan will be generated and then wait for your approval. Use nexus_get_status to check progress, then nexus_approve_plan to approve.',
+            }, null, 2)
+          }]
         };
       } catch (error: any) {
         return {
@@ -182,43 +161,151 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_execute_idea
+  // Tool: nexus_approve_plan
+  server.tool(
+    'nexus_approve_plan',
+    'Approve or reject a generated plan. The workflow will proceed to create tasks if approved.',
+    {
+      idea_id: z.string().describe('The UUID of the idea with a pending plan'),
+      approved: z.boolean().describe('Whether to approve the plan'),
+      remove_steps: z.array(z.number()).optional().describe('Step order numbers to remove from the plan'),
+      notes: z.string().optional().describe('Notes about the approval decision'),
+    },
+    async ({ idea_id, approved, remove_steps, notes }): Promise<CallToolResult> => {
+      try {
+        // Get the execution record
+        const execution = await env.DB.prepare(`
+          SELECT id, workflow_instance_id, status FROM idea_executions
+          WHERE idea_id = ? AND tenant_id = ? AND status = 'planned'
+          ORDER BY created_at DESC LIMIT 1
+        `).bind(idea_id, tenantId).first<{ id: string; workflow_instance_id: string; status: string }>();
+
+        if (!execution) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'No pending plan found for this idea. Run nexus_plan_idea first and wait for planning to complete.' }) }],
+            isError: true
+          };
+        }
+
+        if (!execution.workflow_instance_id) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'No workflow instance found' }) }],
+            isError: true
+          };
+        }
+
+        // Get the workflow instance and send the approval event
+        const instance = await env.IDEA_PLANNING_WORKFLOW.get(execution.workflow_instance_id);
+
+        // Send the approval event to resume the workflow
+        // Note: Cloudflare Workflows receive events via the instance
+        // For now, we'll update the database and let the workflow poll
+        // In production, you'd use instance.sendEvent() when available
+
+        const now = new Date().toISOString();
+        if (approved) {
+          await env.DB.prepare(`
+            UPDATE idea_executions
+            SET status = 'executing', updated_at = ?
+            WHERE id = ?
+          `).bind(now, execution.id).run();
+        } else {
+          await env.DB.prepare(`
+            UPDATE idea_executions
+            SET status = 'cancelled', error_message = ?, updated_at = ?
+            WHERE id = ?
+          `).bind(notes || 'Plan rejected by user', now, execution.id).run();
+
+          await env.DB.prepare(`
+            UPDATE ideas SET execution_status = 'new', updated_at = ? WHERE id = ?
+          `).bind(now, idea_id).run();
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea_id,
+              execution_id: execution.id,
+              approved,
+              message: approved
+                ? 'Plan approved. Tasks will be created from the plan. Use nexus_get_status to monitor progress.'
+                : 'Plan rejected. The idea has been reset to "new" status.',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_execute_idea (now sends approval to start task creation)
   server.tool(
     'nexus_execute_idea',
-    'Execute a planned idea by creating tasks from the generated plan',
+    'Approve and execute a planned idea by creating tasks from the generated plan. Shortcut for nexus_approve_plan with approved=true.',
     {
       idea_id: z.string().describe('The UUID of the idea to execute (must have a plan)'),
     },
     async ({ idea_id }): Promise<CallToolResult> => {
       try {
-        const doId = env.IDEA_EXECUTOR.idFromName(`${tenantId}:${idea_id}`);
-        const stub = env.IDEA_EXECUTOR.get(doId);
+        // Get the execution record with plan
+        const execution = await env.DB.prepare(`
+          SELECT id, workflow_instance_id, status, plan FROM idea_executions
+          WHERE idea_id = ? AND tenant_id = ? AND status IN ('planned', 'pending', 'planning')
+          ORDER BY created_at DESC LIMIT 1
+        `).bind(idea_id, tenantId).first<{ id: string; workflow_instance_id: string; status: string; plan: string }>();
 
-        const response = await stub.fetch(new Request('http://do/execute', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-        }));
-
-        const result = await response.json() as { success: boolean; data?: { tasksCreated: number; tasks: unknown[] } };
-
-        if (result.success && result.data) {
+        if (!execution) {
           return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                success: true,
-                idea_id,
-                tasks_created: result.data.tasksCreated,
-                tasks: result.data.tasks,
-                message: `Created ${result.data.tasksCreated} tasks from the plan. Tasks are now in the inbox.`,
-              }, null, 2)
-            }]
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'No pending execution found. Run nexus_plan_idea first.' }) }],
+            isError: true
           };
         }
 
+        if (execution.status === 'pending' || execution.status === 'planning') {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: `Planning still in progress (status: ${execution.status}). Wait for it to complete.` }) }],
+            isError: true
+          };
+        }
+
+        // Update status to executing (workflow will create tasks)
+        const now = new Date().toISOString();
+        await env.DB.prepare(`
+          UPDATE idea_executions SET status = 'executing', updated_at = ? WHERE id = ?
+        `).bind(now, execution.id).run();
+
+        await env.DB.prepare(`
+          UPDATE ideas SET execution_status = 'executing', updated_at = ? WHERE id = ?
+        `).bind(now, idea_id).run();
+
+        // Parse plan to show task count
+        let taskCount = 0;
+        if (execution.plan) {
+          try {
+            const plan = JSON.parse(execution.plan);
+            taskCount = plan.steps?.length || 0;
+          } catch {
+            // Ignore parse errors
+          }
+        }
+
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-          isError: !result.success
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea_id,
+              execution_id: execution.id,
+              tasks_planned: taskCount,
+              message: `Execution approved. ${taskCount} tasks will be created from the plan.`,
+            }, null, 2)
+          }]
         };
       } catch (error: any) {
         return {
@@ -232,7 +319,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_get_status
   server.tool(
     'nexus_get_status',
-    'Get the current execution status for an idea, including plan details, task progress, and any blockers',
+    'Get the current execution status for an idea, including plan details, task progress, workflow status, and any blockers',
     {
       idea_id: z.string().describe('The UUID of the idea to check'),
     },
@@ -240,7 +327,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         // Get idea details
         const idea = await env.DB.prepare(`
-          SELECT id, title, category, created_at FROM ideas
+          SELECT id, title, category, execution_status, created_at FROM ideas
           WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
         `).bind(idea_id, tenantId).first();
 
@@ -255,18 +342,40 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
         const decryptedTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
 
-        // Get execution status from DO
-        const doId = env.IDEA_EXECUTOR.idFromName(`${tenantId}:${idea_id}`);
-        const stub = env.IDEA_EXECUTOR.get(doId);
-
-        const response = await stub.fetch(new Request('http://do/status'));
-        const statusResult = await response.json() as { success: boolean; data: unknown };
-
-        // Also get from DB for historical data
+        // Get execution from DB
         const execution = await env.DB.prepare(`
           SELECT * FROM idea_executions
-          WHERE idea_id = ? AND tenant_id = ? AND deleted_at IS NULL
+          WHERE idea_id = ? AND tenant_id = ?
           ORDER BY created_at DESC LIMIT 1
+        `).bind(idea_id, tenantId).first();
+
+        // Get workflow status if we have an instance ID
+        let workflowStatus = null;
+        if (execution?.workflow_instance_id) {
+          try {
+            const instance = await env.IDEA_PLANNING_WORKFLOW.get(execution.workflow_instance_id as string);
+            const status = await instance.status();
+            workflowStatus = {
+              id: execution.workflow_instance_id,
+              status: status.status,
+              output: status.output,
+              error: status.error,
+            };
+          } catch {
+            // Workflow instance may not exist or be accessible
+            workflowStatus = { id: execution.workflow_instance_id, status: 'unknown' };
+          }
+        }
+
+        // Get task progress
+        const taskStats = await env.DB.prepare(`
+          SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+            SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress
+          FROM idea_tasks
+          WHERE idea_id = ? AND tenant_id = ? AND deleted_at IS NULL
         `).bind(idea_id, tenantId).first();
 
         return {
@@ -278,16 +387,28 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 id: idea_id,
                 title: decryptedTitle,
                 category: idea.category,
+                execution_status: idea.execution_status,
                 created_at: idea.created_at,
               },
-              execution: statusResult.data || (execution ? {
+              execution: execution ? {
                 id: execution.id,
                 status: execution.status,
-                phase: execution.phase,
                 plan: execution.plan ? JSON.parse(execution.plan as string) : null,
+                total_tasks: execution.total_tasks,
+                completed_tasks: execution.completed_tasks,
                 started_at: execution.started_at,
+                planned_at: execution.planned_at,
                 completed_at: execution.completed_at,
-              } : null),
+                error_message: execution.error_message,
+                blockers: execution.blockers ? JSON.parse(execution.blockers as string) : [],
+              } : null,
+              workflow: workflowStatus,
+              task_progress: taskStats ? {
+                total: taskStats.total,
+                completed: taskStats.completed,
+                failed: taskStats.failed,
+                in_progress: taskStats.in_progress,
+              } : null,
             }, null, 2)
           }]
         };
@@ -672,6 +793,201 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 due_date: t.due_date,
                 created_at: t.created_at,
               })),
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_delete_idea
+  server.tool(
+    'nexus_delete_idea',
+    'Permanently delete an idea from Nexus. Requires passphrase for write operations. Will fail if idea has an active execution.',
+    {
+      idea_id: z.string().describe('The UUID of the idea to delete'),
+      passphrase: z.string().describe('Write passphrase for destructive operations'),
+    },
+    async ({ idea_id, passphrase }): Promise<CallToolResult> => {
+      try {
+        // Verify passphrase
+        if (passphrase !== env.WRITE_PASSPHRASE) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Invalid passphrase' }) }],
+            isError: true
+          };
+        }
+
+        // Check idea exists
+        const idea = await env.DB.prepare(`
+          SELECT id, title FROM ideas
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(idea_id, tenantId).first<{ id: string; title: string }>();
+
+        if (!idea) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found' }) }],
+            isError: true
+          };
+        }
+
+        // Decrypt title for response
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const decryptedTitle = idea.title ? await decryptField(idea.title, encryptionKey) : '';
+
+        // Check for active executions
+        const activeExecution = await env.DB.prepare(`
+          SELECT id, status FROM idea_executions
+          WHERE idea_id = ? AND tenant_id = ?
+            AND status IN ('pending', 'planning', 'planned', 'executing', 'in_progress', 'blocked')
+          LIMIT 1
+        `).bind(idea_id, tenantId).first();
+
+        if (activeExecution) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({
+              success: false,
+              error: `Idea has an active execution (status: ${activeExecution.status}). Cancel the execution first using nexus_cancel_execution.`
+            }) }],
+            isError: true
+          };
+        }
+
+        const now = new Date().toISOString();
+
+        // Soft delete the idea
+        await env.DB.prepare(`
+          UPDATE ideas SET deleted_at = ?, updated_at = ?
+          WHERE id = ? AND tenant_id = ?
+        `).bind(now, now, idea_id, tenantId).run();
+
+        // Also soft delete any associated executions and tasks
+        await env.DB.prepare(`
+          UPDATE idea_executions SET deleted_at = ?, updated_at = ?
+          WHERE idea_id = ? AND tenant_id = ?
+        `).bind(now, now, idea_id, tenantId).run();
+
+        await env.DB.prepare(`
+          UPDATE idea_tasks SET deleted_at = ?, updated_at = ?
+          WHERE idea_id = ? AND tenant_id = ?
+        `).bind(now, now, idea_id, tenantId).run();
+
+        // Log the decision
+        await env.DB.prepare(`
+          INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          tenantId,
+          userId,
+          'idea',
+          idea_id,
+          'deleted',
+          'Deleted via MCP tool',
+          now
+        ).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              deleted_id: idea_id,
+              title: decryptedTitle,
+              message: `Idea "${decryptedTitle}" has been deleted.`,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_complete_idea
+  server.tool(
+    'nexus_complete_idea',
+    'Mark an idea as completed without going through the full execution flow. Use when work was done outside the system.',
+    {
+      idea_id: z.string().describe('The UUID of the idea to mark as completed'),
+      passphrase: z.string().describe('Write passphrase for write operations'),
+      resolution: z.string().optional().describe('How the idea was completed or resolved'),
+    },
+    async ({ idea_id, passphrase, resolution }): Promise<CallToolResult> => {
+      try {
+        // Verify passphrase
+        if (passphrase !== env.WRITE_PASSPHRASE) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Invalid passphrase' }) }],
+            isError: true
+          };
+        }
+
+        // Check idea exists
+        const idea = await env.DB.prepare(`
+          SELECT id, title, execution_status FROM ideas
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(idea_id, tenantId).first<{ id: string; title: string; execution_status: string }>();
+
+        if (!idea) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found' }) }],
+            isError: true
+          };
+        }
+
+        // Decrypt title for response
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const decryptedTitle = idea.title ? await decryptField(idea.title, encryptionKey) : '';
+
+        const now = new Date().toISOString();
+
+        // Update idea status to done
+        await env.DB.prepare(`
+          UPDATE ideas
+          SET execution_status = 'done', archived_at = ?, archive_reason = ?, updated_at = ?
+          WHERE id = ? AND tenant_id = ?
+        `).bind(now, resolution || 'Completed via MCP', now, idea_id, tenantId).run();
+
+        // If there's an existing execution, mark it completed too
+        await env.DB.prepare(`
+          UPDATE idea_executions
+          SET status = 'completed', completed_at = ?, updated_at = ?
+          WHERE idea_id = ? AND tenant_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')
+        `).bind(now, now, idea_id, tenantId).run();
+
+        // Log the decision
+        await env.DB.prepare(`
+          INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          tenantId,
+          userId,
+          'idea',
+          idea_id,
+          'completed',
+          resolution || 'Marked complete via MCP tool',
+          now
+        ).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea_id,
+              title: decryptedTitle,
+              resolution: resolution || null,
+              message: `Idea "${decryptedTitle}" has been marked as completed.`,
             }, null, 2)
           }]
         };

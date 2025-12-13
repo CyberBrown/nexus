@@ -288,20 +288,43 @@ npm run secret:put ANTHROPIC_API_KEY
 npx wrangler secret put ANTHROPIC_API_KEY
 ```
 
-### Local Development with Secrets
+### Local Development Setup
 
-For local dev, you have two options:
+Development requires a Cloudflare API token for wrangler CLI commands (deploy, secrets, migrations, remote dev).
 
-1. **Use remote bindings** (recommended - uses production secrets):
-   ```bash
-   npm run dev:remote
-   ```
+**1. Create `.dev.vars` file** (gitignored):
+```bash
+# Cloudflare API Token for Wrangler CLI (development/deployment only)
+# Permissions needed:
+#   Account: Account Settings (Read), Workers KV Storage (Edit), Workers R2 Storage (Edit), D1 (Edit), Workers Scripts (Edit)
+#   Zone: Workers Routes (Edit)
+CLOUDFLARE_API_TOKEN=your-token-here
+```
 
-2. **Create `.dev.vars`** (local-only secrets):
-   ```bash
-   echo "ANTHROPIC_API_KEY=sk-ant-..." > .dev.vars
-   ```
-   Note: `.dev.vars` is gitignored and should never be committed.
+Create a token at https://dash.cloudflare.com/profile/api-tokens
+
+**2. Run commands normally** - npm scripts auto-load from `.dev.vars`:
+```bash
+bun run dev:remote    # Dev server with remote bindings
+bun run deploy        # Deploy to Cloudflare
+bun run secret:list   # List secrets
+bun run db:migrate:remote  # Run D1 migrations
+```
+
+**Note:** The Cloudflare API token is only for the wrangler CLI during development/deployment. The deployed Worker uses separate secrets (`ANTHROPIC_API_KEY`, etc.) configured via `wrangler secret put`.
+
+### Local-only Worker Secrets
+
+To add Worker secrets for local dev (like `ANTHROPIC_API_KEY`), add them to `.dev.vars`:
+```bash
+CLOUDFLARE_API_TOKEN=your-cf-token
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Or use remote bindings which pulls production secrets:
+```bash
+bun run dev:remote
+```
 
 ## Testing
 
@@ -361,7 +384,7 @@ npm run db:migrate:remote
 ## Execution Loop Hierarchy
 
 Nexus operates through a hierarchy of execution loops for autonomous task processing.
-See `docs/TASK_REVIEW_LOOP.md` for full documentation.
+See `docs/EXECUTION_LOOP.md` for full documentation (idea triage, task review, execution loops).
 
 ```
                     ┌─────────────────────────┐
