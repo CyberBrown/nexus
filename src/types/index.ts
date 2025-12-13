@@ -8,10 +8,15 @@ export interface Env {
   SYNC_MANAGER: DurableObjectNamespace;
   USER_SESSION: DurableObjectNamespace;
   IDEA_EXECUTOR: DurableObjectNamespace;
-  ANTHROPIC_API_KEY: string;
+  // Service Bindings
+  DE: Fetcher; // DE (distributed-electrons) service for LLM operations
+  // Cloudflare Workflows
+  IDEA_EXECUTION_WORKFLOW: Workflow; // Durable execution for ideas
   // Cloudflare Access
   TEAM_DOMAIN?: string; // e.g., https://your-team.cloudflareaccess.com
   POLICY_AUD?: string; // Application Audience (AUD) tag
+  // MCP Passphrase Auth (Mnemo-style)
+  WRITE_PASSPHRASE?: string; // Passphrase for MCP write operations
 }
 
 // Cloudflare Scheduled Event

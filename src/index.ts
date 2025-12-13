@@ -22,6 +22,9 @@ export { SyncManager } from './durable-objects/SyncManager.ts';
 export { UserSession } from './durable-objects/UserSession.ts';
 export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
 
+// Re-export Cloudflare Workflows
+export { IdeaExecutionWorkflow } from './workflows/IdeaExecutionWorkflow.ts';
+
 // Scheduled handler for Cloudflare Cron Triggers
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -933,12 +936,83 @@ app.route('/api', api);
 
 // ========================================
 // MCP Server Endpoint (root level for mcp-remote compatibility)
+// Uses Mnemo-style passphrase auth instead of full OAuth
+// - Read operations: No auth required
+// - Write operations: Require WRITE_PASSPHRASE in tool arguments
 // ========================================
-app.all('/mcp', authMiddleware(), async (c) => {
-  const { tenantId, userId } = getAuth(c);
-  const handler = createNexusMcpHandler(c.env, tenantId, userId);
+app.all('/mcp', async (c) => {
+  // Get or create MCP default tenant/user
+  // This provides data isolation while allowing open read access
+  const mcpTenant = await getOrCreateMcpTenant(c.env);
+
+  const handler = createNexusMcpHandler(c.env, mcpTenant.tenantId, mcpTenant.userId);
   return handler(c.req.raw, c.env, c.executionCtx);
 });
+
+/**
+ * Get the primary tenant/user for MCP access
+ *
+ * SINGLE-TENANT MODE: MCP requests use the same tenant as CLI/API
+ * This ensures data created via Claude.ai MCP is visible in CLI and vice versa.
+ *
+ * Priority:
+ * 1. Use PRIMARY_TENANT env var if set
+ * 2. Find the first owner user in the system
+ * 3. Fall back to creating an MCP-specific tenant (legacy behavior)
+ */
+async function getOrCreateMcpTenant(env: Env): Promise<{ tenantId: string; userId: string }> {
+  // Option 1: Use explicit PRIMARY_TENANT from env (for multi-tenant setups)
+  const primaryTenantId = (env as unknown as Record<string, string>).PRIMARY_TENANT;
+  if (primaryTenantId) {
+    const user = await env.DB.prepare(`
+      SELECT id FROM users WHERE tenant_id = ? AND role = 'owner' AND deleted_at IS NULL LIMIT 1
+    `).bind(primaryTenantId).first<{ id: string }>();
+
+    if (user) {
+      return { tenantId: primaryTenantId, userId: user.id };
+    }
+  }
+
+  // Option 2: Single-tenant mode - find the first/primary owner in the system
+  const primaryOwner = await env.DB.prepare(`
+    SELECT u.id as user_id, u.tenant_id
+    FROM users u
+    JOIN tenants t ON u.tenant_id = t.id
+    WHERE u.role = 'owner' AND u.deleted_at IS NULL AND t.deleted_at IS NULL
+    ORDER BY u.created_at ASC
+    LIMIT 1
+  `).first<{ user_id: string; tenant_id: string }>();
+
+  if (primaryOwner) {
+    console.log(`MCP using primary tenant: ${primaryOwner.tenant_id}`);
+    return { tenantId: primaryOwner.tenant_id, userId: primaryOwner.user_id };
+  }
+
+  // Option 3: Fall back to creating MCP-specific tenant (first-time setup)
+  const MCP_TENANT_NAME = 'Primary Tenant';
+  const MCP_USER_EMAIL = 'owner@nexus.local';
+
+  const tenantId = crypto.randomUUID();
+  const userId = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  await env.DB.prepare(`
+    INSERT INTO tenants (id, name, encryption_key_ref, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(tenantId, MCP_TENANT_NAME, `tenant:${tenantId}:key`, now, now).run();
+
+  await env.DB.prepare(`
+    INSERT INTO users (id, tenant_id, email, name, role, timezone, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(userId, tenantId, MCP_USER_EMAIL, 'Primary User', 'owner', 'UTC', now, now).run();
+
+  // Generate encryption key for tenant
+  await generateTenantKey(env.KV, tenantId);
+
+  console.log(`Created primary tenant: ${tenantId}`);
+
+  return { tenantId, userId };
+}
 
 // 404 handler
 app.notFound((c) => {

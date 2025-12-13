@@ -1,10 +1,10 @@
-name = "nexus"
+name = "nexus-mcp"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
 [dev]
-port = 8787
+port = 8788
 
 [[d1_databases]]
 binding = "DB"
@@ -12,18 +12,15 @@ database_name = "nexus-db"
 database_id = "1210076d-a443-443c-8623-a02b5ff4de9f"
 
 [vars]
-ENVIRONMENT = "development"
-# Cloudflare Access - set these for production auth
-# TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
-# POLICY_AUD = "your-application-audience-tag"
-# MCP Passphrase Auth - set via `npx wrangler secret put WRITE_PASSPHRASE` for production
-# WRITE_PASSPHRASE = "stale-coffee-44"
+ENVIRONMENT = "production"
+# Primary tenant for single-tenant MCP mode (ensures all clients use same data)
+PRIMARY_TENANT = "f943851e-a7c5-4908-90a2-956367f21460"
 
 [[kv_namespaces]]
 binding = "KV"
 id = "4a9097857e284189a3f0dc6211b7fb3f"
-preview_id = "a62b4b925b7c40679937e1545c1dff64"
 
+# Durable Objects - same classes, new namespace for this worker
 [[durable_objects.bindings]]
 name = "INBOX_MANAGER"
 class_name = "InboxManager"
@@ -44,7 +41,7 @@ class_name = "UserSession"
 name = "IDEA_EXECUTOR"
 class_name = "IdeaExecutor"
 
-# DO Migrations - sync with production (currently at v8)
+# Migrations for DO SQLite storage
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["InboxManager"]
@@ -63,32 +60,9 @@ new_sqlite_classes = ["UserSession"]
 
 [[migrations]]
 tag = "v5"
-
-[[migrations]]
-tag = "v6"
-
-[[migrations]]
-tag = "v7"
-
-[[migrations]]
-tag = "v8"
-
-# v9 adds IdeaExecutor as a new class
-[[migrations]]
-tag = "v9"
 new_sqlite_classes = ["IdeaExecutor"]
 
 # Service Bindings - Worker-to-Worker communication
 [[services]]
 binding = "DE"
 service = "text-gen"  # DE's text-gen worker for LLM operations
-
-# Cloudflare Workflows - Durable execution for long-running tasks
-[[workflows]]
-name = "idea-execution-workflow"
-binding = "IDEA_EXECUTION_WORKFLOW"
-class_name = "IdeaExecutionWorkflow"
-
-# Cron Triggers
-[triggers]
-crons = ["0 0 * * *"]  # Run daily at midnight UTC

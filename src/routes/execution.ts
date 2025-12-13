@@ -417,4 +417,124 @@ executionRoutes.post('/decisions', async (c) => {
   }
 });
 
+// ========================================
+// Cloudflare Workflow Endpoints (Durable Execution)
+// ========================================
+
+// POST /execution/workflow/ideas/:id - Trigger idea execution via Cloudflare Workflow
+// This is the preferred method for long-running executions with automatic retries
+executionRoutes.post('/workflow/ideas/:id', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const ideaId = c.req.param('id');
+
+  try {
+    // Get the idea
+    const idea = await c.env.DB.prepare(`
+      SELECT id, title, description FROM ideas
+      WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+    `).bind(ideaId, tenantId).first<{ id: string; title: string; description: string }>();
+
+    if (!idea) {
+      return c.json({ success: false, error: 'Idea not found' }, 404);
+    }
+
+    // Decrypt title and description
+    const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
+    const decryptedTitle = idea.title ? await decryptField(idea.title, encryptionKey) : '';
+    const decryptedDescription = idea.description ? await decryptField(idea.description, encryptionKey) : '';
+
+    // Start the workflow
+    const workflowId = `idea-${ideaId}-${Date.now()}`;
+    const instance = await c.env.IDEA_EXECUTION_WORKFLOW.create({
+      id: workflowId,
+      params: {
+        ideaId: idea.id,
+        tenantId,
+        userId,
+        ideaTitle: decryptedTitle,
+        ideaDescription: decryptedDescription,
+      },
+    });
+
+    return c.json({
+      success: true,
+      data: {
+        workflowId: instance.id,
+        ideaId,
+        status: 'started',
+        message: 'Workflow execution started. Use GET /execution/workflow/:id to check status.',
+      },
+    });
+  } catch (error) {
+    console.error('Start workflow error:', error);
+    return c.json({ success: false, error: 'Failed to start workflow' }, 500);
+  }
+});
+
+// GET /execution/workflow/:id - Get workflow instance status
+executionRoutes.get('/workflow/:id', async (c) => {
+  const workflowId = c.req.param('id');
+
+  try {
+    const instance = await c.env.IDEA_EXECUTION_WORKFLOW.get(workflowId);
+    const status = await instance.status();
+
+    return c.json({
+      success: true,
+      data: {
+        workflowId,
+        status: status.status,
+        output: status.output,
+        error: status.error,
+      },
+    });
+  } catch (error) {
+    console.error('Get workflow status error:', error);
+    return c.json({ success: false, error: 'Workflow not found or failed to get status' }, 404);
+  }
+});
+
+// POST /execution/workflow/:id/terminate - Terminate a running workflow
+executionRoutes.post('/workflow/:id/terminate', async (c) => {
+  const workflowId = c.req.param('id');
+
+  try {
+    const instance = await c.env.IDEA_EXECUTION_WORKFLOW.get(workflowId);
+    await instance.terminate();
+
+    return c.json({
+      success: true,
+      data: { workflowId, status: 'terminated' },
+    });
+  } catch (error) {
+    console.error('Terminate workflow error:', error);
+    return c.json({ success: false, error: 'Failed to terminate workflow' }, 500);
+  }
+});
+
+// GET /execution/workflows - List recent workflow instances
+executionRoutes.get('/workflows', async (c) => {
+  try {
+    // Note: Cloudflare Workflows doesn't have a list API yet
+    // This returns info from our idea_executions table instead
+    const { tenantId } = getAuth(c);
+
+    const executions = await c.env.DB.prepare(`
+      SELECT id, idea_id, status, phase, started_at, completed_at, updated_at
+      FROM idea_executions
+      WHERE tenant_id = ? AND deleted_at IS NULL
+      ORDER BY created_at DESC
+      LIMIT 50
+    `).bind(tenantId).all();
+
+    return c.json({
+      success: true,
+      data: executions.results,
+    });
+  } catch (error) {
+    console.error('List workflows error:', error);
+    return c.json({ success: false, error: 'Failed to list workflows' }, 500);
+  }
+});
+
 export default executionRoutes;

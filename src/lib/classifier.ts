@@ -1,5 +1,6 @@
 import type { Env, ClassificationResult, Project } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from './encryption.ts';
+import { DEClient } from './de-client.ts';
 
 interface ClassifierInput {
   raw_content: string;
@@ -65,37 +66,17 @@ export async function classifyInboxItem(
 
   const userPrompt = buildUserPrompt(input, projects);
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: userPrompt,
-        },
-      ],
-    }),
+  // Use DE service for LLM calls
+  const deClient = new DEClient(env);
+  const response = await deClient.chatCompletion({
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+    max_tokens: 1024,
   });
 
-  if (!response.ok) {
-    const error = await response.text();
-    console.error('Claude API error:', error);
-    throw new Error(`Classification failed: ${response.status}`);
-  }
-
-  const data = await response.json() as {
-    content: Array<{ type: string; text: string }>;
-  };
-
-  let text = data.content[0]?.text;
+  let text = response.content;
   if (!text) {
     throw new Error('No response from classifier');
   }

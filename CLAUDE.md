@@ -17,9 +17,9 @@ Nexus is **The Brain** of the AI infrastructure ecosystem - the orchestration la
 ### Nexus Core Responsibilities
 
 **Tier 1 Processing:**
-- Fast/cheap edge AI classification
 - Input triage and routing
 - Decide when to escalate to Tier 2 (DE)
+- Orchestrate LLM calls via DE service binding (never calls LLM providers directly)
 
 **Active Memory Manager (AMM):**
 - Entity detection in conversations
@@ -50,6 +50,36 @@ Nexus is **The Brain** of the AI infrastructure ecosystem - the orchestration la
 - **State Management**: Durable Objects
 - **Package Manager**: Bun (NOT npm)
 - **Language**: TypeScript
+- **LLM Operations**: Via DE service binding (no direct LLM API calls)
+
+## Service Bindings
+
+Nexus uses Cloudflare Service Bindings for zero-cost Worker-to-Worker communication:
+
+| Binding | Service | Purpose |
+|---------|---------|---------|
+| `DE` | `text-gen` | LLM operations (chat completion, text generation) |
+
+### Using the DE Client
+
+```typescript
+import { DEClient } from './lib/de-client.ts';
+
+// In a handler or Durable Object method:
+const deClient = new DEClient(env);
+
+const response = await deClient.chatCompletion({
+  messages: [
+    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'user', content: 'Hello!' },
+  ],
+  max_tokens: 1000,
+});
+
+console.log(response.content);
+```
+
+**Important:** Never call LLM providers directly. Always use the DE client.
 
 ## Developer Guidelines (MCP Server)
 
@@ -270,9 +300,11 @@ POST /setup → Returns dev token → Use Bearer token → Worker validates
 
 | Secret | Description |
 |--------|-------------|
-| `ANTHROPIC_API_KEY` | Claude API key for AI classification |
 | `TEAM_DOMAIN` | Cloudflare Access team domain (production) |
 | `POLICY_AUD` | Cloudflare Access application audience tag (production) |
+| `WRITE_PASSPHRASE` | Passphrase for MCP write operations |
+
+**Note:** `ANTHROPIC_API_KEY` is NOT needed in Nexus. All LLM operations go through DE (distributed-electrons) via service binding.
 
 ### Managing Secrets
 
@@ -281,27 +313,29 @@ POST /setup → Returns dev token → Use Bearer token → Worker validates
 npm run secret:list
 
 # Add/update a secret
-npm run secret:put ANTHROPIC_API_KEY
+npm run secret:put WRITE_PASSPHRASE
 # (prompts for value)
 
 # Or directly with wrangler
-npx wrangler secret put ANTHROPIC_API_KEY
+npx wrangler secret put WRITE_PASSPHRASE
 ```
 
 ### Local Development with Secrets
 
 For local dev, you have two options:
 
-1. **Use remote bindings** (recommended - uses production secrets):
+1. **Use remote bindings** (recommended - uses production secrets and service bindings):
    ```bash
    npm run dev:remote
    ```
 
 2. **Create `.dev.vars`** (local-only secrets):
    ```bash
-   echo "ANTHROPIC_API_KEY=sk-ant-..." > .dev.vars
+   echo "WRITE_PASSPHRASE=your-dev-passphrase" > .dev.vars
    ```
    Note: `.dev.vars` is gitignored and should never be committed.
+
+**Important:** For LLM functionality in local dev, you must use `npm run dev:remote` to access the DE service binding.
 
 ## Testing
 

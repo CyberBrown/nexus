@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types/index.ts';
+import { DEClient } from '../lib/de-client.ts';
 
 /**
  * IdeaExecutor Durable Object
@@ -402,12 +403,9 @@ export class IdeaExecutor extends DurableObject<Env> {
     });
   }
 
-  // Generate plan using Claude AI
+  // Generate plan using DE's LLM service
   private async generatePlanWithAI(title: string, description: string): Promise<ExecutionPlan> {
-    const apiKey = this.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY not configured');
-    }
+    const deClient = new DEClient(this.env);
 
     const systemPrompt = `You are a technical project planner. Given an idea, create a detailed execution plan.
 
@@ -435,36 +433,18 @@ Effort scale:
 - l: 2-5 days
 - xl: > 1 week`;
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 2000,
-        system: systemPrompt,
-        messages: [
-          {
-            role: 'user',
-            content: `Create an execution plan for this idea:\n\nTitle: ${title}\n\nDescription: ${description || 'No additional description provided'}`,
-          },
-        ],
-      }),
+    const response = await deClient.chatCompletion({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        {
+          role: 'user',
+          content: `Create an execution plan for this idea:\n\nTitle: ${title}\n\nDescription: ${description || 'No additional description provided'}`,
+        },
+      ],
+      max_tokens: 2000,
     });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Claude API error: ${error}`);
-    }
-
-    const result = await response.json() as {
-      content: Array<{ type: string; text: string }>;
-    };
-
-    const text = result.content[0]?.text || '';
+    const text = response.content || '';
 
     // Extract JSON from response
     const jsonMatch = text.match(/\{[\s\S]*\}/);
