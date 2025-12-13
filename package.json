@@ -20,7 +20,7 @@
     "@cloudflare/workers-types": "^4.20251202.0",
     "@types/bun": "latest",
     "vitest": "^3.2.0",
-    "wrangler": "^4.52.1"
+    "wrangler": "^4.54.0"
   },
   "peerDependencies": {
     "typescript": "^5"

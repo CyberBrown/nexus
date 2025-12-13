@@ -404,9 +404,12 @@ export class IdeaExecutor extends DurableObject<Env> {
 
   // Generate plan using Claude AI
   private async generatePlanWithAI(title: string, description: string): Promise<ExecutionPlan> {
+    // Debug: log available env keys (not values for security)
+    console.log('IdeaExecutor env keys:', Object.keys(this.env));
+
     const apiKey = this.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY not configured');
+      throw new Error('ANTHROPIC_API_KEY not configured. Available env keys: ' + Object.keys(this.env).join(', '));
     }
 
     const systemPrompt = `You are a technical project planner. Given an idea, create a detailed execution plan.

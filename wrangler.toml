@@ -41,6 +41,7 @@ class_name = "UserSession"
 name = "IDEA_EXECUTOR"
 class_name = "IdeaExecutor"
 
+# Durable Objects migrations
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["InboxManager"]
@@ -59,6 +60,14 @@ new_sqlite_classes = ["UserSession"]
 
 [[migrations]]
 tag = "v5"
+new_sqlite_classes = ["IdeaExecutor"]
+
+[[migrations]]
+tag = "v6"
+# Empty migration to match remote state
+
+[[migrations]]
+tag = "v7"
 new_sqlite_classes = ["IdeaExecutor"]
 
 # Cron Triggers
