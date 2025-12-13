@@ -22,6 +22,10 @@ export { SyncManager } from './durable-objects/SyncManager.ts';
 export { UserSession } from './durable-objects/UserSession.ts';
 export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
 
+// Re-export Workflows
+export { IdeaToPlanWorkflow } from './workflows/IdeaToPlanWorkflow.ts';
+export { TaskExecutorWorkflow } from './workflows/TaskExecutorWorkflow.ts';
+
 // Scheduled handler for Cloudflare Cron Triggers
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -121,7 +125,6 @@ api.route('/ideas', ideasRoutes);
 api.route('/people', peopleRoutes);
 api.route('/commitments', commitmentsRoutes);
 api.route('/execution', executionRoutes);
-
 
 // ========================================
 // Auth Routes

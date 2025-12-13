@@ -64,3 +64,14 @@ new_sqlite_classes = ["IdeaExecutor"]
 # Cron Triggers
 [triggers]
 crons = ["0 0 * * *"]  # Run daily at midnight UTC
+
+# Workflows
+[[workflows]]
+name = "idea-to-plan-workflow"
+binding = "IDEA_TO_PLAN_WORKFLOW"
+class_name = "IdeaToPlanWorkflow"
+
+[[workflows]]
+name = "task-executor-workflow"
+binding = "TASK_EXECUTOR_WORKFLOW"
+class_name = "TaskExecutorWorkflow"

@@ -1,3 +1,22 @@
+// Workflow binding type
+interface Workflow {
+  create(options?: { id?: string; params?: unknown }): Promise<WorkflowInstance>;
+  get(id: string): Promise<WorkflowInstance>;
+}
+
+interface WorkflowInstance {
+  id: string;
+  status(): Promise<{
+    status: 'queued' | 'running' | 'paused' | 'complete' | 'errored' | 'terminated' | 'waiting';
+    output?: unknown;
+    error?: string;
+  }>;
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+  terminate(): Promise<void>;
+  restart(): Promise<void>;
+}
+
 // Environment bindings
 export interface Env {
   DB: D1Database;
@@ -12,6 +31,9 @@ export interface Env {
   // Cloudflare Access
   TEAM_DOMAIN?: string; // e.g., https://your-team.cloudflareaccess.com
   POLICY_AUD?: string; // Application Audience (AUD) tag
+  // Workflows
+  IDEA_TO_PLAN_WORKFLOW: Workflow;
+  TASK_EXECUTOR_WORKFLOW: Workflow;
 }
 
 // Cloudflare Scheduled Event
@@ -163,6 +185,46 @@ export interface Idea extends BaseEntity {
   archived_at: string | null;
   archive_reason: string | null;
   source_inbox_item_id: string | null;
+  // Execution loop fields
+  execution_status: 'new' | 'planned' | 'executing' | 'done' | 'blocked' | null;
+  effort_estimate: 'xs' | 's' | 'm' | 'l' | 'xl' | null;
+  energy_type: 'creative' | 'analytical' | 'maintenance' | null;
+  dependencies: string | null; // JSON array
+  priority_score: number | null;
+}
+
+// IdeaTask - Tasks generated from ideas
+export interface IdeaTask extends BaseEntity {
+  user_id: string;
+  idea_id: string;
+  title: string; // encrypted
+  description: string | null; // encrypted
+  agent_type: 'claude' | 'local' | 'human';
+  estimated_effort: 'xs' | 's' | 'm' | 'l' | 'xl' | null;
+  sequence_order: number;
+  status: 'pending' | 'ready' | 'in_progress' | 'completed' | 'failed' | 'blocked';
+  started_at: string | null;
+  completed_at: string | null;
+  result: string | null; // encrypted JSON
+  error_message: string | null;
+  retry_count: number;
+  max_retries: number;
+}
+
+// IdeaExecution - Workflow run tracking
+export interface IdeaExecution extends Omit<BaseEntity, 'deleted_at'> {
+  user_id: string;
+  idea_id: string;
+  workflow_instance_id: string | null;
+  status: 'pending' | 'planning' | 'planned' | 'executing' | 'completed' | 'failed' | 'blocked';
+  total_tasks: number;
+  completed_tasks: number;
+  failed_tasks: number;
+  blockers: string | null; // JSON array
+  started_at: string | null;
+  planned_at: string | null;
+  completed_at: string | null;
+  error_message: string | null;
 }
 
 // Person

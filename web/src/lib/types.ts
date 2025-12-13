@@ -65,10 +65,82 @@ export interface Idea {
   title: string; // encrypted
   description?: string; // encrypted
   category?: string;
+  domain?: string;
   tags?: string[];
+  execution_status?: 'new' | 'planned' | 'executing' | 'done' | 'blocked';
+  effort_estimate?: 'xs' | 's' | 'm' | 'l' | 'xl';
+  energy_type?: 'creative' | 'analytical' | 'maintenance';
+  priority_score?: number;
   created_at: string;
   updated_at: string;
   deleted_at?: string;
+}
+
+export interface IdeaTask {
+  id: string;
+  idea_id: string;
+  title: string;
+  description?: string;
+  agent_type: 'claude' | 'local' | 'human';
+  estimated_effort?: 'xs' | 's' | 'm' | 'l' | 'xl';
+  sequence_order: number;
+  status: 'pending' | 'ready' | 'in_progress' | 'completed' | 'failed' | 'blocked';
+  started_at?: string;
+  completed_at?: string;
+  result?: any;
+  error_message?: string;
+}
+
+export interface IdeaExecution {
+  id: string;
+  idea_id: string;
+  workflow_instance_id?: string;
+  status: 'pending' | 'planning' | 'planned' | 'executing' | 'completed' | 'failed' | 'blocked';
+  total_tasks: number;
+  completed_tasks: number;
+  failed_tasks: number;
+  started_at?: string;
+  planned_at?: string;
+  completed_at?: string;
+}
+
+export interface IdeaStatus {
+  idea: {
+    id: string;
+    title: string;
+    description?: string;
+    execution_status?: string;
+    category?: string;
+    domain?: string;
+  };
+  execution?: IdeaExecution;
+  tasks: IdeaTask[];
+  stats: {
+    total: number;
+    completed: number;
+    failed: number;
+    blocked: number;
+    completion_pct: number;
+  };
+  blockers: Array<{
+    task_id: string;
+    title: string;
+    agent_type: string;
+  }>;
+}
+
+export interface IdeaListItem {
+  id: string;
+  title: string;
+  description?: string;
+  category?: string;
+  domain?: string;
+  execution_status: string;
+  exec_status?: string;
+  total_tasks: number;
+  completed_tasks: number;
+  failed_tasks: number;
+  created_at: string;
 }
 
 export interface Person {

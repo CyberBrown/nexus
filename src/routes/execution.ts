@@ -1,420 +1,526 @@
 import { Hono } from 'hono';
-import type { AppType } from '../types/index.ts';
+import type { AppType, Idea, IdeaTask, IdeaExecution } from '../types/index.ts';
 import { getAuth } from '../lib/auth.ts';
-import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
+import { findById } from '../lib/db.ts';
+import { getEncryptionKey, decryptFields, decryptField } from '../lib/encryption.ts';
+import { NotFoundError, AppError, ValidationError } from '../lib/errors.ts';
 
-const executionRoutes = new Hono<AppType>();
+const ENCRYPTED_IDEA_FIELDS = ['title', 'description'];
+const ENCRYPTED_TASK_FIELDS = ['title', 'description', 'result'];
 
-/**
- * Execution API Routes
- *
- * Manages the idea → execution pipeline:
- * - List ideas ready for execution
- * - Trigger planning for an idea
- * - Start execution (create tasks)
- * - Check execution status
- * - Resolve blockers
- * - Cancel executions
- */
+const execution = new Hono<AppType>();
 
-// GET /execution/ideas - List ideas with execution status
-executionRoutes.get('/ideas', async (c) => {
-  const { tenantId } = getAuth(c);
+// ========================================
+// Trigger Planning Workflow
+// ========================================
 
-  try {
-    // Get all ideas with their execution status
-    const ideas = await c.env.DB.prepare(`
-      SELECT
-        i.id,
-        i.title,
-        i.description,
-        i.category,
-        i.effort_estimate,
-        i.impact_score,
-        i.priority_score,
-        i.created_at,
-        e.id as execution_id,
-        e.status as execution_status,
-        e.phase as execution_phase,
-        e.started_at as execution_started,
-        e.completed_at as execution_completed
-      FROM ideas i
-      LEFT JOIN idea_executions e ON i.id = e.idea_id AND e.deleted_at IS NULL
-      WHERE i.tenant_id = ? AND i.deleted_at IS NULL AND i.archived_at IS NULL
-      ORDER BY i.priority_score DESC NULLS LAST, i.created_at DESC
-    `).bind(tenantId).all();
-
-    return c.json({
-      success: true,
-      data: ideas.results.map(row => ({
-        id: row.id,
-        title: row.title,
-        description: row.description,
-        category: row.category,
-        effortEstimate: row.effort_estimate,
-        impactScore: row.impact_score,
-        priorityScore: row.priority_score,
-        createdAt: row.created_at,
-        execution: row.execution_id ? {
-          id: row.execution_id,
-          status: row.execution_status,
-          phase: row.execution_phase,
-          startedAt: row.execution_started,
-          completedAt: row.execution_completed,
-        } : null,
-      })),
-    });
-  } catch (error) {
-    console.error('List execution ideas error:', error);
-    return c.json({ success: false, error: 'Failed to list ideas' }, 500);
-  }
-});
-
-// GET /execution/ideas/:id - Get idea with full execution details
-executionRoutes.get('/ideas/:id', async (c) => {
-  const { tenantId } = getAuth(c);
+// POST /api/execution/ideas/:id/plan - Trigger planning workflow for an idea
+execution.post('/ideas/:id/plan', async (c) => {
+  const { tenantId, userId } = getAuth(c);
   const ideaId = c.req.param('id');
 
-  try {
-    // Get idea
-    const idea = await c.env.DB.prepare(`
-      SELECT * FROM ideas WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
-    `).bind(ideaId, tenantId).first();
+  // Verify idea exists and user owns it
+  const idea = await findById<Idea>(c.env.DB, 'ideas', ideaId, { tenantId });
+  if (!idea || idea.user_id !== userId) {
+    throw new NotFoundError('Idea', ideaId);
+  }
 
-    if (!idea) {
-      return c.json({ success: false, error: 'Idea not found' }, 404);
-    }
+  // Check if already executing
+  if (idea.execution_status === 'executing' || idea.execution_status === 'planned') {
+    throw new AppError('Idea is already being processed', 400, 'ALREADY_PROCESSING');
+  }
 
-    // Get execution if exists
-    const execution = await c.env.DB.prepare(`
-      SELECT * FROM idea_executions
-      WHERE idea_id = ? AND tenant_id = ? AND deleted_at IS NULL
-      ORDER BY created_at DESC LIMIT 1
-    `).bind(ideaId, tenantId).first();
+  const now = new Date().toISOString();
+  const executionId = crypto.randomUUID();
 
-    // Get DO status if execution exists
-    let doStatus = null;
-    if (execution) {
-      const doId = c.env.IDEA_EXECUTOR.idFromName(`${tenantId}:${ideaId}`);
-      const stub = c.env.IDEA_EXECUTOR.get(doId);
-      const response = await stub.fetch(new Request('http://do/status'));
-      const statusResult = await response.json() as { success: boolean; data: unknown };
-      doStatus = statusResult.data;
-    }
+  // Create execution record
+  await c.env.DB.prepare(`
+    INSERT INTO idea_executions (
+      id, tenant_id, user_id, idea_id, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+  `).bind(executionId, tenantId, userId, ideaId, now, now).run();
 
-    return c.json({
-      success: true,
-      data: {
-        idea: {
-          id: idea.id,
-          title: idea.title,
-          description: idea.description,
-          category: idea.category,
-          effortEstimate: idea.effort_estimate,
-          impactScore: idea.impact_score,
-          priorityScore: idea.priority_score,
-          createdAt: idea.created_at,
-        },
-        execution: execution ? {
-          id: execution.id,
-          status: execution.status,
-          phase: execution.phase,
-          plan: execution.plan ? JSON.parse(execution.plan as string) : null,
-          tasks: execution.tasks_generated ? JSON.parse(execution.tasks_generated as string) : [],
-          blockers: execution.blockers ? JSON.parse(execution.blockers as string) : [],
-          result: execution.result ? JSON.parse(execution.result as string) : null,
-          error: execution.error,
-          startedAt: execution.started_at,
-          completedAt: execution.completed_at,
-        } : null,
-        liveStatus: doStatus,
+  // Trigger the workflow
+  const instance = await c.env.IDEA_TO_PLAN_WORKFLOW.create({
+    id: executionId,
+    params: {
+      idea_id: ideaId,
+      tenant_id: tenantId,
+      user_id: userId,
+      execution_id: executionId,
+    },
+  });
+
+  // Update execution with workflow instance ID
+  await c.env.DB.prepare(`
+    UPDATE idea_executions
+    SET workflow_instance_id = ?, updated_at = ?
+    WHERE id = ?
+  `).bind(instance.id, now, executionId).run();
+
+  return c.json({
+    success: true,
+    data: {
+      execution_id: executionId,
+      workflow_instance_id: instance.id,
+      status: 'pending',
+    },
+  });
+});
+
+// ========================================
+// Trigger Task Execution
+// ========================================
+
+// POST /api/execution/tasks/:id/execute - Execute a specific task
+execution.post('/tasks/:id/execute', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const taskId = c.req.param('id');
+
+  // Load task
+  const task = await c.env.DB.prepare(`
+    SELECT * FROM idea_tasks
+    WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+  `).bind(taskId, tenantId).first<IdeaTask>();
+
+  if (!task || task.user_id !== userId) {
+    throw new NotFoundError('Task', taskId);
+  }
+
+  // Check task is ready
+  if (task.status !== 'ready' && task.status !== 'failed') {
+    throw new AppError(`Task is not ready for execution (status: ${task.status})`, 400, 'TASK_NOT_READY');
+  }
+
+  // Get the execution record
+  const exec = await c.env.DB.prepare(`
+    SELECT id FROM idea_executions
+    WHERE idea_id = ? AND tenant_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).bind(task.idea_id, tenantId).first<{ id: string }>();
+
+  if (!exec) {
+    throw new AppError('No execution found for this idea', 400, 'NO_EXECUTION');
+  }
+
+  // Trigger execution workflow
+  const instance = await c.env.TASK_EXECUTOR_WORKFLOW.create({
+    id: `${exec.id}-${taskId}`,
+    params: {
+      task_id: taskId,
+      tenant_id: tenantId,
+      user_id: userId,
+      idea_id: task.idea_id,
+      execution_id: exec.id,
+    },
+  });
+
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(`
+    UPDATE idea_tasks
+    SET status = 'in_progress', started_at = ?, updated_at = ?
+    WHERE id = ?
+  `).bind(now, now, taskId).run();
+
+  return c.json({
+    success: true,
+    data: {
+      task_id: taskId,
+      workflow_instance_id: instance.id,
+      status: 'in_progress',
+    },
+  });
+});
+
+// POST /api/execution/ideas/:id/execute-all - Execute all ready tasks for an idea
+execution.post('/ideas/:id/execute-all', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const ideaId = c.req.param('id');
+
+  // Verify idea exists
+  const idea = await findById<Idea>(c.env.DB, 'ideas', ideaId, { tenantId });
+  if (!idea || idea.user_id !== userId) {
+    throw new NotFoundError('Idea', ideaId);
+  }
+
+  // Get execution record
+  const exec = await c.env.DB.prepare(`
+    SELECT id FROM idea_executions
+    WHERE idea_id = ? AND tenant_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).bind(ideaId, tenantId).first<{ id: string }>();
+
+  if (!exec) {
+    throw new AppError('No execution found for this idea. Run plan first.', 400, 'NO_EXECUTION');
+  }
+
+  // Get ready tasks
+  const readyTasks = await c.env.DB.prepare(`
+    SELECT id FROM idea_tasks
+    WHERE idea_id = ? AND tenant_id = ? AND status = 'ready' AND deleted_at IS NULL
+    ORDER BY sequence_order
+  `).bind(ideaId, tenantId).all<{ id: string }>();
+
+  const results: Array<{ task_id: string; workflow_instance_id: string }> = [];
+  const now = new Date().toISOString();
+
+  // Trigger execution for each ready task
+  for (const task of readyTasks.results) {
+    const instance = await c.env.TASK_EXECUTOR_WORKFLOW.create({
+      id: `${exec.id}-${task.id}`,
+      params: {
+        task_id: task.id,
+        tenant_id: tenantId,
+        user_id: userId,
+        idea_id: ideaId,
+        execution_id: exec.id,
       },
     });
-  } catch (error) {
-    console.error('Get execution idea error:', error);
-    return c.json({ success: false, error: 'Failed to get idea' }, 500);
-  }
-});
 
-// POST /execution/ideas/:id/plan - Trigger planning for an idea
-executionRoutes.post('/ideas/:id/plan', async (c) => {
-  const { tenantId, userId } = getAuth(c);
-  const ideaId = c.req.param('id');
-
-  try {
-    // Get the idea
-    const idea = await c.env.DB.prepare(`
-      SELECT id, title, description FROM ideas
-      WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
-    `).bind(ideaId, tenantId).first<{ id: string; title: string; description: string }>();
-
-    if (!idea) {
-      return c.json({ success: false, error: 'Idea not found' }, 404);
-    }
-
-    // Decrypt title and description
-    const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
-    const decryptedTitle = idea.title ? await decryptField(idea.title, encryptionKey) : '';
-    const decryptedDescription = idea.description ? await decryptField(idea.description, encryptionKey) : '';
-
-    // Get or create DO instance for this idea
-    const doId = c.env.IDEA_EXECUTOR.idFromName(`${tenantId}:${ideaId}`);
-    const stub = c.env.IDEA_EXECUTOR.get(doId);
-
-    // Initialize execution
-    const executionId = crypto.randomUUID();
-    const initResponse = await stub.fetch(new Request('http://do/init', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        executionId,
-        ideaId: idea.id,
-        tenantId,
-        userId,
-        ideaTitle: decryptedTitle,
-        ideaDescription: decryptedDescription,
-      }),
-    }));
-
-    if (!initResponse.ok) {
-      const error = await initResponse.json() as { error: string };
-      return c.json({ success: false, error: error.error }, initResponse.status);
-    }
-
-    // Generate plan
-    const planResponse = await stub.fetch(new Request('http://do/plan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ideaTitle: decryptedTitle,
-        ideaDescription: decryptedDescription,
-      }),
-    }));
-
-    const result = await planResponse.json();
-    return c.json(result, planResponse.ok ? 200 : 500);
-  } catch (error) {
-    console.error('Plan idea error:', error);
-    return c.json({ success: false, error: 'Failed to generate plan' }, 500);
-  }
-});
-
-// POST /execution/ideas/:id/execute - Start execution (create tasks from plan)
-executionRoutes.post('/ideas/:id/execute', async (c) => {
-  const { tenantId } = getAuth(c);
-  const ideaId = c.req.param('id');
-
-  try {
-    const doId = c.env.IDEA_EXECUTOR.idFromName(`${tenantId}:${ideaId}`);
-    const stub = c.env.IDEA_EXECUTOR.get(doId);
-
-    const response = await stub.fetch(new Request('http://do/execute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    }));
-
-    const result = await response.json();
-    return c.json(result, response.ok ? 200 : 500);
-  } catch (error) {
-    console.error('Execute idea error:', error);
-    return c.json({ success: false, error: 'Failed to start execution' }, 500);
-  }
-});
-
-// GET /execution/ideas/:id/status - Get execution status
-executionRoutes.get('/ideas/:id/status', async (c) => {
-  const { tenantId } = getAuth(c);
-  const ideaId = c.req.param('id');
-
-  try {
-    const doId = c.env.IDEA_EXECUTOR.idFromName(`${tenantId}:${ideaId}`);
-    const stub = c.env.IDEA_EXECUTOR.get(doId);
-
-    const response = await stub.fetch(new Request('http://do/status'));
-    const result = await response.json();
-    return c.json(result);
-  } catch (error) {
-    console.error('Get execution status error:', error);
-    return c.json({ success: false, error: 'Failed to get status' }, 500);
-  }
-});
-
-// POST /execution/ideas/:id/resolve - Resolve a blocker
-executionRoutes.post('/ideas/:id/resolve', async (c) => {
-  const { tenantId, userId } = getAuth(c);
-  const ideaId = c.req.param('id');
-
-  try {
-    const body = await c.req.json() as { blockerId: string; resolution: string };
-
-    const doId = c.env.IDEA_EXECUTOR.idFromName(`${tenantId}:${ideaId}`);
-    const stub = c.env.IDEA_EXECUTOR.get(doId);
-
-    const response = await stub.fetch(new Request('http://do/resolve-blocker', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }));
-
-    // Log the decision
     await c.env.DB.prepare(`
-      INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      crypto.randomUUID(),
-      tenantId,
-      userId,
-      'execution',
-      ideaId,
-      'resolved_blocker',
-      body.resolution,
-      new Date().toISOString()
-    ).run();
+      UPDATE idea_tasks
+      SET status = 'in_progress', started_at = ?, updated_at = ?
+      WHERE id = ?
+    `).bind(now, now, task.id).run();
 
-    const result = await response.json();
-    return c.json(result, response.ok ? 200 : 500);
-  } catch (error) {
-    console.error('Resolve blocker error:', error);
-    return c.json({ success: false, error: 'Failed to resolve blocker' }, 500);
-  }
-});
-
-// POST /execution/ideas/:id/cancel - Cancel execution
-executionRoutes.post('/ideas/:id/cancel', async (c) => {
-  const { tenantId, userId } = getAuth(c);
-  const ideaId = c.req.param('id');
-
-  try {
-    const body = await c.req.json() as { reason?: string };
-
-    const doId = c.env.IDEA_EXECUTOR.idFromName(`${tenantId}:${ideaId}`);
-    const stub = c.env.IDEA_EXECUTOR.get(doId);
-
-    const response = await stub.fetch(new Request('http://do/cancel', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }));
-
-    // Log the decision
-    await c.env.DB.prepare(`
-      INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      crypto.randomUUID(),
-      tenantId,
-      userId,
-      'execution',
-      ideaId,
-      'cancelled',
-      body.reason || 'Cancelled by user',
-      new Date().toISOString()
-    ).run();
-
-    const result = await response.json();
-    return c.json(result, response.ok ? 200 : 500);
-  } catch (error) {
-    console.error('Cancel execution error:', error);
-    return c.json({ success: false, error: 'Failed to cancel execution' }, 500);
-  }
-});
-
-// GET /execution/active - List all active executions
-executionRoutes.get('/active', async (c) => {
-  const { tenantId } = getAuth(c);
-
-  try {
-    const executions = await c.env.DB.prepare(`
-      SELECT
-        e.*,
-        i.title as idea_title,
-        i.description as idea_description
-      FROM idea_executions e
-      JOIN ideas i ON e.idea_id = i.id
-      WHERE e.tenant_id = ? AND e.deleted_at IS NULL
-        AND e.status IN ('pending', 'planning', 'in_progress', 'blocked')
-      ORDER BY e.updated_at DESC
-    `).bind(tenantId).all();
-
-    return c.json({
-      success: true,
-      data: executions.results.map(row => ({
-        id: row.id,
-        ideaId: row.idea_id,
-        ideaTitle: row.idea_title,
-        status: row.status,
-        phase: row.phase,
-        blockers: row.blockers ? JSON.parse(row.blockers as string) : [],
-        startedAt: row.started_at,
-        updatedAt: row.updated_at,
-      })),
+    results.push({
+      task_id: task.id,
+      workflow_instance_id: instance.id,
     });
-  } catch (error) {
-    console.error('List active executions error:', error);
-    return c.json({ success: false, error: 'Failed to list executions' }, 500);
   }
+
+  // Update idea status
+  await c.env.DB.prepare(`
+    UPDATE ideas
+    SET execution_status = 'executing', updated_at = ?
+    WHERE id = ?
+  `).bind(now, ideaId).run();
+
+  return c.json({
+    success: true,
+    data: {
+      idea_id: ideaId,
+      tasks_started: results.length,
+      tasks: results,
+    },
+  });
 });
 
-// GET /execution/decisions - List recent decisions
-executionRoutes.get('/decisions', async (c) => {
-  const { tenantId } = getAuth(c);
-  const limit = parseInt(c.req.query('limit') || '50');
+// ========================================
+// Get Idea Status (with tasks and outputs)
+// ========================================
 
-  try {
-    const decisions = await c.env.DB.prepare(`
-      SELECT * FROM decisions
+// GET /api/execution/ideas/:id/status - Get full execution status
+execution.get('/ideas/:id/status', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const ideaId = c.req.param('id');
+
+  // Load idea
+  const idea = await findById<Idea>(c.env.DB, 'ideas', ideaId, { tenantId });
+  if (!idea || idea.user_id !== userId) {
+    throw new NotFoundError('Idea', ideaId);
+  }
+
+  const key = await getEncryptionKey(c.env.KV, tenantId);
+  const decryptedIdea = await decryptFields(idea, ENCRYPTED_IDEA_FIELDS, key);
+
+  // Get latest execution
+  const exec = await c.env.DB.prepare(`
+    SELECT * FROM idea_executions
+    WHERE idea_id = ? AND tenant_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).bind(ideaId, tenantId).first<IdeaExecution>();
+
+  // Get all tasks
+  const tasksResult = await c.env.DB.prepare(`
+    SELECT * FROM idea_tasks
+    WHERE idea_id = ? AND tenant_id = ? AND deleted_at IS NULL
+    ORDER BY sequence_order
+  `).bind(ideaId, tenantId).all<IdeaTask>();
+
+  // Decrypt tasks
+  const tasks = await Promise.all(
+    tasksResult.results.map(async (task) => {
+      const decrypted = await decryptFields(task, ENCRYPTED_TASK_FIELDS, key);
+      // Parse result if present
+      if (decrypted.result) {
+        try {
+          decrypted.result = JSON.parse(decrypted.result as string);
+        } catch {
+          // Keep as string if not valid JSON
+        }
+      }
+      return decrypted;
+    })
+  );
+
+  // Calculate completion percentage
+  const totalTasks = tasks.length;
+  const completedTasks = tasks.filter(t => t.status === 'completed').length;
+  const failedTasks = tasks.filter(t => t.status === 'failed').length;
+  const blockedTasks = tasks.filter(t => t.status === 'blocked').length;
+  const completionPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+
+  // Get blockers
+  const blockers = tasks
+    .filter(t => t.status === 'blocked')
+    .map(t => ({ task_id: t.id, title: t.title, agent_type: t.agent_type }));
+
+  return c.json({
+    success: true,
+    data: {
+      idea: {
+        id: decryptedIdea.id,
+        title: decryptedIdea.title,
+        description: decryptedIdea.description,
+        execution_status: decryptedIdea.execution_status,
+        category: decryptedIdea.category,
+        domain: decryptedIdea.domain,
+      },
+      execution: exec ? {
+        id: exec.id,
+        status: exec.status,
+        workflow_instance_id: exec.workflow_instance_id,
+        started_at: exec.started_at,
+        planned_at: exec.planned_at,
+        completed_at: exec.completed_at,
+      } : null,
+      tasks,
+      stats: {
+        total: totalTasks,
+        completed: completedTasks,
+        failed: failedTasks,
+        blocked: blockedTasks,
+        completion_pct: completionPct,
+      },
+      blockers,
+    },
+  });
+});
+
+// ========================================
+// List Ideas by Execution Status
+// ========================================
+
+// GET /api/execution/ideas - List ideas with execution info
+execution.get('/ideas', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const status = c.req.query('status'); // new, planned, executing, done, blocked
+
+  let query = `
+    SELECT i.*, e.status as exec_status, e.total_tasks, e.completed_tasks, e.failed_tasks
+    FROM ideas i
+    LEFT JOIN (
+      SELECT idea_id, status, total_tasks, completed_tasks, failed_tasks,
+             ROW_NUMBER() OVER (PARTITION BY idea_id ORDER BY created_at DESC) as rn
+      FROM idea_executions
       WHERE tenant_id = ?
-      ORDER BY created_at DESC
-      LIMIT ?
-    `).bind(tenantId, limit).all();
+    ) e ON i.id = e.idea_id AND e.rn = 1
+    WHERE i.tenant_id = ? AND i.user_id = ? AND i.deleted_at IS NULL
+  `;
 
-    return c.json({
-      success: true,
-      data: decisions.results,
-    });
-  } catch (error) {
-    console.error('List decisions error:', error);
-    return c.json({ success: false, error: 'Failed to list decisions' }, 500);
+  const bindings: string[] = [tenantId, tenantId, userId];
+
+  if (status) {
+    query += ` AND i.execution_status = ?`;
+    bindings.push(status);
   }
+
+  query += ` ORDER BY i.created_at DESC`;
+
+  const results = await c.env.DB.prepare(query).bind(...bindings).all<Idea & {
+    exec_status: string | null;
+    total_tasks: number | null;
+    completed_tasks: number | null;
+    failed_tasks: number | null;
+  }>();
+
+  const key = await getEncryptionKey(c.env.KV, tenantId);
+  const decrypted = await Promise.all(
+    results.results.map(item => decryptFields(item, ENCRYPTED_IDEA_FIELDS, key))
+  );
+
+  return c.json({
+    success: true,
+    data: decrypted.map(item => ({
+      id: item.id,
+      title: item.title,
+      description: item.description,
+      category: item.category,
+      domain: item.domain,
+      execution_status: item.execution_status || 'new',
+      exec_status: item.exec_status,
+      total_tasks: item.total_tasks || 0,
+      completed_tasks: item.completed_tasks || 0,
+      failed_tasks: item.failed_tasks || 0,
+      created_at: item.created_at,
+    })),
+  });
 });
 
-// POST /execution/decisions - Log a decision
-executionRoutes.post('/decisions', async (c) => {
+// ========================================
+// Needs Input (Blocked/Human Tasks)
+// ========================================
+
+// GET /api/execution/needs-input - Get tasks requiring human input
+execution.get('/needs-input', async (c) => {
   const { tenantId, userId } = getAuth(c);
 
-  try {
-    const body = await c.req.json() as {
-      entityType: string;
-      entityId: string;
-      decision: string;
-      reasoning?: string;
-      context?: Record<string, unknown>;
-    };
+  const results = await c.env.DB.prepare(`
+    SELECT t.*, i.title as idea_title
+    FROM idea_tasks t
+    JOIN ideas i ON t.idea_id = i.id
+    WHERE t.tenant_id = ? AND t.user_id = ?
+    AND (t.status = 'blocked' OR t.agent_type = 'human')
+    AND t.deleted_at IS NULL
+    ORDER BY t.created_at DESC
+  `).bind(tenantId, userId).all<IdeaTask & { idea_title: string }>();
 
-    const decisionId = crypto.randomUUID();
-    await c.env.DB.prepare(`
-      INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, context, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      decisionId,
-      tenantId,
-      userId,
-      body.entityType,
-      body.entityId,
-      body.decision,
-      body.reasoning || null,
-      body.context ? JSON.stringify(body.context) : null,
-      new Date().toISOString()
-    ).run();
+  const key = await getEncryptionKey(c.env.KV, tenantId);
+  const decrypted = await Promise.all(
+    results.results.map(async (task) => {
+      const decryptedTask = await decryptFields(task, ENCRYPTED_TASK_FIELDS, key);
+      const ideaTitle = await decryptField(task.idea_title, key);
+      return { ...decryptedTask, idea_title: ideaTitle };
+    })
+  );
 
-    return c.json({
-      success: true,
-      data: { id: decisionId },
-    });
-  } catch (error) {
-    console.error('Log decision error:', error);
-    return c.json({ success: false, error: 'Failed to log decision' }, 500);
-  }
+  return c.json({
+    success: true,
+    data: decrypted,
+  });
 });
 
-export default executionRoutes;
+// ========================================
+// Complete Human Task
+// ========================================
+
+// POST /api/execution/tasks/:id/complete - Mark a human task as completed
+execution.post('/tasks/:id/complete', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const taskId = c.req.param('id');
+
+  const task = await c.env.DB.prepare(`
+    SELECT * FROM idea_tasks
+    WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+  `).bind(taskId, tenantId).first<IdeaTask>();
+
+  if (!task || task.user_id !== userId) {
+    throw new NotFoundError('Task', taskId);
+  }
+
+  if (task.agent_type !== 'human' && task.status !== 'blocked') {
+    throw new AppError('This task cannot be manually completed', 400, 'NOT_HUMAN_TASK');
+  }
+
+  const body = await c.req.json<{ result?: string }>();
+  const now = new Date().toISOString();
+
+  // Encrypt result if provided
+  let encryptedResult = null;
+  if (body.result) {
+    const key = await getEncryptionKey(c.env.KV, tenantId);
+    const { encryptField } = await import('../lib/encryption.ts');
+    encryptedResult = await encryptField(JSON.stringify({ output: body.result, success: true }), key);
+  }
+
+  await c.env.DB.prepare(`
+    UPDATE idea_tasks
+    SET status = 'completed', result = ?, completed_at = ?, updated_at = ?
+    WHERE id = ?
+  `).bind(encryptedResult, now, now, taskId).run();
+
+  // Update execution
+  const exec = await c.env.DB.prepare(`
+    SELECT id FROM idea_executions
+    WHERE idea_id = ? ORDER BY created_at DESC LIMIT 1
+  `).bind(task.idea_id).first<{ id: string }>();
+
+  if (exec) {
+    await c.env.DB.prepare(`
+      UPDATE idea_executions
+      SET completed_tasks = completed_tasks + 1, updated_at = ?
+      WHERE id = ?
+    `).bind(now, exec.id).run();
+
+    // Check if all done
+    const stats = await c.env.DB.prepare(`
+      SELECT COUNT(*) as remaining
+      FROM idea_tasks
+      WHERE idea_id = ? AND status IN ('pending', 'ready', 'in_progress') AND deleted_at IS NULL
+    `).bind(task.idea_id).first<{ remaining: number }>();
+
+    if (stats && stats.remaining === 0) {
+      await c.env.DB.prepare(`
+        UPDATE idea_executions
+        SET status = 'completed', completed_at = ?, blockers = NULL, updated_at = ?
+        WHERE id = ?
+      `).bind(now, now, exec.id).run();
+
+      await c.env.DB.prepare(`
+        UPDATE ideas
+        SET execution_status = 'done', updated_at = ?
+        WHERE id = ?
+      `).bind(now, task.idea_id).run();
+    } else {
+      // Clear blockers and resume
+      await c.env.DB.prepare(`
+        UPDATE idea_executions
+        SET status = 'executing', blockers = NULL, updated_at = ?
+        WHERE id = ?
+      `).bind(now, exec.id).run();
+    }
+  }
+
+  return c.json({ success: true });
+});
+
+// ========================================
+// Retry Failed Task
+// ========================================
+
+// POST /api/execution/tasks/:id/retry - Retry a failed task
+execution.post('/tasks/:id/retry', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const taskId = c.req.param('id');
+
+  const task = await c.env.DB.prepare(`
+    SELECT * FROM idea_tasks
+    WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+  `).bind(taskId, tenantId).first<IdeaTask>();
+
+  if (!task || task.user_id !== userId) {
+    throw new NotFoundError('Task', taskId);
+  }
+
+  if (task.status !== 'failed') {
+    throw new AppError('Only failed tasks can be retried', 400, 'NOT_FAILED');
+  }
+
+  if (task.retry_count >= task.max_retries) {
+    throw new AppError('Maximum retries exceeded', 400, 'MAX_RETRIES');
+  }
+
+  const now = new Date().toISOString();
+
+  // Reset to ready and increment retry count
+  await c.env.DB.prepare(`
+    UPDATE idea_tasks
+    SET status = 'ready', error_message = NULL, retry_count = retry_count + 1, updated_at = ?
+    WHERE id = ?
+  `).bind(now, taskId).run();
+
+  return c.json({
+    success: true,
+    data: {
+      task_id: taskId,
+      status: 'ready',
+      retry_count: task.retry_count + 1,
+    },
+  });
+});
+
+export default execution;
