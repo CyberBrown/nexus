@@ -1737,6 +1737,63 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
+  // Tool: nexus_delete_idea
+  server.tool(
+    'nexus_delete_idea',
+    'Permanently delete an idea (hard delete). Use sparingly - prefer archive for most cases.',
+    {
+      idea_id: z.string().describe('The UUID of the idea to delete'),
+      confirm: z.boolean().describe('Must be true to confirm deletion'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_delete_idea', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { idea_id, confirm } = args;
+
+      if (!confirm) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Must set confirm=true to delete' }) }],
+          isError: true
+        };
+      }
+
+      try {
+        const now = new Date().toISOString();
+
+        // Soft delete (set deleted_at)
+        const result = await env.DB.prepare(`
+          UPDATE ideas SET deleted_at = ?, updated_at = ?
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(now, now, idea_id, tenantId).run();
+
+        if (result.meta.changes === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found or already deleted' }) }],
+            isError: true
+          };
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea_id,
+              message: 'Idea deleted successfully',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
   // Tool: nexus_update_task
   server.tool(
     'nexus_update_task',
