@@ -1,0 +1,68 @@
+name = "nexus-mcp"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[dev]
+port = 8788
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nexus-db"
+database_id = "1210076d-a443-443c-8623-a02b5ff4de9f"
+
+[vars]
+ENVIRONMENT = "production"
+# Primary tenant for single-tenant MCP mode (ensures all clients use same data)
+PRIMARY_TENANT = "f943851e-a7c5-4908-90a2-956367f21460"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "4a9097857e284189a3f0dc6211b7fb3f"
+
+# Durable Objects - same classes, new namespace for this worker
+[[durable_objects.bindings]]
+name = "INBOX_MANAGER"
+class_name = "InboxManager"
+
+[[durable_objects.bindings]]
+name = "CAPTURE_BUFFER"
+class_name = "CaptureBuffer"
+
+[[durable_objects.bindings]]
+name = "SYNC_MANAGER"
+class_name = "SyncManager"
+
+[[durable_objects.bindings]]
+name = "USER_SESSION"
+class_name = "UserSession"
+
+[[durable_objects.bindings]]
+name = "IDEA_EXECUTOR"
+class_name = "IdeaExecutor"
+
+# Migrations for DO SQLite storage
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["InboxManager"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CaptureBuffer"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SyncManager"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["UserSession"]
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["IdeaExecutor"]
+
+# Service Bindings - Worker-to-Worker communication
+[[services]]
+binding = "DE"
+service = "text-gen"  # DE's text-gen worker for LLM operations

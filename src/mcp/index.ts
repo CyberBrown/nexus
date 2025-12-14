@@ -3,6 +3,10 @@
  *
  * Implements the Model Context Protocol for Claude.ai integration.
  * Uses the same pattern as developer-guides-mcp for proper OAuth handling.
+ *
+ * Authentication: Mnemo-style passphrase auth
+ * - Read operations: No auth required
+ * - Write operations: Require WRITE_PASSPHRASE in tool arguments
  */
 
 import { z } from 'zod';
@@ -11,6 +15,114 @@ import { createMcpHandler } from 'agents/mcp';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { Env } from '../types/index.ts';
 import { getEncryptionKey, encryptField, decryptField } from '../lib/encryption.ts';
+
+// ========================================
+// SAFE DECRYPT HELPER
+// ========================================
+
+/**
+ * Safely decrypt a field, returning the original value if decryption fails.
+ * This handles cases where data might be unencrypted (plain text) or NULL.
+ */
+async function safeDecrypt(value: unknown, key: CryptoKey): Promise<string> {
+  if (!value || typeof value !== 'string') {
+    return '';
+  }
+  try {
+    return await decryptField(value, key);
+  } catch {
+    // If decryption fails, the value is likely plain text - return as-is
+    return value;
+  }
+}
+
+// ========================================
+// PASSPHRASE AUTH HELPERS
+// ========================================
+
+/**
+ * Tools that modify data (create, update, delete, execute)
+ * These require passphrase validation when WRITE_PASSPHRASE is set
+ */
+const WRITE_TOOLS = new Set([
+  'nexus_create_idea',
+  'nexus_update_idea',
+  'nexus_archive_idea',
+  'nexus_delete_idea',
+  'nexus_plan_idea',
+  'nexus_execute_idea',
+  'nexus_resolve_blocker',
+  'nexus_cancel_execution',
+  'nexus_log_decision',
+  'nexus_capture',
+  'nexus_update_task',
+  'nexus_complete_task',
+  'nexus_delete_task',
+  'nexus_claim_task',
+]);
+
+/**
+ * Tools that only read data - no passphrase required
+ */
+const READ_TOOLS = new Set([
+  'nexus_get_status',
+  'nexus_get_idea',
+  'nexus_list_ideas',
+  'nexus_list_active',
+  'nexus_list_blocked',
+  'nexus_list_tasks',
+  'nexus_trigger_task',
+]);
+
+/**
+ * Check if a tool is a write operation
+ */
+export function isWriteOperation(toolName: string): boolean {
+  return WRITE_TOOLS.has(toolName);
+}
+
+/**
+ * Validate passphrase for write operations
+ * Returns error result if validation fails, null if OK
+ */
+export function validatePassphrase(
+  toolName: string,
+  args: Record<string, unknown>,
+  writePassphrase: string | undefined
+): CallToolResult | null {
+  // If no passphrase configured, skip validation (dev mode)
+  if (!writePassphrase) {
+    return null;
+  }
+
+  // Read operations don't need passphrase
+  if (!isWriteOperation(toolName)) {
+    return null;
+  }
+
+  // Check passphrase in arguments
+  const providedPassphrase = args.passphrase as string | undefined;
+  if (!providedPassphrase) {
+    return {
+      content: [{ type: 'text', text: 'Error: Write operation requires passphrase' }],
+      isError: true,
+    };
+  }
+
+  if (providedPassphrase !== writePassphrase) {
+    return {
+      content: [{ type: 'text', text: 'Error: Invalid passphrase' }],
+      isError: true,
+    };
+  }
+
+  return null; // Passphrase valid
+}
+
+/**
+ * Optional passphrase schema for write tools
+ */
+const passphraseSchema = z.string().optional().describe('Passphrase for write operations (required when WRITE_PASSPHRASE is configured)');
 
 // Factory function to create MCP server with bindings
 export function createNexusMcpServer(env: Env, tenantId: string, userId: string) {
@@ -38,8 +150,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       excitement_level: z.number().min(1).max(5).optional().describe('How excited are you about this idea? (1-5)'),
       feasibility: z.number().min(1).max(5).optional().describe('How feasible is this idea? (1-5)'),
       potential_impact: z.number().min(1).max(5).optional().describe('What is the potential impact? (1-5)'),
+      passphrase: passphraseSchema,
     },
     async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_create_idea', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
       try {
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
         const now = new Date().toISOString();
@@ -94,8 +211,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'Trigger AI planning for an idea. Starts a workflow that generates an execution plan and waits for approval.',
     {
       idea_id: z.string().describe('The UUID of the idea to plan'),
+      passphrase: passphraseSchema,
     },
-    async ({ idea_id }): Promise<CallToolResult> => {
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_plan_idea', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { idea_id } = args;
       try {
         // Verify idea exists
         const idea = await env.DB.prepare(`
@@ -250,8 +373,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'Approve and execute a planned idea by creating tasks from the generated plan. Shortcut for nexus_approve_plan with approved=true.',
     {
       idea_id: z.string().describe('The UUID of the idea to execute (must have a plan)'),
+      passphrase: passphraseSchema,
     },
-    async ({ idea_id }): Promise<CallToolResult> => {
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_execute_idea', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { idea_id } = args;
       try {
         // Get the execution record with plan
         const execution = await env.DB.prepare(`
@@ -421,6 +550,350 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
+  // Tool: nexus_get_idea - Returns full idea details including description
+  server.tool(
+    'nexus_get_idea',
+    'Get full details of an idea including its description content. Use this to access the complete idea context.',
+    {
+      idea_id: z.string().describe('The UUID of the idea to retrieve'),
+    },
+    async ({ idea_id }): Promise<CallToolResult> => {
+      try {
+        const idea = await env.DB.prepare(`
+          SELECT id, title, description, category, domain,
+                 excitement_level, feasibility, potential_impact,
+                 created_at, updated_at
+          FROM ideas
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(idea_id, tenantId).first();
+
+        if (!idea) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found' }) }],
+            isError: true
+          };
+        }
+
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const decryptedTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
+        const decryptedDescription = idea.description ? await decryptField(idea.description as string, encryptionKey) : '';
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea: {
+                id: idea.id,
+                title: decryptedTitle,
+                description: decryptedDescription,
+                category: idea.category,
+                domain: idea.domain,
+                excitement_level: idea.excitement_level,
+                feasibility: idea.feasibility,
+                potential_impact: idea.potential_impact,
+                created_at: idea.created_at,
+                updated_at: idea.updated_at,
+              },
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_trigger_task - Returns full context needed to execute a task
+  server.tool(
+    'nexus_trigger_task',
+    'Get full context needed to execute a task, including parent idea details and execution plan. Use this before starting work on a task.',
+    {
+      task_id: z.string().describe('The UUID of the task to get context for'),
+    },
+    async ({ task_id }): Promise<CallToolResult> => {
+      try {
+        // Get task with source reference to find parent idea
+        const task = await env.DB.prepare(`
+          SELECT id, title, description, status, source_type, source_reference,
+                 urgency, importance, energy_required, time_estimate_minutes,
+                 claimed_by, claimed_at, created_at
+          FROM tasks
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(task_id, tenantId).first();
+
+        if (!task) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found' }) }],
+            isError: true
+          };
+        }
+
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const decryptedTaskTitle = await safeDecrypt(task.title, encryptionKey);
+        const decryptedTaskDescription = await safeDecrypt(task.description, encryptionKey);
+
+        // Parse source_reference to get idea and execution IDs
+        // Format: "idea:{ideaId}:execution:{executionId}" OR just a UUID (legacy)
+        let ideaContext = null;
+        let executionContext = null;
+        const sourceRef = task.source_reference as string;
+
+        // Try to extract idea ID from source_reference
+        let ideaId: string | null = null;
+        let executionId: string | null = null;
+
+        if (sourceRef) {
+          if (sourceRef.startsWith('idea:')) {
+            // New format: "idea:{ideaId}:execution:{executionId}"
+            const parts = sourceRef.split(':');
+            ideaId = parts[1];
+            executionId = parts[3] || null;
+          } else {
+            // Legacy format: might be just an execution ID, try to look it up
+            const execution = await env.DB.prepare(`
+              SELECT idea_id FROM idea_executions WHERE id = ? AND tenant_id = ?
+            `).bind(sourceRef, tenantId).first<{ idea_id: string }>();
+            if (execution) {
+              ideaId = execution.idea_id;
+              executionId = sourceRef;
+            }
+          }
+        }
+
+        if (ideaId) {
+          // Get parent idea
+          const idea = await env.DB.prepare(`
+            SELECT id, title, description, category, domain
+            FROM ideas
+            WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+          `).bind(ideaId, tenantId).first();
+
+          if (idea) {
+            const decryptedIdeaTitle = await safeDecrypt(idea.title, encryptionKey);
+            const decryptedIdeaDescription = await safeDecrypt(idea.description, encryptionKey);
+
+            ideaContext = {
+              id: idea.id,
+              title: decryptedIdeaTitle,
+              description: decryptedIdeaDescription,
+              category: idea.category,
+              domain: idea.domain,
+            };
+          }
+
+          // Get execution plan
+          if (executionId) {
+            const execution = await env.DB.prepare(`
+              SELECT id, plan, phase, status
+              FROM idea_executions
+              WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+            `).bind(executionId, tenantId).first();
+
+            if (execution && execution.plan) {
+              executionContext = {
+                id: execution.id,
+                phase: execution.phase,
+                status: execution.status,
+                plan: JSON.parse(execution.plan as string),
+              };
+            }
+          }
+        }
+
+        // Check if task is ready to work on
+        const isReady = task.status === 'inbox' || task.status === 'next';
+        const isClaimed = !!task.claimed_by;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              task: {
+                id: task.id,
+                title: decryptedTaskTitle,
+                description: decryptedTaskDescription,
+                status: task.status,
+                source_type: task.source_type,
+                urgency: task.urgency,
+                importance: task.importance,
+                energy_required: task.energy_required,
+                time_estimate_minutes: task.time_estimate_minutes,
+                claimed_by: task.claimed_by,
+                claimed_at: task.claimed_at,
+              },
+              idea: ideaContext,
+              execution: executionContext,
+              ready: isReady && !isClaimed,
+              message: isClaimed
+                ? `Task already claimed by ${task.claimed_by} at ${task.claimed_at}`
+                : isReady
+                  ? 'Task is ready to be claimed and executed'
+                  : `Task status is "${task.status}" - may not be ready for execution`,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_claim_task - Executor claims a task to prevent duplicate work
+  server.tool(
+    'nexus_claim_task',
+    'Claim a task for execution. This prevents duplicate work by marking who is working on it. Returns full context needed to execute.',
+    {
+      task_id: z.string().describe('The UUID of the task to claim'),
+      executor_id: z.string().describe('Identifier of the executor claiming the task (e.g., "claude-code", "claude-ai", "human")'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_claim_task', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { task_id, executor_id } = args;
+
+      try {
+        // Check if task exists and is not already claimed
+        const task = await env.DB.prepare(`
+          SELECT id, title, description, status, source_type, source_reference,
+                 urgency, importance, claimed_by, claimed_at
+          FROM tasks
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(task_id, tenantId).first();
+
+        if (!task) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found' }) }],
+            isError: true
+          };
+        }
+
+        // Check if already claimed by someone else
+        if (task.claimed_by && task.claimed_by !== executor_id) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: `Task already claimed by ${task.claimed_by} at ${task.claimed_at}`,
+                claimed_by: task.claimed_by,
+                claimed_at: task.claimed_at,
+              })
+            }],
+            isError: true
+          };
+        }
+
+        const now = new Date().toISOString();
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
+        // Claim the task
+        await env.DB.prepare(`
+          UPDATE tasks SET claimed_by = ?, claimed_at = ?, status = 'next', updated_at = ?
+          WHERE id = ? AND tenant_id = ?
+        `).bind(executor_id, now, now, task_id, tenantId).run();
+
+        // Decrypt task fields (using safeDecrypt for mixed encrypted/plain data)
+        const decryptedTaskTitle = await safeDecrypt(task.title, encryptionKey);
+        const decryptedTaskDescription = await safeDecrypt(task.description, encryptionKey);
+
+        // Get parent idea context
+        let ideaContext = null;
+        const sourceRef = task.source_reference as string;
+
+        // Try to extract idea ID from source_reference
+        let ideaId: string | null = null;
+
+        if (sourceRef) {
+          if (sourceRef.startsWith('idea:')) {
+            // New format: "idea:{ideaId}:execution:{executionId}"
+            const parts = sourceRef.split(':');
+            ideaId = parts[1];
+          } else {
+            // Legacy format: might be just an execution ID, try to look it up
+            const execution = await env.DB.prepare(`
+              SELECT idea_id FROM idea_executions WHERE id = ? AND tenant_id = ?
+            `).bind(sourceRef, tenantId).first<{ idea_id: string }>();
+            if (execution) {
+              ideaId = execution.idea_id;
+            }
+          }
+        }
+
+        if (ideaId) {
+          const idea = await env.DB.prepare(`
+            SELECT id, title, description, category, domain
+            FROM ideas
+            WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+          `).bind(ideaId, tenantId).first();
+
+          if (idea) {
+            const decryptedIdeaTitle = await safeDecrypt(idea.title, encryptionKey);
+            const decryptedIdeaDescription = await safeDecrypt(idea.description, encryptionKey);
+
+            ideaContext = {
+              id: idea.id,
+              title: decryptedIdeaTitle,
+              description: decryptedIdeaDescription,
+              category: idea.category,
+              domain: idea.domain,
+            };
+          }
+        }
+
+        // Log the decision
+        await env.DB.prepare(`
+          INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          tenantId,
+          userId,
+          'task',
+          task_id,
+          'claimed',
+          `Claimed by ${executor_id}`,
+          now
+        ).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              claimed: true,
+              task: {
+                id: task.id,
+                title: decryptedTaskTitle,
+                description: decryptedTaskDescription,
+                status: 'next',
+                source_type: task.source_type,
+              },
+              idea: ideaContext,
+              claimed_by: executor_id,
+              claimed_at: now,
+              message: `Task claimed successfully. You are now responsible for executing this task.`,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
   // Tool: nexus_list_ideas
   server.tool(
     'nexus_list_ideas',
@@ -432,6 +905,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     },
     async ({ status, category, limit }): Promise<CallToolResult> => {
       try {
+        // Use a subquery to get only the most recent execution per idea
+        // This prevents duplicates when an idea has multiple execution records
         let query = `
           SELECT
             i.id,
@@ -439,10 +914,20 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             i.description,
             i.category,
             i.created_at,
-            e.status as execution_status,
-            e.phase as execution_phase
+            latest_exec.status as execution_status,
+            latest_exec.phase as execution_phase
           FROM ideas i
-          LEFT JOIN idea_executions e ON i.id = e.idea_id AND e.deleted_at IS NULL
+          LEFT JOIN (
+            SELECT e1.*
+            FROM idea_executions e1
+            INNER JOIN (
+              SELECT idea_id, MAX(created_at) as max_created
+              FROM idea_executions
+              WHERE deleted_at IS NULL
+              GROUP BY idea_id
+            ) e2 ON e1.idea_id = e2.idea_id AND e1.created_at = e2.max_created
+            WHERE e1.deleted_at IS NULL
+          ) latest_exec ON i.id = latest_exec.idea_id
           WHERE i.tenant_id = ? AND i.deleted_at IS NULL AND i.archived_at IS NULL
         `;
 
@@ -455,9 +940,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         if (status && status !== 'all') {
           if (status === 'no_execution') {
-            query += ' AND e.id IS NULL';
+            query += ' AND latest_exec.id IS NULL';
           } else {
-            query += ' AND e.status = ?';
+            query += ' AND latest_exec.status = ?';
             bindings.push(status);
           }
         }
@@ -608,8 +1093,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       idea_id: z.string().describe('The UUID of the idea with the blocker'),
       blocker_id: z.string().describe('The UUID of the specific blocker to resolve'),
       resolution: z.string().describe('How the blocker was resolved (decision made, info provided, etc.)'),
+      passphrase: passphraseSchema,
     },
-    async ({ idea_id, blocker_id, resolution }): Promise<CallToolResult> => {
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_resolve_blocker', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { idea_id, blocker_id, resolution } = args;
       try {
         const doId = env.IDEA_EXECUTOR.idFromName(`${tenantId}:${idea_id}`);
         const stub = env.IDEA_EXECUTOR.get(doId);
@@ -655,8 +1146,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     {
       idea_id: z.string().describe('The UUID of the idea to cancel execution for'),
       reason: z.string().optional().describe('Why the execution is being cancelled'),
+      passphrase: passphraseSchema,
     },
-    async ({ idea_id, reason }): Promise<CallToolResult> => {
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_cancel_execution', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { idea_id, reason } = args;
       try {
         const cancelReason = reason || 'Cancelled via MCP';
 
@@ -706,8 +1203,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       entity_id: z.string().describe('UUID of the entity'),
       decision: z.enum(['approved', 'rejected', 'deferred', 'modified', 'cancelled']).describe('The decision made'),
       reasoning: z.string().optional().describe('Why this decision was made'),
+      passphrase: passphraseSchema,
     },
-    async ({ entity_type, entity_id, decision, reasoning }): Promise<CallToolResult> => {
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_log_decision', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { entity_type, entity_id, decision, reasoning } = args;
       try {
         const decisionId = crypto.randomUUID();
 
@@ -1007,8 +1510,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     {
       content: z.string().describe('The raw content to capture (voice transcription, note, etc.)'),
       source_type: z.enum(['voice', 'email', 'webhook', 'manual', 'sms', 'claude']).optional().describe('Source of the capture'),
+      passphrase: passphraseSchema,
     },
-    async ({ content, source_type }): Promise<CallToolResult> => {
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_capture', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { content, source_type } = args;
       try {
         // Forward to InboxManager DO
         const doId = env.INBOX_MANAGER.idFromName(tenantId);
@@ -1046,6 +1555,442 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
           isError: true
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_update_idea
+  server.tool(
+    'nexus_update_idea',
+    'Update an existing idea with new information',
+    {
+      idea_id: z.string().describe('The UUID of the idea to update'),
+      title: z.string().optional().describe('New title for the idea'),
+      description: z.string().optional().describe('New description for the idea'),
+      category: z.enum(['feature', 'improvement', 'bug', 'documentation', 'research', 'infrastructure', 'random']).optional().describe('New category'),
+      domain: z.enum(['work', 'personal', 'side_project', 'family', 'health']).optional().describe('New domain'),
+      excitement_level: z.number().min(1).max(5).optional().describe('Updated excitement level (1-5)'),
+      feasibility: z.number().min(1).max(5).optional().describe('Updated feasibility score (1-5)'),
+      potential_impact: z.number().min(1).max(5).optional().describe('Updated impact score (1-5)'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_update_idea', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { idea_id, title, description, category, domain, excitement_level, feasibility, potential_impact } = args;
+
+      try {
+        // Check idea exists
+        const existing = await env.DB.prepare(`
+          SELECT id FROM ideas WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(idea_id, tenantId).first();
+
+        if (!existing) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found' }) }],
+            isError: true
+          };
+        }
+
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const now = new Date().toISOString();
+
+        // Build dynamic update query
+        const updates: string[] = ['updated_at = ?'];
+        const bindings: unknown[] = [now];
+
+        if (title !== undefined) {
+          updates.push('title = ?');
+          bindings.push(await encryptField(title, encryptionKey));
+        }
+        if (description !== undefined) {
+          updates.push('description = ?');
+          bindings.push(await encryptField(description, encryptionKey));
+        }
+        if (category !== undefined) {
+          updates.push('category = ?');
+          bindings.push(category);
+        }
+        if (domain !== undefined) {
+          updates.push('domain = ?');
+          bindings.push(domain);
+        }
+        if (excitement_level !== undefined) {
+          updates.push('excitement_level = ?');
+          bindings.push(excitement_level);
+        }
+        if (feasibility !== undefined) {
+          updates.push('feasibility = ?');
+          bindings.push(feasibility);
+        }
+        if (potential_impact !== undefined) {
+          updates.push('potential_impact = ?');
+          bindings.push(potential_impact);
+        }
+
+        bindings.push(idea_id, tenantId);
+
+        await env.DB.prepare(`
+          UPDATE ideas SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?
+        `).bind(...bindings).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea_id,
+              message: 'Idea updated successfully',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_archive_idea
+  server.tool(
+    'nexus_archive_idea',
+    'Archive an idea (soft delete). Use this to clean up ideas that are no longer relevant.',
+    {
+      idea_id: z.string().describe('The UUID of the idea to archive'),
+      reason: z.string().optional().describe('Reason for archiving (e.g., "duplicate", "no longer relevant", "completed elsewhere")'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_archive_idea', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { idea_id, reason } = args;
+
+      try {
+        const now = new Date().toISOString();
+
+        const result = await env.DB.prepare(`
+          UPDATE ideas SET archived_at = ?, archive_reason = ?, updated_at = ?
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL AND archived_at IS NULL
+        `).bind(now, reason || null, now, idea_id, tenantId).run();
+
+        if (result.meta.changes === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found or already archived' }) }],
+            isError: true
+          };
+        }
+
+        // Log the decision
+        await env.DB.prepare(`
+          INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          tenantId,
+          userId,
+          'idea',
+          idea_id,
+          'archived',
+          reason || 'Archived via MCP',
+          now
+        ).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea_id,
+              message: 'Idea archived successfully',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_delete_idea
+  server.tool(
+    'nexus_delete_idea',
+    'Permanently delete an idea (hard delete). Use sparingly - prefer archive for most cases.',
+    {
+      idea_id: z.string().describe('The UUID of the idea to delete'),
+      confirm: z.boolean().describe('Must be true to confirm deletion'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_delete_idea', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { idea_id, confirm } = args;
+
+      if (!confirm) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Must set confirm=true to delete' }) }],
+          isError: true
+        };
+      }
+
+      try {
+        const now = new Date().toISOString();
+
+        // Soft delete (set deleted_at)
+        const result = await env.DB.prepare(`
+          UPDATE ideas SET deleted_at = ?, updated_at = ?
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(now, now, idea_id, tenantId).run();
+
+        if (result.meta.changes === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found or already deleted' }) }],
+            isError: true
+          };
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea_id,
+              message: 'Idea deleted successfully',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_update_task
+  server.tool(
+    'nexus_update_task',
+    'Update an existing task with new information',
+    {
+      task_id: z.string().describe('The UUID of the task to update'),
+      title: z.string().optional().describe('New title for the task'),
+      description: z.string().optional().describe('New description'),
+      status: z.enum(['inbox', 'next', 'scheduled', 'waiting', 'someday', 'completed', 'cancelled']).optional().describe('New status'),
+      urgency: z.number().min(1).max(5).optional().describe('Urgency level (1-5)'),
+      importance: z.number().min(1).max(5).optional().describe('Importance level (1-5)'),
+      due_date: z.string().optional().describe('Due date in ISO format (YYYY-MM-DD)'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_update_task', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { task_id, title, description, status, urgency, importance, due_date } = args;
+
+      try {
+        const existing = await env.DB.prepare(`
+          SELECT id FROM tasks WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(task_id, tenantId).first();
+
+        if (!existing) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found' }) }],
+            isError: true
+          };
+        }
+
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const now = new Date().toISOString();
+
+        const updates: string[] = ['updated_at = ?'];
+        const bindings: unknown[] = [now];
+
+        if (title !== undefined) {
+          updates.push('title = ?');
+          bindings.push(await encryptField(title, encryptionKey));
+        }
+        if (description !== undefined) {
+          updates.push('description = ?');
+          bindings.push(await encryptField(description, encryptionKey));
+        }
+        if (status !== undefined) {
+          updates.push('status = ?');
+          bindings.push(status);
+          if (status === 'completed') {
+            updates.push('completed_at = ?');
+            bindings.push(now);
+          }
+        }
+        if (urgency !== undefined) {
+          updates.push('urgency = ?');
+          bindings.push(urgency);
+        }
+        if (importance !== undefined) {
+          updates.push('importance = ?');
+          bindings.push(importance);
+        }
+        if (due_date !== undefined) {
+          updates.push('due_date = ?');
+          bindings.push(due_date);
+        }
+
+        bindings.push(task_id, tenantId);
+
+        await env.DB.prepare(`
+          UPDATE tasks SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?
+        `).bind(...bindings).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              task_id,
+              message: 'Task updated successfully',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_complete_task
+  server.tool(
+    'nexus_complete_task',
+    'Mark a task as completed',
+    {
+      task_id: z.string().describe('The UUID of the task to complete'),
+      notes: z.string().optional().describe('Optional completion notes'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_complete_task', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { task_id, notes } = args;
+
+      try {
+        const now = new Date().toISOString();
+
+        const result = await env.DB.prepare(`
+          UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ?
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL AND status != 'completed'
+        `).bind(now, now, task_id, tenantId).run();
+
+        if (result.meta.changes === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found or already completed' }) }],
+            isError: true
+          };
+        }
+
+        // Log the decision
+        await env.DB.prepare(`
+          INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          tenantId,
+          userId,
+          'task',
+          task_id,
+          'completed',
+          notes || 'Completed via MCP',
+          now
+        ).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              task_id,
+              message: 'Task marked as completed',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_delete_task
+  server.tool(
+    'nexus_delete_task',
+    'Delete a task (soft delete)',
+    {
+      task_id: z.string().describe('The UUID of the task to delete'),
+      reason: z.string().optional().describe('Reason for deletion'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_delete_task', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { task_id, reason } = args;
+
+      try {
+        const now = new Date().toISOString();
+
+        const result = await env.DB.prepare(`
+          UPDATE tasks SET deleted_at = ?, updated_at = ?
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(now, now, task_id, tenantId).run();
+
+        if (result.meta.changes === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found or already deleted' }) }],
+            isError: true
+          };
+        }
+
+        // Log the decision
+        await env.DB.prepare(`
+          INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          tenantId,
+          userId,
+          'task',
+          task_id,
+          'deleted',
+          reason || 'Deleted via MCP',
+          now
+        ).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              task_id,
+              message: 'Task deleted successfully',
+            }, null, 2)
+          }]
         };
       } catch (error: any) {
         return {

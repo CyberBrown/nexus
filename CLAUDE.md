@@ -17,9 +17,9 @@ Nexus is **The Brain** of the AI infrastructure ecosystem - the orchestration la
 ### Nexus Core Responsibilities
 
 **Tier 1 Processing:**
-- Fast/cheap edge AI classification
 - Input triage and routing
 - Decide when to escalate to Tier 2 (DE)
+- Orchestrate LLM calls via DE service binding (never calls LLM providers directly)
 
 **Active Memory Manager (AMM):**
 - Entity detection in conversations
@@ -50,6 +50,36 @@ Nexus is **The Brain** of the AI infrastructure ecosystem - the orchestration la
 - **State Management**: Durable Objects
 - **Package Manager**: Bun (NOT npm)
 - **Language**: TypeScript
+- **LLM Operations**: Via DE service binding (no direct LLM API calls)
+
+## Service Bindings
+
+Nexus uses Cloudflare Service Bindings for zero-cost Worker-to-Worker communication:
+
+| Binding | Service | Purpose |
+|---------|---------|---------|
+| `DE` | `text-gen` | LLM operations (chat completion, text generation) |
+
+### Using the DE Client
+
+```typescript
+import { DEClient } from './lib/de-client.ts';
+
+// In a handler or Durable Object method:
+const deClient = new DEClient(env);
+
+const response = await deClient.chatCompletion({
+  messages: [
+    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'user', content: 'Hello!' },
+  ],
+  max_tokens: 1000,
+});
+
+console.log(response.content);
+```
+
+**Important:** Never call LLM providers directly. Always use the DE client.
 
 ## Developer Guidelines (MCP Server)
 
@@ -270,9 +300,11 @@ POST /setup → Returns dev token → Use Bearer token → Worker validates
 
 | Secret | Description |
 |--------|-------------|
-| `ANTHROPIC_API_KEY` | Claude API key for AI classification |
 | `TEAM_DOMAIN` | Cloudflare Access team domain (production) |
 | `POLICY_AUD` | Cloudflare Access application audience tag (production) |
+| `WRITE_PASSPHRASE` | Passphrase for MCP write operations |
+
+**Note:** `ANTHROPIC_API_KEY` is NOT needed in Nexus. All LLM operations go through DE (distributed-electrons) via service binding.
 
 ### Managing Secrets
 
@@ -281,50 +313,36 @@ POST /setup → Returns dev token → Use Bearer token → Worker validates
 npm run secret:list
 
 # Add/update a secret
-npm run secret:put ANTHROPIC_API_KEY
+npm run secret:put WRITE_PASSPHRASE
 # (prompts for value)
 
 # Or directly with wrangler
-npx wrangler secret put ANTHROPIC_API_KEY
+npx wrangler secret put WRITE_PASSPHRASE
 ```
 
-### Local Development Setup
+### Local Development with Secrets
 
-Development requires a Cloudflare API token for wrangler CLI commands (deploy, secrets, migrations, remote dev).
+For local dev, you have two options:
 
-**1. Create `.dev.vars` file** (gitignored):
-```bash
-# Cloudflare API Token for Wrangler CLI (development/deployment only)
-# Permissions needed:
-#   Account: Account Settings (Read), Workers KV Storage (Edit), Workers R2 Storage (Edit), D1 (Edit), Workers Scripts (Edit)
-#   Zone: Workers Routes (Edit)
-CLOUDFLARE_API_TOKEN=your-token-here
-```
+1. **Use remote bindings** (recommended - uses production secrets and service bindings):
+   ```bash
+   bun run dev:remote
+   ```
 
-Create a token at https://dash.cloudflare.com/profile/api-tokens
+2. **Create `.dev.vars`** (local-only secrets):
+   ```bash
+   # Cloudflare API Token for Wrangler CLI (development/deployment only)
+   # Permissions needed:
+   #   Account: Account Settings (Read), Workers KV Storage (Edit), Workers R2 Storage (Edit), D1 (Edit), Workers Scripts (Edit)
+   #   Zone: Workers Routes (Edit)
+   CLOUDFLARE_API_TOKEN=your-token-here
+   WRITE_PASSPHRASE=your-dev-passphrase
+   ```
+   Create a token at https://dash.cloudflare.com/profile/api-tokens
 
-**2. Run commands normally** - npm scripts auto-load from `.dev.vars`:
-```bash
-bun run dev:remote    # Dev server with remote bindings
-bun run deploy        # Deploy to Cloudflare
-bun run secret:list   # List secrets
-bun run db:migrate:remote  # Run D1 migrations
-```
+   Note: `.dev.vars` is gitignored and should never be committed.
 
-**Note:** The Cloudflare API token is only for the wrangler CLI during development/deployment. The deployed Worker uses separate secrets (`ANTHROPIC_API_KEY`, etc.) configured via `wrangler secret put`.
-
-### Local-only Worker Secrets
-
-To add Worker secrets for local dev (like `ANTHROPIC_API_KEY`), add them to `.dev.vars`:
-```bash
-CLOUDFLARE_API_TOKEN=your-cf-token
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Or use remote bindings which pulls production secrets:
-```bash
-bun run dev:remote
-```
+**Important:** For LLM functionality in local dev, you must use `npm run dev:remote` to access the DE service binding.
 
 ## Testing
 

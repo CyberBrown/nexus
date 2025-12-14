@@ -16,12 +16,13 @@ ENVIRONMENT = "development"
 # Cloudflare Access - set these for production auth
 # TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 # POLICY_AUD = "your-application-audience-tag"
-# DE text-gen worker URL (for LLM routing)
-# TEXT_GEN_URL = "https://de-text-gen.your-domain.workers.dev"
+# MCP Passphrase Auth - set via `npx wrangler secret put WRITE_PASSPHRASE` for production
+# WRITE_PASSPHRASE = "stale-coffee-44"
 
 [[kv_namespaces]]
 binding = "KV"
 id = "4a9097857e284189a3f0dc6211b7fb3f"
+preview_id = "a62b4b925b7c40679937e1545c1dff64"
 
 [[durable_objects.bindings]]
 name = "INBOX_MANAGER"
@@ -39,12 +40,11 @@ class_name = "SyncManager"
 name = "USER_SESSION"
 class_name = "UserSession"
 
-# DEPRECATED: IdeaExecutor DO replaced by IdeaPlanningWorkflow
-# [[durable_objects.bindings]]
-# name = "IDEA_EXECUTOR"
-# class_name = "IdeaExecutor"
+[[durable_objects.bindings]]
+name = "IDEA_EXECUTOR"
+class_name = "IdeaExecutor"
 
-# Durable Objects migrations
+# DO Migrations - sync with production
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["InboxManager"]
@@ -63,19 +63,31 @@ new_sqlite_classes = ["UserSession"]
 
 [[migrations]]
 tag = "v5"
-new_sqlite_classes = ["IdeaExecutor"]
 
 [[migrations]]
 tag = "v6"
-# Empty migration to match remote state
 
 [[migrations]]
 tag = "v7"
-new_sqlite_classes = ["IdeaExecutor"]
 
 [[migrations]]
 tag = "v8"
-deleted_classes = ["IdeaExecutor"]
+
+# v9 adds IdeaExecutor as a new class
+[[migrations]]
+tag = "v9"
+new_sqlite_classes = ["IdeaExecutor"]
+
+# Service Bindings - Worker-to-Worker communication
+[[services]]
+binding = "DE"
+service = "text-gen"  # DE's text-gen worker for LLM operations
+
+# Cloudflare Workflows - Durable execution for long-running tasks
+[[workflows]]
+name = "idea-execution-workflow"
+binding = "IDEA_EXECUTION_WORKFLOW"
+class_name = "IdeaExecutionWorkflow"
 
 # Cron Triggers
 [triggers]
