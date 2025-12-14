@@ -326,13 +326,20 @@ For local dev, you have two options:
 
 1. **Use remote bindings** (recommended - uses production secrets and service bindings):
    ```bash
-   npm run dev:remote
+   bun run dev:remote
    ```
 
 2. **Create `.dev.vars`** (local-only secrets):
    ```bash
-   echo "WRITE_PASSPHRASE=your-dev-passphrase" > .dev.vars
+   # Cloudflare API Token for Wrangler CLI (development/deployment only)
+   # Permissions needed:
+   #   Account: Account Settings (Read), Workers KV Storage (Edit), Workers R2 Storage (Edit), D1 (Edit), Workers Scripts (Edit)
+   #   Zone: Workers Routes (Edit)
+   CLOUDFLARE_API_TOKEN=your-token-here
+   WRITE_PASSPHRASE=your-dev-passphrase
    ```
+   Create a token at https://dash.cloudflare.com/profile/api-tokens
+
    Note: `.dev.vars` is gitignored and should never be committed.
 
 **Important:** For LLM functionality in local dev, you must use `npm run dev:remote` to access the DE service binding.
@@ -395,7 +402,7 @@ npm run db:migrate:remote
 ## Execution Loop Hierarchy
 
 Nexus operates through a hierarchy of execution loops for autonomous task processing.
-See `docs/TASK_REVIEW_LOOP.md` for full documentation.
+See `docs/EXECUTION_LOOP.md` for full documentation (idea triage, task review, execution loops).
 
 ```
                     ┌─────────────────────────┐

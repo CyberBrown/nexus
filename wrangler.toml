@@ -44,7 +44,7 @@ class_name = "UserSession"
 name = "IDEA_EXECUTOR"
 class_name = "IdeaExecutor"
 
-# DO Migrations - sync with production (currently at v8)
+# DO Migrations - sync with production
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["InboxManager"]
@@ -92,3 +92,19 @@ class_name = "IdeaExecutionWorkflow"
 # Cron Triggers
 [triggers]
 crons = ["0 0 * * *"]  # Run daily at midnight UTC
+
+# Workflows
+[[workflows]]
+name = "idea-to-plan-workflow"
+binding = "IDEA_TO_PLAN_WORKFLOW"
+class_name = "IdeaToPlanWorkflow"
+
+[[workflows]]
+name = "task-executor-workflow"
+binding = "TASK_EXECUTOR_WORKFLOW"
+class_name = "TaskExecutorWorkflow"
+
+[[workflows]]
+name = "idea-planning-workflow"
+binding = "IDEA_PLANNING_WORKFLOW"
+class_name = "IdeaPlanningWorkflow"

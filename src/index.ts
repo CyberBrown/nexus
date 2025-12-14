@@ -20,7 +20,13 @@ export { InboxManager } from './durable-objects/InboxManager.ts';
 export { CaptureBuffer } from './durable-objects/CaptureBuffer.ts';
 export { SyncManager } from './durable-objects/SyncManager.ts';
 export { UserSession } from './durable-objects/UserSession.ts';
-export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
+// DEPRECATED: IdeaExecutor replaced by IdeaPlanningWorkflow
+// export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
+
+// Re-export Workflows
+export { IdeaToPlanWorkflow } from './workflows/IdeaToPlanWorkflow.ts';
+export { TaskExecutorWorkflow } from './workflows/TaskExecutorWorkflow.ts';
+export { IdeaPlanningWorkflow } from './workflows/idea-planning-workflow.ts';
 
 // Re-export Cloudflare Workflows
 export { IdeaExecutionWorkflow } from './workflows/IdeaExecutionWorkflow.ts';
@@ -124,7 +130,6 @@ api.route('/ideas', ideasRoutes);
 api.route('/people', peopleRoutes);
 api.route('/commitments', commitmentsRoutes);
 api.route('/execution', executionRoutes);
-
 
 // ========================================
 // Auth Routes
