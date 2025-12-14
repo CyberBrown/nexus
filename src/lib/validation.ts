@@ -317,6 +317,38 @@ export type BufferChunkInput = z.infer<typeof bufferChunkSchema>;
 export type BufferConfigInput = z.infer<typeof bufferConfigSchema>;
 
 // ============================================
+// Note schemas
+// ============================================
+
+const noteCategorySchema = z.enum(['general', 'meeting', 'research', 'reference', 'idea', 'log']);
+
+export const createNoteSchema = z.object({
+  title: z.string().min(1, 'Title is required').max(500),
+  content: z.string().max(100000).optional().nullable(),
+  category: noteCategorySchema.optional().default('general'),
+  tags: jsonStringSchema,
+  source_type: z.string().max(100).optional().nullable(),
+  source_reference: z.string().max(500).optional().nullable(),
+  source_context: z.string().max(5000).optional().nullable(),
+  pinned: z.boolean().optional().default(false),
+});
+
+export const updateNoteSchema = z.object({
+  title: z.string().min(1).max(500).optional(),
+  content: z.string().max(100000).optional().nullable(),
+  category: noteCategorySchema.optional(),
+  tags: jsonStringSchema,
+  source_type: z.string().max(100).optional().nullable(),
+  source_reference: z.string().max(500).optional().nullable(),
+  source_context: z.string().max(5000).optional().nullable(),
+  pinned: z.boolean().optional(),
+  archived_at: isoDateTimeSchema.optional().nullable(),
+});
+
+export type CreateNoteInput = z.infer<typeof createNoteSchema>;
+export type UpdateNoteInput = z.infer<typeof updateNoteSchema>;
+
+// ============================================
 // Validation helper
 // ============================================
 

@@ -165,7 +165,7 @@ The core foundation has been built and tested. Current capabilities:
 
 ### Implemented Features
 
-- **Full CRUD API** for all entities (tasks, projects, inbox, ideas, people, commitments)
+- **Full CRUD API** for all entities (tasks, projects, inbox, ideas, people, commitments, notes)
 - **App-layer encryption** for sensitive fields (AES-256-GCM)
 - **Zod validation** on all inputs with detailed error messages
 - **Custom error classes** (AppError, ValidationError, NotFoundError, etc.)
@@ -194,7 +194,8 @@ src/
 │   ├── projects.ts             # Projects CRUD
 │   ├── ideas.ts                # Ideas CRUD
 │   ├── people.ts               # People CRUD
-│   └── commitments.ts          # Commitments CRUD
+│   ├── commitments.ts          # Commitments CRUD
+│   └── notes.ts                # Notes CRUD with source tracking
 ├── durable-objects/
 │   └── InboxManager.ts         # Real-time capture & classification
 └── types/
@@ -211,6 +212,7 @@ src/
 | `/api/ideas` | GET, POST, PATCH, DELETE | Ideas/someday-maybe |
 | `/api/people` | GET, POST, PATCH, DELETE | Contacts |
 | `/api/commitments` | GET, POST, PATCH, DELETE | Waiting-for/owed-to |
+| `/api/notes` | GET, POST, PATCH, DELETE | Notes with source tracking |
 | `/api/capture` | POST | Capture with AI classification |
 | `/api/capture/batch` | POST | Batch capture |
 | `/api/capture/status` | GET | InboxManager status |
@@ -227,6 +229,7 @@ src/
 - `ideas.title`, `ideas.description`
 - `people.name`, `people.email`, `people.phone`, `people.notes`
 - `commitments.description`
+- `notes.title`, `notes.content`
 
 ## Authentication
 
@@ -391,6 +394,8 @@ npm run db:migrate:remote
 - **Web Dashboard Foundation** - Qwik app with core pages ✅
 - **AI Classification** - Claude-powered inbox item classification ✅
 - **Execution Loop** - IdeaExecutionLoop with plan generation and task creation ✅
+- **Notes System** - Persistent notes with encryption, source tracking, and MCP tools ✅
+- **Task Dispatcher** - Cron-based task routing to executors (claude-code, claude-ai, de-agent, human) ✅
 
 ### In Progress
 - **Task Review Loop** - Triage framework for task routing (see `docs/TASK_REVIEW_LOOP.md`)
@@ -435,6 +440,170 @@ See `docs/EXECUTION_LOOP.md` for full documentation (idea triage, task review, e
 - `GET /api/execution/active` - List all active executions
 - `POST /api/execution/ideas/:id/cancel` - Cancel execution
 - `GET /api/execution/decisions` - Decision log
+
+## Task Dispatcher System
+
+Automated task routing system that polls for ready tasks and dispatches them to appropriate executors.
+
+### How It Works
+
+1. **Cron Trigger**: Runs every 15 minutes (`*/15 * * * *`)
+2. **Task Detection**: Finds tasks with `status = 'next'` (ready for execution)
+3. **Executor Routing**: Routes based on task title prefix tags
+4. **Queue Management**: Tracks execution state in `execution_queue` table
+
+### Executor Types
+
+| Type | Description | Routed From |
+|------|-------------|-------------|
+| `claude-code` | Claude Code CLI for code tasks | `[implement]`, `[deploy]`, `[fix]`, `[refactor]`, `[test]`, `[debug]`, `[code]` |
+| `claude-ai` | Claude.ai for research/writing | `[research]`, `[design]`, `[document]`, `[analyze]`, `[plan]`, `[write]` |
+| `de-agent` | DE service for automated tasks | (reserved for future use) |
+| `human` | Human attention required | `[human]`, `[review]`, `[approve]`, `[decide]`, `[call]`, `[meeting]` |
+
+Tasks without prefix tags default to `human` for triage.
+
+### MCP Tools for Queue Management
+
+```typescript
+// Check queue for tasks ready to execute
+nexus_check_queue({ executor_type: 'claude-code' })
+
+// Claim a task to work on it
+nexus_claim_task({ queue_id: '...', passphrase: '...' })
+
+// Mark task completed
+nexus_complete_queue_task({ queue_id: '...', result: '...', passphrase: '...' })
+
+// Get queue statistics
+nexus_queue_stats()
+
+// MANUAL DISPATCH - Immediately queue tasks without waiting for cron
+nexus_dispatch_task({ task_id: '...', passphrase: '...' })  // Single task
+nexus_dispatch_ready({ executor_type: 'claude-code', passphrase: '...' })  // All ready tasks
+```
+
+### REST API Endpoints
+
+```
+POST /api/tasks/:id/dispatch   - Dispatch single task
+  Body: { executor_type?: string }
+
+POST /api/dispatch/ready       - Dispatch all tasks with status="next"
+  Body: { executor_type?: string, limit?: number }
+```
+
+### Execution Flow
+
+```
+Task created with status="next"
+        ↓
+Cron trigger (every 15 min) OR manual: nexus_dispatch_task
+        ↓
+Dispatcher routes to queue based on title tag
+        ↓
+Executor checks queue: nexus_check_queue
+        ↓
+Executor claims task: nexus_claim_task
+        ↓
+Executor gets context: nexus_trigger_task
+        ↓
+Executor does work
+        ↓
+Executor reports: nexus_complete_queue_task
+        ↓
+Auto-dispatch checks for newly ready tasks
+        ↓
+Response includes next_available tasks → loop continues
+```
+
+### Auto-Dispatch on Completion
+
+When `nexus_complete_queue_task` is called, it automatically:
+1. Checks for already-queued tasks for the same executor type
+2. Finds newly ready tasks (`status="next"`) that match this executor
+3. Dispatches them immediately (no waiting for cron)
+4. Returns `next_available` list so executor can claim next task
+
+This enables continuous execution loops without polling delays.
+
+### Database Tables
+
+- `execution_queue` - Active queue entries with status tracking
+- `dispatch_log` - Immutable audit trail of all dispatch actions
+
+### Cron Configuration
+
+```toml
+[triggers]
+crons = [
+  "0 0 * * *",     # Daily at midnight - recurring tasks
+  "*/15 * * * *"   # Every 15 min - task dispatcher
+]
+```
+
+## Notes System
+
+Persistent note storage with source tracking - designed to capture knowledge from various sources (Claude conversations, idea executions, meetings, research).
+
+### Note Categories
+| Category | Use Case |
+|----------|----------|
+| `general` | Default, general-purpose notes |
+| `meeting` | Meeting notes and action items |
+| `research` | Research findings and references |
+| `reference` | Reference material, documentation |
+| `idea` | Idea elaborations and explorations |
+| `log` | Activity logs, status updates |
+
+### Source Tracking
+Notes can track where they originated from:
+- `source_type`: Origin type (e.g., `claude_conversation`, `idea_execution`, `manual`, `capture`)
+- `source_reference`: Reference ID or URL
+- `source_context`: Additional context about the source
+
+### API Endpoints
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/notes` | GET | List notes (with filters: category, archived, pinned, search, source_type) |
+| `/api/notes` | POST | Create note |
+| `/api/notes/:id` | GET | Get single note |
+| `/api/notes/:id` | PATCH | Update note |
+| `/api/notes/:id` | DELETE | Soft delete note |
+| `/api/notes/:id/archive` | POST | Archive note |
+| `/api/notes/:id/unarchive` | POST | Unarchive note |
+| `/api/notes/:id/pin` | POST | Toggle pin status |
+
+### MCP Tools
+Available via the Nexus MCP server:
+- `nexus_create_note` - Create a new note (requires passphrase)
+- `nexus_list_notes` - List notes with optional filters
+- `nexus_get_note` - Get a specific note by ID
+- `nexus_update_note` - Update an existing note (requires passphrase)
+- `nexus_delete_note` - Soft delete a note (requires passphrase)
+- `nexus_archive_note` - Archive/unarchive a note (requires passphrase)
+- `nexus_search_notes` - Search notes by content
+
+### Database Schema
+```sql
+CREATE TABLE notes (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    title TEXT NOT NULL,        -- encrypted
+    content TEXT,               -- encrypted
+    category TEXT DEFAULT 'general',
+    tags TEXT,                  -- JSON array
+    source_type TEXT,
+    source_reference TEXT,
+    source_context TEXT,
+    pinned INTEGER DEFAULT 0,
+    archived_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+```
 
 ## Idea Management System (Priority Feature)
 

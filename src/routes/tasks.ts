@@ -384,4 +384,121 @@ tasks.get('/:id/recurrence-history', async (c) => {
   });
 });
 
+// ========================================
+// Task Dispatch Endpoints
+// ========================================
+
+// Dispatch a single task to the execution queue
+tasks.post('/:id/dispatch', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+  const taskId = c.req.param('id');
+
+  // Verify ownership
+  const task = await findById<Task>(c.env.DB, 'tasks', taskId, { tenantId });
+  if (!task || task.user_id !== userId) {
+    throw new NotFoundError('Task', taskId);
+  }
+
+  // Check if already queued
+  const existing = await c.env.DB.prepare(`
+    SELECT id, status FROM execution_queue
+    WHERE task_id = ? AND status IN ('queued', 'claimed', 'dispatched')
+  `).bind(taskId).first<{ id: string; status: string }>();
+
+  if (existing) {
+    return c.json({
+      success: false,
+      error: `Task is already in queue with status '${existing.status}'`,
+      queue_id: existing.id,
+    }, 409);
+  }
+
+  // Get optional executor_type override from body
+  const body = await c.req.json().catch(() => ({}));
+  let executorType = body.executor_type as string | undefined;
+
+  // Decrypt title for auto-detection
+  const key = await getEncryptionKey(c.env.KV, tenantId);
+  const decrypted = await decryptFields(task, ENCRYPTED_FIELDS, key);
+
+  // Auto-detect executor type if not provided
+  if (!executorType) {
+    const patterns: Array<{ pattern: RegExp; executor: string }> = [
+      { pattern: /^\[implement\]/i, executor: 'claude-code' },
+      { pattern: /^\[deploy\]/i, executor: 'claude-code' },
+      { pattern: /^\[fix\]/i, executor: 'claude-code' },
+      { pattern: /^\[refactor\]/i, executor: 'claude-code' },
+      { pattern: /^\[test\]/i, executor: 'claude-code' },
+      { pattern: /^\[debug\]/i, executor: 'claude-code' },
+      { pattern: /^\[code\]/i, executor: 'claude-code' },
+      { pattern: /^\[research\]/i, executor: 'claude-ai' },
+      { pattern: /^\[design\]/i, executor: 'claude-ai' },
+      { pattern: /^\[document\]/i, executor: 'claude-ai' },
+      { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
+      { pattern: /^\[plan\]/i, executor: 'claude-ai' },
+      { pattern: /^\[write\]/i, executor: 'claude-ai' },
+      { pattern: /^\[human\]/i, executor: 'human' },
+      { pattern: /^\[review\]/i, executor: 'human' },
+      { pattern: /^\[approve\]/i, executor: 'human' },
+      { pattern: /^\[decide\]/i, executor: 'human' },
+      { pattern: /^\[call\]/i, executor: 'human' },
+      { pattern: /^\[meeting\]/i, executor: 'human' },
+    ];
+
+    executorType = 'human'; // default
+    for (const { pattern, executor } of patterns) {
+      if (pattern.test(decrypted.title)) {
+        executorType = executor;
+        break;
+      }
+    }
+  }
+
+  // Calculate priority
+  const priority = (task.urgency || 3) * (task.importance || 3);
+  const now = new Date().toISOString();
+
+  // Build context
+  const context = JSON.stringify({
+    task_title: decrypted.title,
+    task_description: decrypted.description,
+    project_id: task.project_id,
+    domain: task.domain,
+    due_date: task.due_date,
+    energy_required: task.energy_required,
+    source_type: task.source_type,
+    source_reference: task.source_reference,
+  });
+
+  // Add to queue
+  const queueId = crypto.randomUUID();
+  await c.env.DB.prepare(`
+    INSERT INTO execution_queue (
+      id, tenant_id, user_id, task_id, executor_type, status,
+      priority, queued_at, context, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+  `).bind(
+    queueId, tenantId, userId, taskId, executorType,
+    priority, now, context, now, now
+  ).run();
+
+  // Log the dispatch
+  const logId = crypto.randomUUID();
+  await c.env.DB.prepare(`
+    INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+    VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+  `).bind(logId, tenantId, queueId, taskId, executorType, JSON.stringify({ source: 'api_dispatch' }), now).run();
+
+  return c.json({
+    success: true,
+    data: {
+      queue_id: queueId,
+      task_id: taskId,
+      executor_type: executorType,
+      priority: priority,
+      queued_at: now,
+    },
+  }, 201);
+});
+
 export default tasks;

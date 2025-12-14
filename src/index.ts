@@ -12,16 +12,17 @@ import ideasRoutes from './routes/ideas.ts';
 import peopleRoutes from './routes/people.ts';
 import commitmentsRoutes from './routes/commitments.ts';
 import executionRoutes from './routes/execution.ts';
+import notesRoutes from './routes/notes.ts';
 import { createNexusMcpHandler } from './mcp/index.ts';
 import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
+import { dispatchTasks } from './scheduled/task-dispatcher.ts';
 
 // Re-export Durable Objects
 export { InboxManager } from './durable-objects/InboxManager.ts';
 export { CaptureBuffer } from './durable-objects/CaptureBuffer.ts';
 export { SyncManager } from './durable-objects/SyncManager.ts';
 export { UserSession } from './durable-objects/UserSession.ts';
-// DEPRECATED: IdeaExecutor replaced by IdeaPlanningWorkflow
-// export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
+export { IdeaExecutor } from './durable-objects/IdeaExecutor.ts';
 
 // Re-export Workflows
 export { IdeaToPlanWorkflow } from './workflows/IdeaToPlanWorkflow.ts';
@@ -38,10 +39,23 @@ export default {
   },
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    console.log(`Cron trigger fired at ${new Date(event.scheduledTime).toISOString()}`);
+    console.log(`Cron trigger fired at ${new Date(event.scheduledTime).toISOString()}, cron: ${event.cron}`);
 
-    // Process recurring tasks
-    ctx.waitUntil(processRecurringTasks(env));
+    // Route based on cron pattern
+    // Daily at midnight: process recurring tasks
+    // Every 15 minutes: dispatch ready tasks
+    if (event.cron === '0 0 * * *') {
+      // Daily at midnight UTC - process recurring tasks
+      ctx.waitUntil(processRecurringTasks(env));
+    } else if (event.cron === '*/15 * * * *') {
+      // Every 15 minutes - dispatch tasks to executors
+      ctx.waitUntil(dispatchTasks(env));
+    } else {
+      // Unknown cron, run both to be safe
+      console.log(`Unknown cron pattern: ${event.cron}, running all scheduled tasks`);
+      ctx.waitUntil(processRecurringTasks(env));
+      ctx.waitUntil(dispatchTasks(env));
+    }
   },
 };
 
@@ -130,6 +144,7 @@ api.route('/ideas', ideasRoutes);
 api.route('/people', peopleRoutes);
 api.route('/commitments', commitmentsRoutes);
 api.route('/execution', executionRoutes);
+api.route('/notes', notesRoutes);
 
 // ========================================
 // Auth Routes
@@ -934,6 +949,184 @@ api.get('/sync/ws', async (c) => {
   } catch (error) {
     console.error('Sync WebSocket error:', error);
     return c.json({ success: false, error: 'Sync WebSocket connection failed' }, 500);
+  }
+});
+
+// ========================================
+// Dispatch Endpoint - Batch dispatch ready tasks
+// ========================================
+
+api.post('/dispatch/ready', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const filterExecutorType = body.executor_type as string | undefined;
+    const limit = (body.limit as number) || 50;
+
+    // Get tasks with status="next"
+    const tasks = await c.env.DB.prepare(`
+      SELECT id, user_id, title, description, urgency, importance,
+             project_id, domain, due_date, energy_required, source_type, source_reference
+      FROM tasks
+      WHERE tenant_id = ? AND user_id = ? AND status = 'next' AND deleted_at IS NULL
+      ORDER BY urgency DESC, importance DESC, created_at ASC
+      LIMIT ?
+    `).bind(tenantId, userId, limit * 2).all<{
+      id: string;
+      user_id: string;
+      title: string;
+      description: string | null;
+      urgency: number;
+      importance: number;
+      project_id: string | null;
+      domain: string;
+      due_date: string | null;
+      energy_required: string;
+      source_type: string | null;
+      source_reference: string | null;
+    }>();
+
+    if (!tasks.results || tasks.results.length === 0) {
+      return c.json({
+        success: true,
+        data: {
+          dispatched: 0,
+          message: 'No tasks with status="next" found',
+        },
+      });
+    }
+
+    // Auto-detect executor patterns
+    const patterns: Array<{ pattern: RegExp; executor: string }> = [
+      { pattern: /^\[implement\]/i, executor: 'claude-code' },
+      { pattern: /^\[deploy\]/i, executor: 'claude-code' },
+      { pattern: /^\[fix\]/i, executor: 'claude-code' },
+      { pattern: /^\[refactor\]/i, executor: 'claude-code' },
+      { pattern: /^\[test\]/i, executor: 'claude-code' },
+      { pattern: /^\[debug\]/i, executor: 'claude-code' },
+      { pattern: /^\[code\]/i, executor: 'claude-code' },
+      { pattern: /^\[research\]/i, executor: 'claude-ai' },
+      { pattern: /^\[design\]/i, executor: 'claude-ai' },
+      { pattern: /^\[document\]/i, executor: 'claude-ai' },
+      { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
+      { pattern: /^\[plan\]/i, executor: 'claude-ai' },
+      { pattern: /^\[write\]/i, executor: 'claude-ai' },
+      { pattern: /^\[human\]/i, executor: 'human' },
+      { pattern: /^\[review\]/i, executor: 'human' },
+      { pattern: /^\[approve\]/i, executor: 'human' },
+      { pattern: /^\[decide\]/i, executor: 'human' },
+      { pattern: /^\[call\]/i, executor: 'human' },
+      { pattern: /^\[meeting\]/i, executor: 'human' },
+    ];
+
+    // Helper to safely decrypt
+    const safeDecrypt = async (value: unknown, key: CryptoKey): Promise<string> => {
+      if (!value || typeof value !== 'string') return '';
+      try {
+        const { decryptField } = await import('./lib/encryption.ts');
+        return await decryptField(value, key);
+      } catch {
+        return value;
+      }
+    };
+
+    const { getEncryptionKey } = await import('./lib/encryption.ts');
+    const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
+    const now = new Date().toISOString();
+
+    const dispatched: Array<{ task_id: string; task_title: string; executor_type: string; queue_id: string }> = [];
+    const skipped: Array<{ task_id: string; reason: string }> = [];
+
+    for (const task of tasks.results) {
+      if (dispatched.length >= limit) break;
+
+      // Check if already queued
+      const existing = await c.env.DB.prepare(`
+        SELECT id FROM execution_queue
+        WHERE task_id = ? AND status IN ('queued', 'claimed', 'dispatched')
+      `).bind(task.id).first<{ id: string }>();
+
+      if (existing) {
+        skipped.push({ task_id: task.id, reason: 'already_queued' });
+        continue;
+      }
+
+      // Decrypt title
+      const decryptedTitle = await safeDecrypt(task.title, encryptionKey);
+
+      // Determine executor type
+      let executorType = 'human';
+      for (const { pattern, executor } of patterns) {
+        if (pattern.test(decryptedTitle)) {
+          executorType = executor;
+          break;
+        }
+      }
+
+      // Filter by executor type if specified
+      if (filterExecutorType && executorType !== filterExecutorType) {
+        skipped.push({ task_id: task.id, reason: `executor_mismatch (${executorType})` });
+        continue;
+      }
+
+      // Calculate priority
+      const priority = (task.urgency || 3) * (task.importance || 3);
+
+      // Build context
+      const context = JSON.stringify({
+        task_title: decryptedTitle,
+        task_description: task.description ? await safeDecrypt(task.description, encryptionKey) : null,
+        project_id: task.project_id,
+        domain: task.domain,
+        due_date: task.due_date,
+        energy_required: task.energy_required,
+        source_type: task.source_type,
+        source_reference: task.source_reference,
+      });
+
+      // Add to queue
+      const queueId = crypto.randomUUID();
+      await c.env.DB.prepare(`
+        INSERT INTO execution_queue (
+          id, tenant_id, user_id, task_id, executor_type, status,
+          priority, queued_at, context, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+      `).bind(queueId, tenantId, userId, task.id, executorType, priority, now, context, now, now).run();
+
+      // Log
+      const logId = crypto.randomUUID();
+      await c.env.DB.prepare(`
+        INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+      `).bind(logId, tenantId, queueId, task.id, executorType, JSON.stringify({ source: 'api_batch_dispatch' }), now).run();
+
+      dispatched.push({
+        task_id: task.id,
+        task_title: decryptedTitle,
+        executor_type: executorType,
+        queue_id: queueId,
+      });
+    }
+
+    // Summarize by executor type
+    const byExecutor: Record<string, number> = {};
+    for (const d of dispatched) {
+      byExecutor[d.executor_type] = (byExecutor[d.executor_type] || 0) + 1;
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        dispatched: dispatched.length,
+        skipped: skipped.length,
+        by_executor: byExecutor,
+        tasks: dispatched,
+      },
+    });
+  } catch (error) {
+    console.error('Dispatch ready error:', error);
+    return c.json({ success: false, error: 'Failed to dispatch tasks' }, 500);
   }
 });
 
