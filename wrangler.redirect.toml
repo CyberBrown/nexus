@@ -1,0 +1,72 @@
+name = "nexus"
+main = "src/redirect-worker.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Keep DO bindings to satisfy Cloudflare requirements
+[[durable_objects.bindings]]
+name = "INBOX_MANAGER"
+class_name = "InboxManager"
+
+[[durable_objects.bindings]]
+name = "CAPTURE_BUFFER"
+class_name = "CaptureBuffer"
+
+[[durable_objects.bindings]]
+name = "SYNC_MANAGER"
+class_name = "SyncManager"
+
+[[durable_objects.bindings]]
+name = "USER_SESSION"
+class_name = "UserSession"
+
+[[durable_objects.bindings]]
+name = "IDEA_EXECUTOR"
+class_name = "IdeaExecutor"
+
+# Keep migrations in sync
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["InboxManager"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CaptureBuffer"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SyncManager"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["UserSession"]
+
+[[migrations]]
+tag = "v5"
+
+[[migrations]]
+tag = "v6"
+
+[[migrations]]
+tag = "v7"
+
+[[migrations]]
+tag = "v8"
+
+[[migrations]]
+tag = "v9"
+new_sqlite_classes = ["IdeaExecutor"]
+
+# Minimal bindings needed for DOs to compile
+[[kv_namespaces]]
+binding = "KV"
+id = "4a9097857e284189a3f0dc6211b7fb3f"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nexus-db"
+database_id = "1210076d-a443-443c-8623-a02b5ff4de9f"
+
+[[services]]
+binding = "DE"
+service = "text-gen"

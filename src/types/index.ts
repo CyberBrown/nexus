@@ -264,6 +264,20 @@ export interface Commitment extends BaseEntity {
   task_id: string | null;
 }
 
+// Note - persistent note storage
+export interface Note extends BaseEntity {
+  user_id: string;
+  title: string; // encrypted
+  content: string | null; // encrypted
+  category: 'general' | 'meeting' | 'research' | 'reference' | 'idea' | 'log';
+  tags: string | null; // JSON array
+  source_type: string | null; // claude_conversation, idea_execution, task, manual, capture
+  source_reference: string | null;
+  source_context: string | null;
+  pinned: number; // 0 or 1
+  archived_at: string | null;
+}
+
 // API response types
 export interface ApiResponse<T> {
   success: boolean;
