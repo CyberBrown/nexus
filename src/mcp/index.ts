@@ -17,6 +17,26 @@ import type { Env } from '../types/index.ts';
 import { getEncryptionKey, encryptField, decryptField } from '../lib/encryption.ts';
 
 // ========================================
+// SAFE DECRYPT HELPER
+// ========================================
+
+/**
+ * Safely decrypt a field, returning the original value if decryption fails.
+ * This handles cases where data might be unencrypted (plain text) or NULL.
+ */
+async function safeDecrypt(value: unknown, key: CryptoKey): Promise<string> {
+  if (!value || typeof value !== 'string') {
+    return '';
+  }
+  try {
+    return await decryptField(value, key);
+  } catch {
+    // If decryption fails, the value is likely plain text - return as-is
+    return value;
+  }
+}
+
+// ========================================
 // PASSPHRASE AUTH HELPERS
 // ========================================
 
@@ -492,20 +512,38 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-        const decryptedTaskTitle = task.title ? await decryptField(task.title as string, encryptionKey) : '';
-        const decryptedTaskDescription = task.description ? await decryptField(task.description as string, encryptionKey) : '';
+        const decryptedTaskTitle = await safeDecrypt(task.title, encryptionKey);
+        const decryptedTaskDescription = await safeDecrypt(task.description, encryptionKey);
 
         // Parse source_reference to get idea and execution IDs
-        // Format: "idea:{ideaId}:execution:{executionId}"
+        // Format: "idea:{ideaId}:execution:{executionId}" OR just a UUID (legacy)
         let ideaContext = null;
         let executionContext = null;
         const sourceRef = task.source_reference as string;
 
-        if (sourceRef && sourceRef.startsWith('idea:')) {
-          const parts = sourceRef.split(':');
-          const ideaId = parts[1];
-          const executionId = parts[3];
+        // Try to extract idea ID from source_reference
+        let ideaId: string | null = null;
+        let executionId: string | null = null;
 
+        if (sourceRef) {
+          if (sourceRef.startsWith('idea:')) {
+            // New format: "idea:{ideaId}:execution:{executionId}"
+            const parts = sourceRef.split(':');
+            ideaId = parts[1];
+            executionId = parts[3] || null;
+          } else {
+            // Legacy format: might be just an execution ID, try to look it up
+            const execution = await env.DB.prepare(`
+              SELECT idea_id FROM idea_executions WHERE id = ? AND tenant_id = ?
+            `).bind(sourceRef, tenantId).first<{ idea_id: string }>();
+            if (execution) {
+              ideaId = execution.idea_id;
+              executionId = sourceRef;
+            }
+          }
+        }
+
+        if (ideaId) {
           // Get parent idea
           const idea = await env.DB.prepare(`
             SELECT id, title, description, category, domain
@@ -514,8 +552,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           `).bind(ideaId, tenantId).first();
 
           if (idea) {
-            const decryptedIdeaTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
-            const decryptedIdeaDescription = idea.description ? await decryptField(idea.description as string, encryptionKey) : '';
+            const decryptedIdeaTitle = await safeDecrypt(idea.title, encryptionKey);
+            const decryptedIdeaDescription = await safeDecrypt(idea.description, encryptionKey);
 
             ideaContext = {
               id: idea.id,
@@ -643,18 +681,34 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           WHERE id = ? AND tenant_id = ?
         `).bind(executor_id, now, now, task_id, tenantId).run();
 
-        // Decrypt task fields
-        const decryptedTaskTitle = task.title ? await decryptField(task.title as string, encryptionKey) : '';
-        const decryptedTaskDescription = task.description ? await decryptField(task.description as string, encryptionKey) : '';
+        // Decrypt task fields (using safeDecrypt for mixed encrypted/plain data)
+        const decryptedTaskTitle = await safeDecrypt(task.title, encryptionKey);
+        const decryptedTaskDescription = await safeDecrypt(task.description, encryptionKey);
 
         // Get parent idea context
         let ideaContext = null;
         const sourceRef = task.source_reference as string;
 
-        if (sourceRef && sourceRef.startsWith('idea:')) {
-          const parts = sourceRef.split(':');
-          const ideaId = parts[1];
+        // Try to extract idea ID from source_reference
+        let ideaId: string | null = null;
 
+        if (sourceRef) {
+          if (sourceRef.startsWith('idea:')) {
+            // New format: "idea:{ideaId}:execution:{executionId}"
+            const parts = sourceRef.split(':');
+            ideaId = parts[1];
+          } else {
+            // Legacy format: might be just an execution ID, try to look it up
+            const execution = await env.DB.prepare(`
+              SELECT idea_id FROM idea_executions WHERE id = ? AND tenant_id = ?
+            `).bind(sourceRef, tenantId).first<{ idea_id: string }>();
+            if (execution) {
+              ideaId = execution.idea_id;
+            }
+          }
+        }
+
+        if (ideaId) {
           const idea = await env.DB.prepare(`
             SELECT id, title, description, category, domain
             FROM ideas
@@ -662,8 +716,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           `).bind(ideaId, tenantId).first();
 
           if (idea) {
-            const decryptedIdeaTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
-            const decryptedIdeaDescription = idea.description ? await decryptField(idea.description as string, encryptionKey) : '';
+            const decryptedIdeaTitle = await safeDecrypt(idea.title, encryptionKey);
+            const decryptedIdeaDescription = await safeDecrypt(idea.description, encryptionKey);
 
             ideaContext = {
               id: idea.id,
