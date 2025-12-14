@@ -38,6 +38,7 @@ const WRITE_TOOLS = new Set([
   'nexus_update_task',
   'nexus_complete_task',
   'nexus_delete_task',
+  'nexus_claim_task',
 ]);
 
 /**
@@ -45,10 +46,12 @@ const WRITE_TOOLS = new Set([
  */
 const READ_TOOLS = new Set([
   'nexus_get_status',
+  'nexus_get_idea',
   'nexus_list_ideas',
   'nexus_list_active',
   'nexus_list_blocked',
   'nexus_list_tasks',
+  'nexus_trigger_task',
 ]);
 
 /**
@@ -394,6 +397,316 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 started_at: execution.started_at,
                 completed_at: execution.completed_at,
               } : null),
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_get_idea - Returns full idea details including description
+  server.tool(
+    'nexus_get_idea',
+    'Get full details of an idea including its description content. Use this to access the complete idea context.',
+    {
+      idea_id: z.string().describe('The UUID of the idea to retrieve'),
+    },
+    async ({ idea_id }): Promise<CallToolResult> => {
+      try {
+        const idea = await env.DB.prepare(`
+          SELECT id, title, description, category, domain,
+                 excitement_level, feasibility, potential_impact,
+                 created_at, updated_at
+          FROM ideas
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(idea_id, tenantId).first();
+
+        if (!idea) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found' }) }],
+            isError: true
+          };
+        }
+
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const decryptedTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
+        const decryptedDescription = idea.description ? await decryptField(idea.description as string, encryptionKey) : '';
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              idea: {
+                id: idea.id,
+                title: decryptedTitle,
+                description: decryptedDescription,
+                category: idea.category,
+                domain: idea.domain,
+                excitement_level: idea.excitement_level,
+                feasibility: idea.feasibility,
+                potential_impact: idea.potential_impact,
+                created_at: idea.created_at,
+                updated_at: idea.updated_at,
+              },
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_trigger_task - Returns full context needed to execute a task
+  server.tool(
+    'nexus_trigger_task',
+    'Get full context needed to execute a task, including parent idea details and execution plan. Use this before starting work on a task.',
+    {
+      task_id: z.string().describe('The UUID of the task to get context for'),
+    },
+    async ({ task_id }): Promise<CallToolResult> => {
+      try {
+        // Get task with source reference to find parent idea
+        const task = await env.DB.prepare(`
+          SELECT id, title, description, status, source_type, source_reference,
+                 urgency, importance, energy_required, time_estimate_minutes,
+                 claimed_by, claimed_at, created_at
+          FROM tasks
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(task_id, tenantId).first();
+
+        if (!task) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found' }) }],
+            isError: true
+          };
+        }
+
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const decryptedTaskTitle = task.title ? await decryptField(task.title as string, encryptionKey) : '';
+        const decryptedTaskDescription = task.description ? await decryptField(task.description as string, encryptionKey) : '';
+
+        // Parse source_reference to get idea and execution IDs
+        // Format: "idea:{ideaId}:execution:{executionId}"
+        let ideaContext = null;
+        let executionContext = null;
+        const sourceRef = task.source_reference as string;
+
+        if (sourceRef && sourceRef.startsWith('idea:')) {
+          const parts = sourceRef.split(':');
+          const ideaId = parts[1];
+          const executionId = parts[3];
+
+          // Get parent idea
+          const idea = await env.DB.prepare(`
+            SELECT id, title, description, category, domain
+            FROM ideas
+            WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+          `).bind(ideaId, tenantId).first();
+
+          if (idea) {
+            const decryptedIdeaTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
+            const decryptedIdeaDescription = idea.description ? await decryptField(idea.description as string, encryptionKey) : '';
+
+            ideaContext = {
+              id: idea.id,
+              title: decryptedIdeaTitle,
+              description: decryptedIdeaDescription,
+              category: idea.category,
+              domain: idea.domain,
+            };
+          }
+
+          // Get execution plan
+          if (executionId) {
+            const execution = await env.DB.prepare(`
+              SELECT id, plan, phase, status
+              FROM idea_executions
+              WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+            `).bind(executionId, tenantId).first();
+
+            if (execution && execution.plan) {
+              executionContext = {
+                id: execution.id,
+                phase: execution.phase,
+                status: execution.status,
+                plan: JSON.parse(execution.plan as string),
+              };
+            }
+          }
+        }
+
+        // Check if task is ready to work on
+        const isReady = task.status === 'inbox' || task.status === 'next';
+        const isClaimed = !!task.claimed_by;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              task: {
+                id: task.id,
+                title: decryptedTaskTitle,
+                description: decryptedTaskDescription,
+                status: task.status,
+                source_type: task.source_type,
+                urgency: task.urgency,
+                importance: task.importance,
+                energy_required: task.energy_required,
+                time_estimate_minutes: task.time_estimate_minutes,
+                claimed_by: task.claimed_by,
+                claimed_at: task.claimed_at,
+              },
+              idea: ideaContext,
+              execution: executionContext,
+              ready: isReady && !isClaimed,
+              message: isClaimed
+                ? `Task already claimed by ${task.claimed_by} at ${task.claimed_at}`
+                : isReady
+                  ? 'Task is ready to be claimed and executed'
+                  : `Task status is "${task.status}" - may not be ready for execution`,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_claim_task - Executor claims a task to prevent duplicate work
+  server.tool(
+    'nexus_claim_task',
+    'Claim a task for execution. This prevents duplicate work by marking who is working on it. Returns full context needed to execute.',
+    {
+      task_id: z.string().describe('The UUID of the task to claim'),
+      executor_id: z.string().describe('Identifier of the executor claiming the task (e.g., "claude-code", "claude-ai", "human")'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_claim_task', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { task_id, executor_id } = args;
+
+      try {
+        // Check if task exists and is not already claimed
+        const task = await env.DB.prepare(`
+          SELECT id, title, description, status, source_type, source_reference,
+                 urgency, importance, claimed_by, claimed_at
+          FROM tasks
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(task_id, tenantId).first();
+
+        if (!task) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found' }) }],
+            isError: true
+          };
+        }
+
+        // Check if already claimed by someone else
+        if (task.claimed_by && task.claimed_by !== executor_id) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: `Task already claimed by ${task.claimed_by} at ${task.claimed_at}`,
+                claimed_by: task.claimed_by,
+                claimed_at: task.claimed_at,
+              })
+            }],
+            isError: true
+          };
+        }
+
+        const now = new Date().toISOString();
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
+        // Claim the task
+        await env.DB.prepare(`
+          UPDATE tasks SET claimed_by = ?, claimed_at = ?, status = 'next', updated_at = ?
+          WHERE id = ? AND tenant_id = ?
+        `).bind(executor_id, now, now, task_id, tenantId).run();
+
+        // Decrypt task fields
+        const decryptedTaskTitle = task.title ? await decryptField(task.title as string, encryptionKey) : '';
+        const decryptedTaskDescription = task.description ? await decryptField(task.description as string, encryptionKey) : '';
+
+        // Get parent idea context
+        let ideaContext = null;
+        const sourceRef = task.source_reference as string;
+
+        if (sourceRef && sourceRef.startsWith('idea:')) {
+          const parts = sourceRef.split(':');
+          const ideaId = parts[1];
+
+          const idea = await env.DB.prepare(`
+            SELECT id, title, description, category, domain
+            FROM ideas
+            WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+          `).bind(ideaId, tenantId).first();
+
+          if (idea) {
+            const decryptedIdeaTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
+            const decryptedIdeaDescription = idea.description ? await decryptField(idea.description as string, encryptionKey) : '';
+
+            ideaContext = {
+              id: idea.id,
+              title: decryptedIdeaTitle,
+              description: decryptedIdeaDescription,
+              category: idea.category,
+              domain: idea.domain,
+            };
+          }
+        }
+
+        // Log the decision
+        await env.DB.prepare(`
+          INSERT INTO decisions (id, tenant_id, user_id, entity_type, entity_id, decision, reasoning, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          tenantId,
+          userId,
+          'task',
+          task_id,
+          'claimed',
+          `Claimed by ${executor_id}`,
+          now
+        ).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              claimed: true,
+              task: {
+                id: task.id,
+                title: decryptedTaskTitle,
+                description: decryptedTaskDescription,
+                status: 'next',
+                source_type: task.source_type,
+              },
+              idea: ideaContext,
+              claimed_by: executor_id,
+              claimed_at: now,
+              message: `Task claimed successfully. You are now responsible for executing this task.`,
             }, null, 2)
           }]
         };
