@@ -64,3 +64,14 @@
 }
 
 ---
+
+## Updates Checked: 2025-12-15
+
+{
+  "response": "```tool_code\nmcp__developer-guides__list_guides\n```",
+  "tokensUsed": 946252,
+  "cachedTokensUsed": 946090,
+  "model": "gemini-2.0-flash-001"
+}
+
+---
