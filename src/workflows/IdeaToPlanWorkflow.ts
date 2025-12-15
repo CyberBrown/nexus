@@ -67,7 +67,7 @@ export class IdeaToPlanWorkflow extends WorkflowEntrypoint<Env, IdeaToPlanParams
       `).bind(now, idea_id).run();
     });
 
-    // Step 3: Call Claude API to break down idea into tasks
+    // Step 3: Call DE text-gen worker to break down idea into tasks
     const tasks = await step.do(
       'generate-plan',
       {
@@ -79,36 +79,47 @@ export class IdeaToPlanWorkflow extends WorkflowEntrypoint<Env, IdeaToPlanParams
         timeout: '2 minutes',
       },
       async () => {
-        const prompt = buildPlanningPrompt(idea);
+        // Use DE service binding for LLM calls - Nexus should never call LLM providers directly
+        if (!this.env.DE) {
+          throw new Error('DE service binding not configured. Add [[services]] binding to wrangler.toml');
+        }
 
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
+        const userPrompt = buildPlanningPrompt(idea);
+        const prompt = `System: ${PLANNING_SYSTEM_PROMPT}\n\nUser: ${userPrompt}\n\nAssistant:`;
+
+        const response = await this.env.DE.fetch('https://de/generate', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'x-api-key': this.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
           },
           body: JSON.stringify({
+            prompt,
             model: 'claude-sonnet-4-20250514',
             max_tokens: 2048,
-            system: PLANNING_SYSTEM_PROMPT,
-            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.7,
           }),
         });
 
         if (!response.ok) {
           const error = await response.text();
-          throw new Error(`Claude API error: ${response.status} - ${error}`);
+          throw new Error(`DE text-gen error: ${response.status} - ${error}`);
         }
 
         const data = await response.json() as {
-          content: Array<{ type: string; text: string }>;
+          success: boolean;
+          text: string;
+          metadata: {
+            provider: string;
+            model: string;
+            tokens_used: number;
+          };
         };
 
-        let text = data.content[0]?.text;
-        if (!text) {
-          throw new Error('No response from Claude');
+        if (!data.success || !data.text) {
+          throw new Error('DE returned empty response');
         }
+
+        let text = data.text;
 
         // Strip markdown code blocks
         text = text.trim();

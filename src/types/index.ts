@@ -31,6 +31,9 @@ export interface Env {
   DE: Fetcher; // DE (distributed-electrons) service for LLM operations
   // Write passphrase for MCP destructive operations
   WRITE_PASSPHRASE?: string;
+  // Primary tenant for MCP access (single-tenant mode)
+  PRIMARY_TENANT_ID?: string;
+  PRIMARY_USER_ID?: string;
   // Cloudflare Access
   TEAM_DOMAIN?: string; // e.g., https://your-team.cloudflareaccess.com
   POLICY_AUD?: string; // Application Audience (AUD) tag

@@ -202,28 +202,30 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
   }
 
   /**
-   * Generate execution plan using DE text-gen worker
+   * Generate execution plan using DE text-gen worker via service binding
    */
   private async generatePlanWithDE(idea: IdeaData): Promise<ExecutionPlan> {
-    const textGenUrl = this.env.TEXT_GEN_URL;
-    if (!textGenUrl) {
-      // Fallback to direct Anthropic API if DE not configured
-      return this.generatePlanWithAnthropic(idea);
+    // Use DE service binding for LLM calls - Nexus should never call LLM providers directly
+    if (!this.env.DE) {
+      throw new Error('DE service binding not configured. Add [[services]] binding to wrangler.toml');
     }
 
     const systemPrompt = this.getPlanningSystemPrompt();
     const userPrompt = this.buildPlanningPrompt(idea);
 
-    const response = await fetch(textGenUrl, {
+    // DE's text-gen service expects a prompt-based request
+    const prompt = `System: ${systemPrompt}\n\nUser: ${userPrompt}\n\nAssistant:`;
+
+    const response = await this.env.DE.fetch('https://de/generate', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
+        prompt,
         model: 'claude-sonnet-4-20250514',
         max_tokens: 2048,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
+        temperature: 0.7,
       }),
     });
 
@@ -233,53 +235,26 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
     }
 
     const data = await response.json() as {
-      content: Array<{ type: string; text: string }>;
+      success: boolean;
+      text: string;
+      metadata: {
+        provider: string;
+        model: string;
+        tokens_used: number;
+      };
     };
 
-    return this.parsePlanResponse(data);
+    if (!data.success || !data.text) {
+      throw new Error('DE returned empty response');
+    }
+
+    return this.parsePlanResponseFromText(data.text);
   }
 
   /**
-   * Fallback: Generate plan directly with Anthropic API
+   * Parse plan from raw text response (used by DE service binding)
    */
-  private async generatePlanWithAnthropic(idea: IdeaData): Promise<ExecutionPlan> {
-    const apiKey = this.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error('Neither TEXT_GEN_URL nor ANTHROPIC_API_KEY configured');
-    }
-
-    const systemPrompt = this.getPlanningSystemPrompt();
-    const userPrompt = this.buildPlanningPrompt(idea);
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 2048,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
-      }),
-    });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Anthropic API error: ${response.status} - ${error}`);
-    }
-
-    const data = await response.json() as {
-      content: Array<{ type: string; text: string }>;
-    };
-
-    return this.parsePlanResponse(data);
-  }
-
-  private parsePlanResponse(data: { content: Array<{ type: string; text: string }> }): ExecutionPlan {
-    let text = data.content[0]?.text;
+  private parsePlanResponseFromText(text: string): ExecutionPlan {
     if (!text) {
       throw new Error('No response from AI');
     }
@@ -303,6 +278,14 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
     }
 
     return JSON.parse(jsonMatch[0]) as ExecutionPlan;
+  }
+
+  /**
+   * Parse plan from Anthropic-style response (legacy, kept for reference)
+   */
+  private parsePlanResponse(data: { content: Array<{ type: string; text: string }> }): ExecutionPlan {
+    const text = data.content[0]?.text;
+    return this.parsePlanResponseFromText(text);
   }
 
   private getPlanningSystemPrompt(): string {

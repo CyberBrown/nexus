@@ -284,3 +284,71 @@ export function generateDevToken(tenantId: string, userId: string, expiresInMs =
   };
   return btoa(JSON.stringify(payload));
 }
+
+// ========================================
+// PASSPHRASE-BASED TENANT RESOLUTION
+// ========================================
+
+/**
+ * Hash a passphrase using SHA-256 for secure storage/comparison
+ */
+export async function hashPassphrase(passphrase: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(passphrase);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Look up tenant and user by passphrase hash
+ * Used by MCP endpoints to resolve tenant from passphrase
+ */
+export async function lookupTenantByPassphrase(
+  db: D1Database,
+  passphrase: string
+): Promise<{ tenantId: string; userId: string; name: string | null } | null> {
+  const passphraseHash = await hashPassphrase(passphrase);
+
+  const result = await db.prepare(`
+    SELECT tenant_id, user_id, name FROM passphrase_tenants
+    WHERE passphrase_hash = ? AND deleted_at IS NULL
+  `).bind(passphraseHash).first<{ tenant_id: string; user_id: string; name: string | null }>();
+
+  if (!result) return null;
+
+  // Update last_used_at and use_count
+  await db.prepare(`
+    UPDATE passphrase_tenants
+    SET last_used_at = datetime('now'), use_count = use_count + 1, updated_at = datetime('now')
+    WHERE passphrase_hash = ?
+  `).bind(passphraseHash).run();
+
+  return {
+    tenantId: result.tenant_id,
+    userId: result.user_id,
+    name: result.name,
+  };
+}
+
+/**
+ * Register a passphrase mapping for a tenant
+ * Used to set up passphrase-based MCP access
+ */
+export async function registerPassphraseTenant(
+  db: D1Database,
+  passphrase: string,
+  tenantId: string,
+  userId: string,
+  name?: string
+): Promise<{ id: string; passphraseHash: string }> {
+  const passphraseHash = await hashPassphrase(passphrase);
+  const id = crypto.randomUUID();
+
+  await db.prepare(`
+    INSERT INTO passphrase_tenants (id, passphrase_hash, tenant_id, user_id, name, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+  `).bind(id, passphraseHash, tenantId, userId, name || null).run();
+
+  return { id, passphraseHash };
+}

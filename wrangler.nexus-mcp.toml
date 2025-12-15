@@ -13,6 +13,10 @@ database_id = "1210076d-a443-443c-8623-a02b5ff4de9f"
 
 [vars]
 ENVIRONMENT = "development"
+# Primary tenant for MCP access (single-tenant mode)
+# This ensures all MCP requests use the correct tenant
+PRIMARY_TENANT_ID = "f943851e-a7c5-4908-90a2-956367f21460"
+PRIMARY_USER_ID = "9ac3bb45-2c0b-4db4-ae24-41a048b3163d"
 # Cloudflare Access - set these for production auth
 # TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 # POLICY_AUD = "your-application-audience-tag"

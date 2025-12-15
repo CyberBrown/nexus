@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import type { AppType, Env, ScheduledEvent } from './types/index.ts';
-import { authMiddleware, generateDevToken, getAuth } from './lib/auth.ts';
+import { authMiddleware, generateDevToken, getAuth, lookupTenantByPassphrase, registerPassphraseTenant, hashPassphrase } from './lib/auth.ts';
 import { generateTenantKey } from './lib/encryption.ts';
 import { AppError, ValidationError, isOperationalError } from './lib/errors.ts';
 import inboxRoutes from './routes/inbox.ts';
@@ -129,6 +129,68 @@ app.post('/setup', async (c) => {
   } catch (error) {
     console.error('Setup error:', error);
     return c.json({ success: false, error: 'Setup failed' }, 500);
+  }
+});
+
+// ========================================
+// Admin: Register passphrase-to-tenant mapping
+// This endpoint allows setting up passphrase-based MCP tenant resolution
+// ========================================
+app.post('/admin/register-passphrase', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { passphrase, tenant_id, user_id, name, admin_passphrase } = body;
+
+    // Require admin_passphrase to match WRITE_PASSPHRASE for security
+    if (!c.env.WRITE_PASSPHRASE) {
+      return c.json({ success: false, error: 'WRITE_PASSPHRASE not configured' }, 400);
+    }
+
+    if (admin_passphrase !== c.env.WRITE_PASSPHRASE) {
+      return c.json({ success: false, error: 'Invalid admin passphrase' }, 401);
+    }
+
+    if (!passphrase || !tenant_id || !user_id) {
+      return c.json({ success: false, error: 'Missing required fields: passphrase, tenant_id, user_id' }, 400);
+    }
+
+    // Verify tenant and user exist
+    const tenant = await c.env.DB.prepare(
+      'SELECT id FROM tenants WHERE id = ? AND deleted_at IS NULL'
+    ).bind(tenant_id).first();
+
+    if (!tenant) {
+      return c.json({ success: false, error: 'Tenant not found' }, 404);
+    }
+
+    const user = await c.env.DB.prepare(
+      'SELECT id FROM users WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL'
+    ).bind(user_id, tenant_id).first();
+
+    if (!user) {
+      return c.json({ success: false, error: 'User not found in tenant' }, 404);
+    }
+
+    // Register the mapping
+    const result = await registerPassphraseTenant(c.env.DB, passphrase, tenant_id, user_id, name);
+
+    return c.json({
+      success: true,
+      data: {
+        id: result.id,
+        passphrase_hash: result.passphraseHash,
+        tenant_id,
+        user_id,
+        name,
+        message: 'Passphrase mapping registered. MCP requests will now use this tenant.',
+      },
+    });
+  } catch (error: any) {
+    console.error('Register passphrase error:', error);
+    if (error.message?.includes('UNIQUE constraint')) {
+      return c.json({ success: false, error: 'This passphrase is already registered' }, 409);
+    }
+    return c.json({ success: false, error: 'Registration failed' }, 500);
   }
 });
 
@@ -1137,11 +1199,48 @@ app.route('/api', api);
 // Uses Mnemo-style passphrase auth instead of full OAuth
 // - Read operations: No auth required
 // - Write operations: Require WRITE_PASSPHRASE in tool arguments
+// - Tenant resolution: Uses passphrase from tool args or falls back to default
 // ========================================
 app.all('/mcp', async (c) => {
-  // Get or create MCP default tenant/user
-  // This provides data isolation while allowing open read access
-  const mcpTenant = await getOrCreateMcpTenant(c.env);
+  // Try to resolve tenant from passphrase in the request body
+  // MCP JSON-RPC format: {"method": "tools/call", "params": {"name": "...", "arguments": {"passphrase": "..."}}}
+  let resolvedTenant: { tenantId: string; userId: string } | null = null;
+
+  if (c.req.method === 'POST') {
+    try {
+      // Clone the request to read the body without consuming it
+      const clonedReq = c.req.raw.clone();
+      const body = await clonedReq.json() as Record<string, unknown>;
+
+      // Extract passphrase from various places in MCP protocol
+      let passphrase: string | undefined;
+
+      // Check in tool call arguments (JSON-RPC format)
+      const params = body?.params as Record<string, unknown> | undefined;
+      const paramsArgs = params?.arguments as Record<string, unknown> | undefined;
+      if (paramsArgs?.passphrase && typeof paramsArgs.passphrase === 'string') {
+        passphrase = paramsArgs.passphrase;
+      }
+      // Check in direct arguments (some MCP implementations)
+      const directArgs = body?.arguments as Record<string, unknown> | undefined;
+      if (!passphrase && directArgs?.passphrase && typeof directArgs.passphrase === 'string') {
+        passphrase = directArgs.passphrase;
+      }
+
+      if (passphrase) {
+        const tenantInfo = await lookupTenantByPassphrase(c.env.DB, passphrase);
+        if (tenantInfo) {
+          resolvedTenant = { tenantId: tenantInfo.tenantId, userId: tenantInfo.userId };
+          console.log(`MCP: Resolved tenant from passphrase: ${tenantInfo.tenantId} (${tenantInfo.name})`);
+        }
+      }
+    } catch (e) {
+      // Ignore JSON parsing errors - might be SSE or other format
+    }
+  }
+
+  // Use resolved tenant or fall back to default
+  const mcpTenant = resolvedTenant || await getOrCreateMcpTenant(c.env);
 
   const handler = createNexusMcpHandler(c.env, mcpTenant.tenantId, mcpTenant.userId);
   return handler(c.req.raw, c.env, c.executionCtx);
@@ -1154,21 +1253,28 @@ app.all('/mcp', async (c) => {
  * This ensures data created via Claude.ai MCP is visible in CLI and vice versa.
  *
  * Priority:
- * 1. Use PRIMARY_TENANT env var if set
- * 2. Find the first owner user in the system
- * 3. Fall back to creating an MCP-specific tenant (legacy behavior)
+ * 1. Use PRIMARY_TENANT_ID + PRIMARY_USER_ID env vars (simplest, most reliable)
+ * 2. Use WRITE_PASSPHRASE to look up registered tenant (passphrase_tenants table)
+ * 3. Find the first owner user in the system
+ * 4. Fall back to creating an MCP-specific tenant (legacy behavior)
  */
 async function getOrCreateMcpTenant(env: Env): Promise<{ tenantId: string; userId: string }> {
-  // Option 1: Use explicit PRIMARY_TENANT from env (for multi-tenant setups)
-  const primaryTenantId = (env as unknown as Record<string, string>).PRIMARY_TENANT;
-  if (primaryTenantId) {
-    const user = await env.DB.prepare(`
-      SELECT id FROM users WHERE tenant_id = ? AND role = 'owner' AND deleted_at IS NULL LIMIT 1
-    `).bind(primaryTenantId).first<{ id: string }>();
+  // Option 0 (HIGHEST PRIORITY): Use explicit tenant/user IDs from env
+  // This is the simplest and most reliable mechanism
+  if (env.PRIMARY_TENANT_ID && env.PRIMARY_USER_ID) {
+    console.log(`MCP using PRIMARY_TENANT_ID: ${env.PRIMARY_TENANT_ID}`);
+    return { tenantId: env.PRIMARY_TENANT_ID, userId: env.PRIMARY_USER_ID };
+  }
 
-    if (user) {
-      return { tenantId: primaryTenantId, userId: user.id };
+  // Option 1: Use WRITE_PASSPHRASE to resolve tenant from passphrase_tenants table
+  if (env.WRITE_PASSPHRASE) {
+    const tenantInfo = await lookupTenantByPassphrase(env.DB, env.WRITE_PASSPHRASE);
+    if (tenantInfo) {
+      console.log(`MCP using passphrase-mapped tenant: ${tenantInfo.tenantId} (${tenantInfo.name})`);
+      return { tenantId: tenantInfo.tenantId, userId: tenantInfo.userId };
     }
+    // Passphrase not mapped yet - fall through to other options
+    console.log('MCP: WRITE_PASSPHRASE set but no tenant mapping found.');
   }
 
   // Option 2: Single-tenant mode - find the first/primary owner in the system
