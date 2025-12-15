@@ -1,89 +1,64 @@
-// AES-256-GCM encryption for sensitive fields
-// Key stored in KV, referenced by tenant
+// Encryption module - DISABLED after data loss incident
+// All functions are now pass-through to avoid future key loss issues
+// For a single-user system, encryption adds complexity without significant benefit
 
-export async function getEncryptionKey(kv: KVNamespace, tenantId: string): Promise<CryptoKey> {
-  const keyData = await kv.get(`tenant:${tenantId}:key`, 'arrayBuffer');
-  if (!keyData) {
-    throw new Error('Encryption key not found for tenant');
-  }
-
-  return crypto.subtle.importKey(
-    'raw',
-    keyData,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt', 'decrypt']
-  );
+/**
+ * Get encryption key - returns null (encryption disabled)
+ * Callers should handle null by skipping encryption/decryption
+ */
+export async function getEncryptionKey(kv: KVNamespace, tenantId: string): Promise<CryptoKey | null> {
+  // Encryption disabled - return null
+  return null;
 }
 
-export async function encryptField(value: string, key: CryptoKey): Promise<string> {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(value);
-
-  const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    encoded
-  );
-
-  const combined = new Uint8Array(iv.length + encrypted.byteLength);
-  combined.set(iv);
-  combined.set(new Uint8Array(encrypted), iv.length);
-
-  return btoa(String.fromCharCode(...combined));
+/**
+ * Encrypt field - pass-through (encryption disabled)
+ * Returns the value unchanged
+ */
+export async function encryptField(value: string, key: CryptoKey | null): Promise<string> {
+  // Encryption disabled - return plaintext
+  return value;
 }
 
-export async function decryptField(encrypted: string, key: CryptoKey): Promise<string> {
-  const combined = Uint8Array.from(atob(encrypted), c => c.charCodeAt(0));
-  const iv = combined.slice(0, 12);
-  const data = combined.slice(12);
-
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    data
-  );
-
-  return new TextDecoder().decode(decrypted);
+/**
+ * Decrypt field - pass-through (encryption disabled)
+ * Returns the value unchanged (handles both encrypted and plaintext data)
+ */
+export async function decryptField(encrypted: string, key: CryptoKey | null): Promise<string> {
+  // Encryption disabled - return as-is
+  return encrypted;
 }
 
+/**
+ * Generate tenant key - no-op (encryption disabled)
+ */
 export async function generateTenantKey(kv: KVNamespace, tenantId: string): Promise<void> {
-  const key = crypto.getRandomValues(new Uint8Array(32));
-  await kv.put(`tenant:${tenantId}:key`, key);
+  // Encryption disabled - no-op
+  return;
 }
 
-// Helper to encrypt multiple fields at once
+/**
+ * Encrypt multiple fields - pass-through (encryption disabled)
+ * Returns the object unchanged
+ */
 export async function encryptFields<T extends object>(
   obj: T,
   fieldsToEncrypt: string[],
-  key: CryptoKey
+  key: CryptoKey | null
 ): Promise<T> {
-  const result = { ...obj } as Record<string, unknown>;
-  for (const field of fieldsToEncrypt) {
-    const value = result[field];
-    if (typeof value === 'string' && value) {
-      result[field] = await encryptField(value, key);
-    }
-  }
-  return result as T;
+  // Encryption disabled - return unchanged
+  return obj;
 }
 
-// Helper to decrypt multiple fields at once
+/**
+ * Decrypt multiple fields - pass-through (encryption disabled)
+ * Returns the object unchanged
+ */
 export async function decryptFields<T extends object>(
   obj: T,
   fieldsToDecrypt: string[],
-  key: CryptoKey
+  key: CryptoKey | null
 ): Promise<T> {
-  const result = { ...obj } as Record<string, unknown>;
-  for (const field of fieldsToDecrypt) {
-    const value = result[field];
-    if (typeof value === 'string' && value) {
-      try {
-        result[field] = await decryptField(value, key);
-      } catch {
-        // If decryption fails, keep original value (might be unencrypted)
-      }
-    }
-  }
-  return result as T;
+  // Encryption disabled - return unchanged
+  return obj;
 }
