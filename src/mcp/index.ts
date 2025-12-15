@@ -251,7 +251,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-        const decryptedTitle = idea.title ? await decryptField(idea.title, encryptionKey) : '';
+        const decryptedTitle = idea.title ? await safeDecrypt(idea.title, encryptionKey) : '';
 
         // Create execution record
         const executionId = crypto.randomUUID();
@@ -482,7 +482,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Decrypt title
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-        const decryptedTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
+        const decryptedTitle = idea.title ? await safeDecrypt(idea.title as string, encryptionKey) : '';
 
         // Get execution from DB (this is the source of truth for execution status)
         const execution = await env.DB.prepare(`
@@ -588,8 +588,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-        const decryptedTitle = idea.title ? await decryptField(idea.title as string, encryptionKey) : '';
-        const decryptedDescription = idea.description ? await decryptField(idea.description as string, encryptionKey) : '';
+        const decryptedTitle = idea.title ? await safeDecrypt(idea.title as string, encryptionKey) : '';
+        const decryptedDescription = idea.description ? await safeDecrypt(idea.description as string, encryptionKey) : '';
 
         return {
           content: [{
@@ -965,12 +965,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         const ideas = await env.DB.prepare(query).bind(...bindings).all();
 
-        // Decrypt titles
+        // Decrypt titles (safeDecrypt handles plain text gracefully)
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
         const decryptedIdeas = await Promise.all(
           ideas.results.map(async (idea: Record<string, unknown>) => ({
             id: idea.id,
-            title: idea.title ? await decryptField(idea.title as string, encryptionKey) : '',
+            title: idea.title ? await safeDecrypt(idea.title as string, encryptionKey) : '',
             category: idea.category,
             created_at: idea.created_at,
             execution_status: idea.execution_status || 'none',
@@ -1020,7 +1020,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           executions.results.map(async (e: Record<string, unknown>) => ({
             execution_id: e.id,
             idea_id: e.idea_id,
-            title: e.idea_title ? await decryptField(e.idea_title as string, encryptionKey) : '',
+            title: e.idea_title ? await safeDecrypt(e.idea_title as string, encryptionKey) : '',
             status: e.status,
             phase: e.phase,
             started_at: e.started_at,
@@ -1070,7 +1070,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           executions.results.map(async (e: Record<string, unknown>) => ({
             execution_id: e.id,
             idea_id: e.idea_id,
-            title: e.idea_title ? await decryptField(e.idea_title as string, encryptionKey) : '',
+            title: e.idea_title ? await safeDecrypt(e.idea_title as string, encryptionKey) : '',
             blockers: e.blockers ? JSON.parse(e.blockers as string) : [],
             started_at: e.started_at,
           }))
@@ -1354,7 +1354,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Decrypt title for response
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-        const decryptedTitle = idea.title ? await decryptField(idea.title, encryptionKey) : '';
+        const decryptedTitle = idea.title ? await safeDecrypt(idea.title, encryptionKey) : '';
 
         // Check for active executions
         const activeExecution = await env.DB.prepare(`
@@ -1462,7 +1462,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Decrypt title for response
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-        const decryptedTitle = idea.title ? await decryptField(idea.title, encryptionKey) : '';
+        const decryptedTitle = idea.title ? await safeDecrypt(idea.title, encryptionKey) : '';
 
         const now = new Date().toISOString();
 
@@ -1725,63 +1725,6 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               success: true,
               idea_id,
               message: 'Idea archived successfully',
-            }, null, 2)
-          }]
-        };
-      } catch (error: any) {
-        return {
-          content: [{ type: 'text', text: `Error: ${error.message}` }],
-          isError: true
-        };
-      }
-    }
-  );
-
-  // Tool: nexus_delete_idea
-  server.tool(
-    'nexus_delete_idea',
-    'Permanently delete an idea (hard delete). Use sparingly - prefer archive for most cases.',
-    {
-      idea_id: z.string().describe('The UUID of the idea to delete'),
-      confirm: z.boolean().describe('Must be true to confirm deletion'),
-      passphrase: passphraseSchema,
-    },
-    async (args): Promise<CallToolResult> => {
-      const authError = validatePassphrase('nexus_delete_idea', args, env.WRITE_PASSPHRASE);
-      if (authError) return authError;
-
-      const { idea_id, confirm } = args;
-
-      if (!confirm) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Must set confirm=true to delete' }) }],
-          isError: true
-        };
-      }
-
-      try {
-        const now = new Date().toISOString();
-
-        // Soft delete (set deleted_at)
-        const result = await env.DB.prepare(`
-          UPDATE ideas SET deleted_at = ?, updated_at = ?
-          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
-        `).bind(now, now, idea_id, tenantId).run();
-
-        if (result.meta.changes === 0) {
-          return {
-            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Idea not found or already deleted' }) }],
-            isError: true
-          };
-        }
-
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              success: true,
-              idea_id,
-              message: 'Idea deleted successfully',
             }, null, 2)
           }]
         };
@@ -2788,6 +2731,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           // Auto-detect executor patterns
           const patterns: Array<{ pattern: RegExp; executor: string }> = [
+            // Shorthand tags (highest priority)
+            { pattern: /^\[CC\]/i, executor: 'claude-code' },
+            { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+            { pattern: /^\[HUMAN\]/i, executor: 'human' },
+            { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+            // Detailed tags
             { pattern: /^\[implement\]/i, executor: 'claude-code' },
             { pattern: /^\[deploy\]/i, executor: 'claude-code' },
             { pattern: /^\[fix\]/i, executor: 'claude-code' },
@@ -2900,7 +2849,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               next_available: nextTasks.slice(0, 5),
               has_more_work: nextTasks.length > 0,
               message: nextTasks.length > 0
-                ? `Task completed. ${nextTasks.length} task(s) available for ${executorType}. Use nexus_claim_task to claim the next one.`
+                ? `Task completed. ${nextTasks.length} task(s) available for ${executorType}. Use nexus_claim_queue_task to claim the next one.`
                 : `Task completed. No more tasks queued for ${executorType}.`,
             }, null, 2)
           }]
@@ -3041,6 +2990,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         if (!executorType) {
           // Auto-detect from title tag patterns
           const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
+            // Shorthand tags (highest priority)
+            { pattern: /^\[CC\]/i, executor: 'claude-code' },
+            { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+            { pattern: /^\[HUMAN\]/i, executor: 'human' },
+            { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+            // Detailed tags
             { pattern: /^\[implement\]/i, executor: 'claude-code' },
             { pattern: /^\[deploy\]/i, executor: 'claude-code' },
             { pattern: /^\[fix\]/i, executor: 'claude-code' },
@@ -3204,6 +3159,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Auto-detect executor patterns
         const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
+          // Shorthand tags (highest priority)
+          { pattern: /^\[CC\]/i, executor: 'claude-code' },
+          { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+          { pattern: /^\[HUMAN\]/i, executor: 'human' },
+          { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+          // Detailed tags
           { pattern: /^\[implement\]/i, executor: 'claude-code' },
           { pattern: /^\[deploy\]/i, executor: 'claude-code' },
           { pattern: /^\[fix\]/i, executor: 'claude-code' },

@@ -29,6 +29,10 @@ export interface Env {
   IDEA_EXECUTOR: DurableObjectNamespace;
   // Service Bindings
   DE: Fetcher; // DE (distributed-electrons) service for LLM operations
+  // DE text-gen URL (for workflows that can't use service bindings)
+  TEXT_GEN_URL?: string;
+  // Fallback Anthropic API key (for environments without DE)
+  ANTHROPIC_API_KEY?: string;
   // Write passphrase for MCP destructive operations
   WRITE_PASSPHRASE?: string;
   // Cloudflare Access

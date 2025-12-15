@@ -15,6 +15,8 @@ database_id = "1210076d-a443-443c-8623-a02b5ff4de9f"
 ENVIRONMENT = "production"
 # Primary tenant for single-tenant MCP mode (ensures all clients use same data)
 PRIMARY_TENANT = "f943851e-a7c5-4908-90a2-956367f21460"
+# DE text-gen URL for workflows (workflows can't use service bindings)
+TEXT_GEN_URL = "https://text-gen.solamp.workers.dev"
 
 [[kv_namespaces]]
 binding = "KV"
@@ -62,7 +64,40 @@ new_sqlite_classes = ["UserSession"]
 tag = "v5"
 new_sqlite_classes = ["IdeaExecutor"]
 
+[[migrations]]
+tag = "v6"
+
+[[migrations]]
+tag = "v7"
+
+[[migrations]]
+tag = "v8"
+
+[[migrations]]
+tag = "v9"
+
 # Service Bindings - Worker-to-Worker communication
 [[services]]
 binding = "DE"
 service = "text-gen"  # DE's text-gen worker for LLM operations
+
+# Cloudflare Workflows - Durable execution for long-running tasks
+[[workflows]]
+name = "idea-execution-workflow"
+binding = "IDEA_EXECUTION_WORKFLOW"
+class_name = "IdeaExecutionWorkflow"
+
+[[workflows]]
+name = "idea-to-plan-workflow"
+binding = "IDEA_TO_PLAN_WORKFLOW"
+class_name = "IdeaToPlanWorkflow"
+
+[[workflows]]
+name = "task-executor-workflow"
+binding = "TASK_EXECUTOR_WORKFLOW"
+class_name = "TaskExecutorWorkflow"
+
+[[workflows]]
+name = "idea-planning-workflow"
+binding = "IDEA_PLANNING_WORKFLOW"
+class_name = "IdeaPlanningWorkflow"
