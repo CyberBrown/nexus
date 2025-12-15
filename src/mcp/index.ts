@@ -341,11 +341,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Send the approval event to resume the workflow
         // This triggers the waitForEvent('plan-approved') in IdeaPlanningWorkflow
-        await instance.sendEvent('plan-approved', {
-          approved,
-          modifications: {
-            remove_steps: remove_steps || [],
-            notes: notes || '',
+        await instance.sendEvent({
+          type: 'plan-approved',
+          payload: {
+            approved,
+            modifications: {
+              remove_steps: remove_steps || [],
+              notes: notes || '',
+            },
           },
         });
 
@@ -446,11 +449,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Send approval event to workflow to trigger task creation
         if (execution.workflow_instance_id) {
           const instance = await env.IDEA_PLANNING_WORKFLOW.get(execution.workflow_instance_id);
-          await instance.sendEvent('plan-approved', {
-            approved: true,
-            modifications: {
-              remove_steps: [],
-              notes: '',
+          await instance.sendEvent({
+            type: 'plan-approved',
+            payload: {
+              approved: true,
+              modifications: {
+                remove_steps: [],
+                notes: '',
+              },
             },
           });
         }

@@ -15,7 +15,7 @@ interface WorkflowInstance {
   resume(): Promise<void>;
   terminate(): Promise<void>;
   restart(): Promise<void>;
-  sendEvent(eventName: string, payload?: unknown): Promise<void>;
+  sendEvent(event: { type: string; payload?: unknown }): Promise<void>;
 }
 
 // Environment bindings
