@@ -11,6 +11,12 @@ export type ExecutorType = 'claude-code' | 'claude-ai' | 'de-agent' | 'human';
 
 // Task tag patterns and their executor mappings
 const EXECUTOR_PATTERNS: Array<{ pattern: RegExp; executor: ExecutorType }> = [
+  // Shorthand tags (highest priority - check first)
+  { pattern: /^\[CC\]/i, executor: 'claude-code' },
+  { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+  { pattern: /^\[HUMAN\]/i, executor: 'human' },
+  { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+
   // Code-related tasks -> Claude Code
   { pattern: /^\[implement\]/i, executor: 'claude-code' },
   { pattern: /^\[deploy\]/i, executor: 'claude-code' },
