@@ -79,15 +79,16 @@ export class IdeaToPlanWorkflow extends WorkflowEntrypoint<Env, IdeaToPlanParams
         timeout: '2 minutes',
       },
       async () => {
-        // Use DE service binding for LLM calls - Nexus should never call LLM providers directly
-        if (!this.env.DE) {
-          throw new Error('DE service binding not configured. Add [[services]] binding to wrangler.toml');
+        // Workflows can't use service bindings - must use TEXT_GEN_URL
+        const textGenUrl = this.env.TEXT_GEN_URL;
+        if (!textGenUrl) {
+          throw new Error('TEXT_GEN_URL not configured. Set TEXT_GEN_URL in wrangler.toml [vars]');
         }
 
         const userPrompt = buildPlanningPrompt(idea);
         const prompt = `System: ${PLANNING_SYSTEM_PROMPT}\n\nUser: ${userPrompt}\n\nAssistant:`;
 
-        const response = await this.env.DE.fetch('https://de/generate', {
+        const response = await fetch(`${textGenUrl}/generate`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

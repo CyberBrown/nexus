@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import type { AppType, Env, ScheduledEvent } from './types/index.ts';
@@ -1083,7 +1084,7 @@ api.post('/dispatch/ready', async (c) => {
     ];
 
     // Helper to safely decrypt
-    const safeDecrypt = async (value: unknown, key: CryptoKey): Promise<string> => {
+    const safeDecrypt = async (value: unknown, key: CryptoKey | null): Promise<string> => {
       if (!value || typeof value !== 'string') return '';
       try {
         const { decryptField } = await import('./lib/encryption.ts');
@@ -1327,12 +1328,12 @@ app.notFound((c) => {
 app.onError((err, c) => {
   // Handle validation errors
   if (err instanceof ValidationError) {
-    return c.json(err.toJSON(), err.statusCode);
+    return c.json(err.toJSON(), err.statusCode as ContentfulStatusCode);
   }
 
   // Handle known operational errors
   if (isOperationalError(err)) {
-    return c.json(err.toJSON(), err.statusCode);
+    return c.json(err.toJSON(), err.statusCode as ContentfulStatusCode);
   }
 
   // Log unexpected errors

@@ -24,7 +24,7 @@ import { getEncryptionKey, encryptField, decryptField } from '../lib/encryption.
  * Safely decrypt a field, returning the original value if decryption fails.
  * This handles cases where data might be unencrypted (plain text) or NULL.
  */
-async function safeDecrypt(value: unknown, key: CryptoKey): Promise<string> {
+async function safeDecrypt(value: unknown, key: CryptoKey | null): Promise<string> {
   if (!value || typeof value !== 'string') {
     return '';
   }
@@ -682,8 +682,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (sourceRef.startsWith('idea:')) {
             // New format: "idea:{ideaId}:execution:{executionId}"
             const parts = sourceRef.split(':');
-            ideaId = parts[1];
-            executionId = parts[3] || null;
+            ideaId = parts[1] ?? null;
+            executionId = parts[3] ?? null;
           } else {
             // Legacy format: might be just an execution ID, try to look it up
             const execution = await env.DB.prepare(`
@@ -849,7 +849,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (sourceRef.startsWith('idea:')) {
             // New format: "idea:{ideaId}:execution:{executionId}"
             const parts = sourceRef.split(':');
-            ideaId = parts[1];
+            ideaId = parts[1] ?? null;
           } else {
             // Legacy format: might be just an execution ID, try to look it up
             const execution = await env.DB.prepare(`
@@ -1184,6 +1184,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         const blocker = blockers[blockerIndex];
+        if (!blocker) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({
+              success: false,
+              error: `Blocker at index ${blockerIndex} not found.`
+            }) }],
+            isError: true
+          };
+        }
+
         if (blocker.resolved) {
           return {
             content: [{ type: 'text', text: JSON.stringify({
@@ -1197,7 +1207,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Mark as resolved
         const now = new Date().toISOString();
         blockers[blockerIndex] = {
-          ...blocker,
+          id: blocker.id,
+          description: blocker.description,
           resolved: true,
           resolution,
           resolved_at: now,
@@ -3033,7 +3044,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               by_status: Object.fromEntries((byStatus.results || []).map(r => [r.status, r.count])),
               by_executor: (byExecutor.results || []).reduce((acc, r) => {
                 if (!acc[r.executor_type]) acc[r.executor_type] = {};
-                acc[r.executor_type][r.status] = r.count;
+                const executorStats = acc[r.executor_type];
+                if (executorStats) executorStats[r.status] = r.count;
                 return acc;
               }, {} as Record<string, Record<string, number>>),
               recent_activity_1h: Object.fromEntries((recentActivity.results || []).map(r => [r.action, r.count])),

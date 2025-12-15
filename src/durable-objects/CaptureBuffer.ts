@@ -462,6 +462,8 @@ export class CaptureBuffer extends DurableObject<Env> {
     // Find the most recent capture for this user and source type within merge window
     for (let i = this.buffer.length - 1; i >= 0; i--) {
       const capture = this.buffer[i];
+      if (!capture) continue;
+
       const age = now - new Date(capture.last_chunk_at).getTime();
 
       if (
@@ -586,12 +588,15 @@ export class CaptureBuffer extends DurableObject<Env> {
       // Remove successfully flushed captures
       const flushedIds = new Set<string>();
       results.forEach((result, index) => {
+        const capture = toFlush[index];
+        if (!capture) return;
+
         if (result.status === 'fulfilled') {
-          flushedIds.add(toFlush[index].id);
+          flushedIds.add(capture.id);
         } else {
           console.error('Failed to flush capture:', result.reason);
           // Mark as accumulating again for retry
-          toFlush[index].status = 'accumulating';
+          capture.status = 'accumulating';
         }
       });
 
@@ -634,15 +639,18 @@ export class CaptureBuffer extends DurableObject<Env> {
     const now = Date.now();
 
     // Find oldest capture age
-    const oldestCapture = this.buffer.length > 0
-      ? this.buffer.reduce((oldest, capture) =>
-          capture.first_chunk_at < oldest.first_chunk_at ? capture : oldest
-        , this.buffer[0])
-      : null;
-
-    if (!oldestCapture) {
+    if (this.buffer.length === 0) {
       return;
     }
+
+    const firstCapture = this.buffer[0];
+    if (!firstCapture) {
+      return;
+    }
+
+    const oldestCapture = this.buffer.reduce((oldest, capture) =>
+      capture.first_chunk_at < oldest.first_chunk_at ? capture : oldest
+    , firstCapture);
 
     const captureAge = now - new Date(oldestCapture.first_chunk_at).getTime();
     const timeUntilFlush = Math.max(0, this.config.maxAgeMs - captureAge);
