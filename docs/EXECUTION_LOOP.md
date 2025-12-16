@@ -248,9 +248,84 @@ No planning phase. No complex review. Just triage → do → done.
 | Quick Win Fast Path | ⏳ Planned | Skip planning for small items |
 | IdeaExecutionLoop | ✅ Implemented | Manual trigger via API |
 | Task Review Questions | ⏳ Planned | Schema additions needed |
-| CodeExecutionLoop | ⏳ Partial | Tasks created, execution manual |
+| CodeExecutionLoop | ⚠️ Blocked | Tasks created, but **blocked on DE container support** |
 | Auto-trigger System | ❌ Not started | Needs cron or event system |
 | Escalation to Bridge | ❌ Not started | Bridge project not yet built |
+
+## DE Integration - Required for Execution
+
+### Current Blocker
+
+Nexus routes tasks to executor queues but **cannot execute them**. The execution loops
+(CodeExecutionLoop, ResearchLoop, etc.) require DE to support container-based execution.
+
+**The gap**: Nexus is an orchestrator (the Brain), not an executor. When a task like
+"[implement] Update README.md" hits the `claude-code` queue, nothing actually does the work.
+DE needs to provide the "Arms & Legs" - container infrastructure that can run Claude Code CLI.
+
+### Architecture
+
+```
+Nexus (Brain/Orchestrator)
+    ↓ sends task via API
+DE (Arms & Legs)
+    ↓ spins up
+Container with Claude Code CLI
+    ↓ executes task
+Reports results back to Nexus
+```
+
+### What DE Needs to Support
+
+1. **Container Execution Service**
+   - Spin up containers on demand (Docker, Fly.io, etc.)
+   - Mount workspace/repo (clone from GitHub)
+   - Run Claude Code CLI or other executors
+   - Stream output back to Nexus
+   - Handle timeouts and resource limits
+
+2. **Execution API**
+   ```
+   POST /execute
+   {
+     "executor": "claude-code",
+     "task": {
+       "id": "task-uuid",
+       "title": "[implement] Update README.md",
+       "description": "Add MCP command documentation",
+       "context": { ... }
+     },
+     "repo": "github.com/CyberBrown/nexus",
+     "branch": "dev",
+     "callback_url": "https://nexus.solamp.workers.dev/api/execution/callback"
+   }
+   ```
+
+3. **Status Reporting**
+   - Progress updates during execution (streaming)
+   - Final result/error reporting
+   - Artifact collection (files changed, commit hash, logs)
+   - Webhook callback to Nexus when complete
+
+### Nexus Side Requirements
+
+When DE container execution is ready, Nexus needs:
+
+1. **Dispatch to DE**: Call DE's `/execute` API when task is claimed
+2. **Callback Handler**: `POST /api/execution/callback` to receive results
+3. **Status Sync**: Update `execution_queue` and task status from callbacks
+4. **Error Handling**: Handle timeouts, failures, retries
+
+### Next Steps
+
+When implementing CodeExecutionLoop:
+1. ⏳ Build container execution service in DE first
+2. Add Nexus → DE execution API call
+3. Add callback handler in Nexus for results
+4. Wire up queue → DE dispatch
+5. Add streaming status updates
+
+See: https://github.com/CyberBrown/distributed-electrons
 
 ## Database Schema Additions
 
