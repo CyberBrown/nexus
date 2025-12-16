@@ -35,6 +35,7 @@ export function parseRRule(rrule: string): ParsedRRule {
 
   for (const part of parts) {
     const [key, value] = part.split('=');
+    if (!value) continue; // Skip malformed parts
 
     switch (key) {
       case 'FREQ':
@@ -55,7 +56,7 @@ export function parseRRule(rrule: string): ParsedRRule {
         rule.byday = value.split(',').map((day) => day.trim().toUpperCase());
         // Validate weekday codes
         for (const day of rule.byday) {
-          if (!WEEKDAY_MAP.hasOwnProperty(day)) {
+          if (!Object.prototype.hasOwnProperty.call(WEEKDAY_MAP, day)) {
             throw new Error(`Invalid weekday: ${day}`);
           }
         }
@@ -164,7 +165,7 @@ export function shouldContinueRecurrence(
 
 function addDays(date: Date, days: number): Date {
   const result = new Date(date);
-  result.setDate(result.getDate() + days);
+  result.setUTCDate(result.getUTCDate() + days);
   return result;
 }
 
@@ -174,13 +175,13 @@ function addWeeks(date: Date, weeks: number): Date {
 
 function addMonths(date: Date, months: number): Date {
   const result = new Date(date);
-  result.setMonth(result.getMonth() + months);
+  result.setUTCMonth(result.getUTCMonth() + months);
   return result;
 }
 
 function addYears(date: Date, years: number): Date {
   const result = new Date(date);
-  result.setFullYear(result.getFullYear() + years);
+  result.setUTCFullYear(result.getUTCFullYear() + years);
   return result;
 }
 
@@ -195,8 +196,18 @@ function nextWeekdayOccurrence(
   weekdays: string[],
   interval: number
 ): Date {
-  const targetDays = weekdays.map((day) => WEEKDAY_MAP[day]).sort((a, b) => a - b);
-  const currentDay = fromDate.getDay();
+  // Map weekday codes to day numbers (already validated in parseRRule)
+  const targetDays = weekdays
+    .map((day) => WEEKDAY_MAP[day])
+    .filter((d): d is number => d !== undefined)
+    .sort((a, b) => a - b);
+
+  if (targetDays.length === 0) {
+    // Fallback: no valid weekdays, return next week
+    return addDays(fromDate, 7 * interval);
+  }
+
+  const currentDay = fromDate.getUTCDay();
 
   // Find next occurrence in current week
   for (const targetDay of targetDays) {
@@ -207,7 +218,8 @@ function nextWeekdayOccurrence(
   }
 
   // No occurrence in current week, go to next interval week
-  const daysUntilNextWeek = 7 * interval - currentDay + targetDays[0];
+  const firstTargetDay = targetDays[0]!;
+  const daysUntilNextWeek = 7 * interval - currentDay + firstTargetDay;
   return addDays(fromDate, daysUntilNextWeek);
 }
 

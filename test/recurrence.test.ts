@@ -88,8 +88,7 @@ describe('calculateNextOccurrence', () => {
     expect(afterUntil).toBeNull();
   });
 
-  test.skip('handles weekly with BYDAY', () => {
-    // TODO: Fix BYDAY off-by-one bug
+  test('handles weekly with BYDAY', () => {
     // Start on Wednesday (2025-01-15)
     const next = calculateNextOccurrence('2025-01-15', 'FREQ=WEEKLY;BYDAY=MO,WE,FR');
     // Should give Friday (2025-01-17)
@@ -179,8 +178,7 @@ describe('edge cases', () => {
     expect(next?.startsWith('2025-02-28') || next?.startsWith('2025-03-01')).toBe(true);
   });
 
-  test.skip('handles weekly BYDAY wrapping to next week', () => {
-    // TODO: Fix BYDAY off-by-one bug
+  test('handles weekly BYDAY wrapping to next week', () => {
     // Start on Saturday, only Monday in BYDAY - should go to next Monday
     const next = calculateNextOccurrence('2025-01-18', 'FREQ=WEEKLY;BYDAY=MO');
     expect(next?.startsWith('2025-01-20')).toBe(true);

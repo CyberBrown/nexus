@@ -24,7 +24,7 @@ import { getEncryptionKey, encryptField, decryptField } from '../lib/encryption.
  * Safely decrypt a field, returning the original value if decryption fails.
  * This handles cases where data might be unencrypted (plain text) or NULL.
  */
-async function safeDecrypt(value: unknown, key: CryptoKey): Promise<string> {
+async function safeDecrypt(value: unknown, key: CryptoKey | null): Promise<string> {
   if (!value || typeof value !== 'string') {
     return '';
   }
@@ -45,6 +45,7 @@ async function safeDecrypt(value: unknown, key: CryptoKey): Promise<string> {
  * These require passphrase validation when WRITE_PASSPHRASE is set
  */
 const WRITE_TOOLS = new Set([
+  'nexus_create_task',
   'nexus_create_idea',
   'nexus_update_idea',
   'nexus_archive_idea',
@@ -89,6 +90,7 @@ const READ_TOOLS = new Set([
   // Queue read tools
   'nexus_check_queue',
   'nexus_queue_stats',
+  'nexus_task_status',
 ]);
 
 /**
@@ -154,6 +156,194 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // ========================================
   // TOOLS
   // ========================================
+
+  // Tool: nexus_create_task - Create a task with optional immediate dispatch
+  server.tool(
+    'nexus_create_task',
+    'Create a new task in Nexus. Use auto_dispatch=true to immediately queue it for execution instead of waiting for the 15-minute cron.',
+    {
+      title: z.string().describe('Task title. Prefix with a tag like [implement], [research], [human] to auto-route to the right executor'),
+      description: z.string().optional().describe('Detailed description of what needs to be done'),
+      status: z.enum(['inbox', 'next', 'scheduled', 'waiting', 'someday']).optional().describe('Task status (default: inbox). Use "next" for tasks ready to execute'),
+      domain: z.enum(['work', 'personal', 'side_project', 'family', 'health']).optional().describe('Domain area (default: work)'),
+      urgency: z.number().min(1).max(5).optional().describe('Urgency level 1-5 (default: 3)'),
+      importance: z.number().min(1).max(5).optional().describe('Importance level 1-5 (default: 3)'),
+      energy_required: z.enum(['low', 'medium', 'high']).optional().describe('Energy required (default: medium)'),
+      due_date: z.string().optional().describe('Due date in ISO format (YYYY-MM-DD)'),
+      project_id: z.string().uuid().optional().describe('Project ID to associate this task with'),
+      time_estimate_minutes: z.number().optional().describe('Estimated time in minutes'),
+      auto_dispatch: z.boolean().optional().describe('If true and status is "next", immediately queue for execution'),
+      executor_type: z.enum(['claude-code', 'claude-ai', 'de-agent', 'human']).optional()
+        .describe('Override auto-detected executor type (only used with auto_dispatch)'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_create_task', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      try {
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const now = new Date().toISOString();
+        const taskId = crypto.randomUUID();
+
+        const encryptedTitle = await encryptField(args.title, encryptionKey);
+        const encryptedDescription = args.description ? await encryptField(args.description, encryptionKey) : null;
+
+        const status = args.status || 'inbox';
+        const domain = args.domain || 'work';
+        const urgency = args.urgency || 3;
+        const importance = args.importance || 3;
+        const energyRequired = args.energy_required || 'medium';
+
+        await env.DB.prepare(`
+          INSERT INTO tasks (
+            id, tenant_id, user_id, title, description, status, domain,
+            urgency, importance, energy_required, due_date, project_id,
+            time_estimate_minutes, source_type, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mcp', ?, ?)
+        `).bind(
+          taskId,
+          tenantId,
+          userId,
+          encryptedTitle,
+          encryptedDescription,
+          status,
+          domain,
+          urgency,
+          importance,
+          energyRequired,
+          args.due_date || null,
+          args.project_id || null,
+          args.time_estimate_minutes || null,
+          now,
+          now
+        ).run();
+
+        // Handle auto_dispatch if task is ready (status = 'next')
+        let dispatchResult = null;
+        if (args.auto_dispatch && status === 'next') {
+          // Determine executor type
+          let executorType = args.executor_type;
+          if (!executorType) {
+            // Auto-detect from title tag patterns
+            const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
+              { pattern: /^\[CC\]/i, executor: 'claude-code' },
+              { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+              { pattern: /^\[HUMAN\]/i, executor: 'human' },
+              { pattern: /^\[implement\]/i, executor: 'claude-code' },
+              { pattern: /^\[deploy\]/i, executor: 'claude-code' },
+              { pattern: /^\[fix\]/i, executor: 'claude-code' },
+              { pattern: /^\[refactor\]/i, executor: 'claude-code' },
+              { pattern: /^\[test\]/i, executor: 'claude-code' },
+              { pattern: /^\[debug\]/i, executor: 'claude-code' },
+              { pattern: /^\[code\]/i, executor: 'claude-code' },
+              { pattern: /^\[research\]/i, executor: 'claude-ai' },
+              { pattern: /^\[design\]/i, executor: 'claude-ai' },
+              { pattern: /^\[document\]/i, executor: 'claude-ai' },
+              { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
+              { pattern: /^\[plan\]/i, executor: 'claude-ai' },
+              { pattern: /^\[write\]/i, executor: 'claude-ai' },
+              { pattern: /^\[review\]/i, executor: 'human' },
+              { pattern: /^\[approve\]/i, executor: 'human' },
+              { pattern: /^\[decide\]/i, executor: 'human' },
+            ];
+
+            for (const { pattern, executor } of patterns) {
+              if (pattern.test(args.title)) {
+                executorType = executor;
+                break;
+              }
+            }
+            executorType = executorType || 'human'; // Default to human if no pattern matches
+          }
+
+          // Create execution queue entry
+          const queueId = crypto.randomUUID();
+          const priority = urgency * importance;
+
+          // Build context for executor
+          const context = {
+            task_id: taskId,
+            title: args.title,
+            description: args.description || null,
+            urgency,
+            importance,
+            energy_required: energyRequired,
+            domain,
+            time_estimate_minutes: args.time_estimate_minutes || null,
+          };
+          const encryptedContext = await encryptField(JSON.stringify(context), encryptionKey);
+
+          await env.DB.prepare(`
+            INSERT INTO execution_queue (
+              id, tenant_id, user_id, task_id, executor_type, status,
+              priority, context, queued_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+          `).bind(
+            queueId,
+            tenantId,
+            userId,
+            taskId,
+            executorType,
+            priority,
+            encryptedContext,
+            now,
+            now,
+            now
+          ).run();
+
+          // Log the dispatch
+          await env.DB.prepare(`
+            INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, created_at)
+            VALUES (?, ?, ?, ?, ?, 'queued', ?)
+          `).bind(
+            crypto.randomUUID(),
+            tenantId,
+            queueId,
+            taskId,
+            executorType,
+            now
+          ).run();
+
+          dispatchResult = {
+            dispatched: true,
+            queue_id: queueId,
+            executor_type: executorType,
+            priority,
+          };
+        }
+
+        const response: Record<string, unknown> = {
+          success: true,
+          task_id: taskId,
+          title: args.title,
+          status,
+          message: dispatchResult
+            ? `Task created and queued for ${dispatchResult.executor_type} executor. Use nexus_task_status to track progress.`
+            : status === 'next'
+              ? `Task created with status "next". Use nexus_dispatch_task to queue it, or wait for the 15-minute cron.`
+              : `Task created successfully.`,
+        };
+
+        if (dispatchResult) {
+          response.dispatch = dispatchResult;
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
 
   // Tool: nexus_create_idea
   server.tool(
@@ -341,11 +531,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Send the approval event to resume the workflow
         // This triggers the waitForEvent('plan-approved') in IdeaPlanningWorkflow
-        await instance.sendEvent('plan-approved', {
-          approved,
-          modifications: {
-            remove_steps: remove_steps || [],
-            notes: notes || '',
+        await instance.sendEvent({
+          type: 'plan-approved',
+          payload: {
+            approved,
+            modifications: {
+              remove_steps: remove_steps || [],
+              notes: notes || '',
+            },
           },
         });
 
@@ -446,11 +639,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Send approval event to workflow to trigger task creation
         if (execution.workflow_instance_id) {
           const instance = await env.IDEA_PLANNING_WORKFLOW.get(execution.workflow_instance_id);
-          await instance.sendEvent('plan-approved', {
-            approved: true,
-            modifications: {
-              remove_steps: [],
-              notes: '',
+          await instance.sendEvent({
+            type: 'plan-approved',
+            payload: {
+              approved: true,
+              modifications: {
+                remove_steps: [],
+                notes: '',
+              },
             },
           });
         }
@@ -682,8 +878,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (sourceRef.startsWith('idea:')) {
             // New format: "idea:{ideaId}:execution:{executionId}"
             const parts = sourceRef.split(':');
-            ideaId = parts[1];
-            executionId = parts[3] || null;
+            ideaId = parts[1] ?? null;
+            executionId = parts[3] ?? null;
           } else {
             // Legacy format: might be just an execution ID, try to look it up
             const execution = await env.DB.prepare(`
@@ -778,6 +974,164 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
+  // Tool: nexus_task_status - Track a task's full execution journey
+  server.tool(
+    'nexus_task_status',
+    'Get complete status of a task including its execution queue state and timeline. Use this to track progress of tasks you\'ve dispatched.',
+    {
+      task_id: z.string().uuid().describe('The UUID of the task to check status for'),
+    },
+    async ({ task_id }): Promise<CallToolResult> => {
+      try {
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
+        // Get task details
+        const task = await env.DB.prepare(`
+          SELECT id, title, description, status, source_type, source_reference,
+                 urgency, importance, energy_required, time_estimate_minutes,
+                 claimed_by, claimed_at, completed_at, created_at, updated_at
+          FROM tasks
+          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(task_id, tenantId).first();
+
+        if (!task) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found' }) }],
+            isError: true
+          };
+        }
+
+        const decryptedTitle = await safeDecrypt(task.title, encryptionKey);
+
+        // Get current execution queue entry (if any)
+        const queueEntry = await env.DB.prepare(`
+          SELECT id, executor_type, status, priority, context,
+                 queued_at, claimed_at, claimed_by, completed_at, result, error,
+                 retry_count, max_retries
+          FROM execution_queue
+          WHERE task_id = ? AND tenant_id = ?
+          ORDER BY queued_at DESC
+          LIMIT 1
+        `).bind(task_id, tenantId).first();
+
+        // Get dispatch log timeline for this task
+        const timeline = await env.DB.prepare(`
+          SELECT action, details, created_at
+          FROM dispatch_log
+          WHERE task_id = ? AND tenant_id = ?
+          ORDER BY created_at ASC
+          LIMIT 50
+        `).bind(task_id, tenantId).all<{ action: string; details: string | null; created_at: string }>();
+
+        // Build timeline with task creation as first event
+        const events: Array<{ action: string; at: string; details?: Record<string, unknown> }> = [
+          { action: 'created', at: task.created_at as string }
+        ];
+
+        // Add dispatch log events
+        for (const log of timeline.results || []) {
+          const event: { action: string; at: string; details?: Record<string, unknown> } = {
+            action: log.action,
+            at: log.created_at,
+          };
+          if (log.details) {
+            try {
+              event.details = JSON.parse(log.details);
+            } catch {
+              event.details = { raw: log.details };
+            }
+          }
+          events.push(event);
+        }
+
+        // Determine overall status
+        let overallStatus: string;
+        let statusMessage: string;
+
+        if (task.status === 'completed') {
+          overallStatus = 'completed';
+          statusMessage = `Task completed at ${task.completed_at}`;
+        } else if (task.status === 'cancelled') {
+          overallStatus = 'cancelled';
+          statusMessage = 'Task was cancelled';
+        } else if (queueEntry) {
+          overallStatus = queueEntry.status as string;
+          switch (queueEntry.status) {
+            case 'queued':
+              statusMessage = `Waiting in queue for ${queueEntry.executor_type} executor (priority: ${queueEntry.priority})`;
+              break;
+            case 'claimed':
+              statusMessage = `Being worked on by ${queueEntry.claimed_by} since ${queueEntry.claimed_at}`;
+              break;
+            case 'dispatched':
+              statusMessage = `Dispatched to ${queueEntry.executor_type}, awaiting completion`;
+              break;
+            case 'completed':
+              overallStatus = 'execution_completed';
+              statusMessage = `Execution completed at ${queueEntry.completed_at}`;
+              break;
+            case 'failed':
+              statusMessage = `Execution failed: ${queueEntry.error || 'Unknown error'} (retries: ${queueEntry.retry_count}/${queueEntry.max_retries})`;
+              break;
+            default:
+              statusMessage = `Queue status: ${queueEntry.status}`;
+          }
+        } else if (task.status === 'next') {
+          overallStatus = 'ready';
+          statusMessage = 'Task is ready but not yet dispatched to queue. Use nexus_dispatch_task to queue it.';
+        } else {
+          overallStatus = task.status as string;
+          statusMessage = `Task status: ${task.status}`;
+        }
+
+        // Build execution info
+        const executionInfo = queueEntry ? {
+          queue_id: queueEntry.id,
+          queue_status: queueEntry.status,
+          executor_type: queueEntry.executor_type,
+          priority: queueEntry.priority,
+          queued_at: queueEntry.queued_at,
+          claimed_at: queueEntry.claimed_at,
+          claimed_by: queueEntry.claimed_by,
+          completed_at: queueEntry.completed_at,
+          result: queueEntry.result ? (() => {
+            try { return JSON.parse(queueEntry.result as string); }
+            catch { return queueEntry.result; }
+          })() : null,
+          error: queueEntry.error,
+          retry_count: queueEntry.retry_count,
+          max_retries: queueEntry.max_retries,
+        } : null;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              overall_status: overallStatus,
+              message: statusMessage,
+              task: {
+                id: task.id,
+                title: decryptedTitle,
+                status: task.status,
+                created_at: task.created_at,
+                updated_at: task.updated_at,
+                completed_at: task.completed_at,
+              },
+              execution: executionInfo,
+              timeline: events,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
   // Tool: nexus_claim_task - Executor claims a task to prevent duplicate work
   server.tool(
     'nexus_claim_task',
@@ -849,7 +1203,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (sourceRef.startsWith('idea:')) {
             // New format: "idea:{ideaId}:execution:{executionId}"
             const parts = sourceRef.split(':');
-            ideaId = parts[1];
+            ideaId = parts[1] ?? null;
           } else {
             // Legacy format: might be just an execution ID, try to look it up
             const execution = await env.DB.prepare(`
@@ -1184,6 +1538,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         const blocker = blockers[blockerIndex];
+        if (!blocker) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({
+              success: false,
+              error: `Blocker at index ${blockerIndex} not found.`
+            }) }],
+            isError: true
+          };
+        }
+
         if (blocker.resolved) {
           return {
             content: [{ type: 'text', text: JSON.stringify({
@@ -1197,7 +1561,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Mark as resolved
         const now = new Date().toISOString();
         blockers[blockerIndex] = {
-          ...blocker,
+          id: blocker.id,
+          description: blocker.description,
           resolved: true,
           resolution,
           resolved_at: now,
@@ -3033,7 +3398,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               by_status: Object.fromEntries((byStatus.results || []).map(r => [r.status, r.count])),
               by_executor: (byExecutor.results || []).reduce((acc, r) => {
                 if (!acc[r.executor_type]) acc[r.executor_type] = {};
-                acc[r.executor_type][r.status] = r.count;
+                const executorStats = acc[r.executor_type];
+                if (executorStats) executorStats[r.status] = r.count;
                 return acc;
               }, {} as Record<string, Record<string, number>>),
               recent_activity_1h: Object.fromEntries((recentActivity.results || []).map(r => [r.action, r.count])),

@@ -221,7 +221,7 @@ export const changeLogEntrySchema = z.object({
   entity_type: z.enum(['task', 'project', 'inbox_item', 'idea', 'person', 'commitment']),
   entity_id: uuidSchema,
   operation: z.enum(['create', 'update', 'delete']),
-  changes: z.record(z.unknown()),
+  changes: z.record(z.string(), z.unknown()),
   device_id: z.string().uuid(),
   user_id: uuidSchema,
 });
@@ -304,7 +304,7 @@ export const bufferChunkSchema = z.object({
   source_platform: z.string().max(50).optional().nullable(),
   source_id: z.string().max(200).optional().nullable(),
   is_final: z.boolean().optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const bufferConfigSchema = z.object({

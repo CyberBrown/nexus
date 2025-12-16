@@ -50,9 +50,10 @@ async function spawnNextRecurringTask(
     return null; // Recurrence exhausted
   }
 
-  // Calculate next due date
-  const currentDueDate = parentTask.due_date || new Date().toISOString().split('T')[0];
-  const nextDueDate = calculateNextOccurrence(currentDueDate, parentTask.recurrence_rule);
+  // Calculate next due date (recurrence_rule already validated above)
+  const todayIso = new Date().toISOString();
+  const currentDueDate = parentTask.due_date || (todayIso.split('T')[0] ?? todayIso);
+  const nextDueDate = calculateNextOccurrence(currentDueDate, parentTask.recurrence_rule!);
 
   if (!nextDueDate) {
     return null; // No more occurrences (UNTIL exceeded)

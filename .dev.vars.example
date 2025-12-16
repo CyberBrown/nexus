@@ -1,0 +1,22 @@
+# =============================================================================
+# LOCAL DEVELOPMENT ONLY (for wrangler dev)
+# =============================================================================
+# Copy to .dev.vars and fill in values for local development.
+# These are NOT used in production - production uses Cloudflare secrets.
+
+# Cloudflare API Token (for wrangler CLI operations)
+# Create at: https://dash.cloudflare.com/profile/api-tokens
+CLOUDFLARE_API_TOKEN=your_cloudflare_api_token_here
+
+# =============================================================================
+# CLOUDFLARE WORKER SECRETS (Do NOT store locally - set via wrangler CLI)
+# =============================================================================
+# These secrets should be configured as Cloudflare Worker secrets:
+#   wrangler secret put WRITE_PASSPHRASE
+#
+# Or via Dashboard → Workers → nexus → Settings → Variables → Secrets
+#
+# Required secrets (for production):
+#   WRITE_PASSPHRASE    - MCP passphrase for write authentication
+#   TEAM_DOMAIN         - Cloudflare Access team domain (optional)
+#   POLICY_AUD          - Cloudflare Access audience tag (optional)

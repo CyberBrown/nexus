@@ -133,11 +133,13 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
     });
 
     // Step 5: Wait for human approval (can wait indefinitely)
-    const approval = await step.waitForEvent<ApprovalEvent>('plan-approved', {
+    const approvalEvent = await step.waitForEvent<ApprovalEvent>('plan-approved', {
+      type: 'plan-approved',
       timeout: '30 days', // Can wait up to 30 days for approval
     });
 
     // Step 6: Handle approval decision
+    const approval = approvalEvent.payload;
     if (!approval.approved) {
       await step.do('mark-rejected', async () => {
         const now = new Date().toISOString();
@@ -164,10 +166,11 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
 
     // Step 7: Apply any modifications to the plan
     let finalPlan = plan;
-    if (approval.modifications?.remove_steps?.length) {
+    const modifications = approval.modifications;
+    if (modifications?.remove_steps?.length) {
       finalPlan = {
         ...plan,
-        steps: plan.steps.filter(s => !approval.modifications!.remove_steps!.includes(s.order)),
+        steps: plan.steps.filter(s => !modifications.remove_steps!.includes(s.order)),
       };
     }
 
@@ -202,12 +205,14 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
   }
 
   /**
-   * Generate execution plan using DE text-gen worker via service binding
+   * Generate execution plan using DE text-gen worker via HTTP
+   * Note: Cloudflare Workflows can't use service bindings, must use HTTP fetch
    */
   private async generatePlanWithDE(idea: IdeaData): Promise<ExecutionPlan> {
-    // Use DE service binding for LLM calls - Nexus should never call LLM providers directly
-    if (!this.env.DE) {
-      throw new Error('DE service binding not configured. Add [[services]] binding to wrangler.toml');
+    // Workflows can't use service bindings - must use TEXT_GEN_URL
+    const textGenUrl = this.env.TEXT_GEN_URL;
+    if (!textGenUrl) {
+      throw new Error('TEXT_GEN_URL not configured. Set TEXT_GEN_URL in wrangler.toml [vars]');
     }
 
     const systemPrompt = this.getPlanningSystemPrompt();
@@ -216,7 +221,7 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
     // DE's text-gen service expects a prompt-based request
     const prompt = `System: ${systemPrompt}\n\nUser: ${userPrompt}\n\nAssistant:`;
 
-    const response = await this.env.DE.fetch('https://de/generate', {
+    const response = await fetch(`${textGenUrl}/generate`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -284,7 +289,7 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
    * Parse plan from Anthropic-style response (legacy, kept for reference)
    */
   private parsePlanResponse(data: { content: Array<{ type: string; text: string }> }): ExecutionPlan {
-    const text = data.content[0]?.text;
+    const text = data.content[0]?.text ?? '';
     return this.parsePlanResponseFromText(text);
   }
 

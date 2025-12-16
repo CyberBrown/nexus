@@ -400,6 +400,9 @@ npm run db:migrate:remote
 ### In Progress
 - **Task Review Loop** - Triage framework for task routing (see `docs/TASK_REVIEW_LOOP.md`)
 - **CodeExecutionLoop** - Auto-execute code/documentation tasks
+  - ⚠️ **Blocked on DE**: Requires DE to support container-based execution
+  - Tasks route to queue correctly, but cannot execute until DE has container service
+  - See `docs/EXECUTION_LOOP.md` "DE Integration Required" section for full spec
 - **Web Dashboard Completion** - Finish placeholder pages (Projects, Ideas, People, Commitments)
 - **Mnemo Integration** - Context orchestration (Nexus tells Mnemo what to load)
 - **Email Integration** - Gmail/IMAP ingestion and classification

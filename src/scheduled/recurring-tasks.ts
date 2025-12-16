@@ -42,7 +42,7 @@ function shouldSpawnTask(task: Task, today: string): boolean {
   }
 
   // Check if next date is today or earlier
-  const nextDateOnly = nextDate.split('T')[0];
+  const nextDateOnly = nextDate.split('T')[0] ?? nextDate;
   return nextDateOnly <= today;
 }
 
@@ -77,9 +77,11 @@ async function spawnNextInstance(
     return null;
   }
 
-  // Calculate next due date
-  const currentDueDate = task.due_date || new Date().toISOString().split('T')[0];
-  const nextDueDate = calculateNextOccurrence(currentDueDate, task.recurrence_rule!);
+  // Calculate next due date (recurrence_rule validated above)
+  const todayStr = new Date().toISOString().split('T')[0] ?? new Date().toISOString();
+  const currentDueDate = task.due_date || todayStr;
+  const recurrenceRule = task.recurrence_rule!;
+  const nextDueDate = calculateNextOccurrence(currentDueDate, recurrenceRule);
 
   if (!nextDueDate) {
     console.log(`Recurrence exhausted for task ${task.id} (UNTIL limit reached)`);
@@ -141,7 +143,8 @@ async function spawnNextInstance(
 export async function processRecurringTasks(env: Env): Promise<void> {
   console.log('Starting recurring tasks processing...');
 
-  const today = new Date().toISOString().split('T')[0];
+  const isoDate = new Date().toISOString();
+  const today = isoDate.split('T')[0] ?? isoDate;
   let totalSpawned = 0;
 
   try {
