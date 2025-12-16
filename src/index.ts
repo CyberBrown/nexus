@@ -17,6 +17,7 @@ import notesRoutes from './routes/notes.ts';
 import { createNexusMcpHandler } from './mcp/index.ts';
 import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 import { dispatchTasks } from './scheduled/task-dispatcher.ts';
+import { executeTasks } from './scheduled/task-executor.ts';
 
 // Re-export Durable Objects
 export { InboxManager } from './durable-objects/InboxManager.ts';
@@ -49,8 +50,10 @@ export default {
       // Daily at midnight UTC - process recurring tasks
       ctx.waitUntil(processRecurringTasks(env));
     } else if (event.cron === '*/15 * * * *') {
-      // Every 15 minutes - dispatch tasks to executors
-      ctx.waitUntil(dispatchTasks(env));
+      // Every 15 minutes - dispatch tasks to executors, then execute queued tasks
+      ctx.waitUntil(
+        dispatchTasks(env).then(() => executeTasks(env))
+      );
     } else {
       // Unknown cron, run both to be safe
       console.log(`Unknown cron pattern: ${event.cron}, running all scheduled tasks`);
