@@ -277,15 +277,19 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           await env.DB.prepare(`
             INSERT INTO execution_queue (
-              id, tenant_id, task_id, executor_type, status, priority, context, queued_at
-            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+              id, tenant_id, user_id, task_id, executor_type, status,
+              priority, context, queued_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
           `).bind(
             queueId,
             tenantId,
+            userId,
             taskId,
             executorType,
             priority,
             encryptedContext,
+            now,
+            now,
             now
           ).run();
 
