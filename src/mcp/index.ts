@@ -15,6 +15,7 @@ import { createMcpHandler } from 'agents/mcp';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { Env } from '../types/index.ts';
 import { getEncryptionKey, encryptField, decryptField } from '../lib/encryption.ts';
+import { executeQueueEntry } from '../scheduled/task-executor.ts';
 
 // ========================================
 // SAFE DECRYPT HELPER
@@ -70,6 +71,7 @@ const WRITE_TOOLS = new Set([
   'nexus_complete_queue_task',
   'nexus_dispatch_task',
   'nexus_dispatch_ready',
+  'nexus_execute_task',
 ]);
 
 /**
@@ -3789,6 +3791,59 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }, null, 2)
           }]
         };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_execute_task
+  server.tool(
+    'nexus_execute_task',
+    'Execute a queued task immediately via DE (Distributed Electrons). Only works for tasks routed to de-agent or claude-ai executors. Use this for immediate task execution instead of waiting for the cron.',
+    {
+      queue_id: z.string().uuid().describe('Queue entry ID to execute (from nexus_check_queue)'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_execute_task', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      try {
+        const queueId = args.queue_id;
+
+        // Execute the task via DE
+        const result = await executeQueueEntry(env, queueId, tenantId);
+
+        if (result.success) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                queue_id: queueId,
+                message: 'Task executed successfully via DE',
+                result: result.result,
+              }, null, 2)
+            }]
+          };
+        } else {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                queue_id: queueId,
+                error: result.error,
+              }, null, 2)
+            }],
+            isError: true
+          };
+        }
       } catch (error: any) {
         return {
           content: [{ type: 'text', text: `Error: ${error.message}` }],
