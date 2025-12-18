@@ -15,6 +15,8 @@ database_id = "1210076d-a443-443c-8623-a02b5ff4de9f"
 ENVIRONMENT = "development"
 # DE text-gen URL for workflows (workflows can't use service bindings)
 TEXT_GEN_URL = "https://text-gen.solamp.workers.dev"
+# Sandbox executor URL for code tasks (GitHub integration, deployments)
+SANDBOX_EXECUTOR_URL = "https://sandbox-executor.solamp.workers.dev"
 # Cloudflare Access - set these for production auth
 # TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 # POLICY_AUD = "your-application-audience-tag"
@@ -84,6 +86,10 @@ new_sqlite_classes = ["IdeaExecutor"]
 [[services]]
 binding = "DE"
 service = "text-gen"  # DE's text-gen worker for LLM operations
+
+[[services]]
+binding = "SANDBOX_EXECUTOR"
+service = "sandbox-executor"  # For code task execution
 
 # Cloudflare Workflows - Durable execution for long-running tasks
 [[workflows]]

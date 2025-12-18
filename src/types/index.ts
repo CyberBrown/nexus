@@ -30,8 +30,11 @@ export interface Env {
   IDEA_EXECUTOR: DurableObjectNamespace;
   // Service Bindings
   DE: Fetcher; // DE (distributed-electrons) service for LLM operations
+  SANDBOX_EXECUTOR?: Fetcher; // Sandbox executor service for code tasks
   // DE text-gen URL (for workflows that can't use service bindings)
   TEXT_GEN_URL?: string;
+  // Sandbox executor URL (for code generation/deployment tasks)
+  SANDBOX_EXECUTOR_URL?: string;
   // Fallback Anthropic API key (for environments without DE)
   ANTHROPIC_API_KEY?: string;
   // Write passphrase for MCP destructive operations
@@ -222,6 +225,10 @@ export interface IdeaTask extends BaseEntity {
   error_message: string | null;
   retry_count: number;
   max_retries: number;
+  // Code execution fields (for sandbox-executor)
+  repo: string | null; // e.g., "CyberBrown/distributed-electrons"
+  branch: string | null; // e.g., "feature/my-feature"
+  commit_message: string | null;
 }
 
 // IdeaExecution - Workflow run tracking

@@ -439,20 +439,9 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
 export async function executeQueueEntry(
   env: Env,
   queueId: string,
-  tenantId: string
+  tenantId: string,
+  options?: { repo?: string; branch?: string; commitMessage?: string }
 ): Promise<{ success: boolean; result?: string; error?: string }> {
-  // Check if DE is available
-  const deClient = createDEClient(env);
-  if (!deClient) {
-    return { success: false, error: 'DE service not available' };
-  }
-
-  // Verify DE is healthy
-  const healthy = await deClient.healthCheck();
-  if (!healthy) {
-    return { success: false, error: 'DE service health check failed' };
-  }
-
   const executorId = `nexus-manual-${Date.now()}`;
 
   // Get the queue entry with task data
@@ -466,14 +455,6 @@ export async function executeQueueEntry(
 
   if (!entry) {
     return { success: false, error: 'Queue entry not found' };
-  }
-
-  // Validate executor type
-  if (!['de-agent', 'claude-ai'].includes(entry.executor_type)) {
-    return {
-      success: false,
-      error: `Cannot execute ${entry.executor_type} tasks via DE. Only de-agent and claude-ai tasks are supported.`,
-    };
   }
 
   // Check status
@@ -495,15 +476,183 @@ export async function executeQueueEntry(
   // Get encryption key
   const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
-  // Execute the task
-  const result = await executeTask(deClient, entry, entry, encryptionKey);
+  // Route based on executor type
+  if (entry.executor_type === 'claude-code') {
+    // Execute via sandbox-executor
+    return executeCodeTask(env, entry, entry, encryptionKey, options);
+  } else if (['de-agent', 'claude-ai'].includes(entry.executor_type)) {
+    // Execute via DE
+    const deClient = createDEClient(env);
+    if (!deClient) {
+      await failEntry(env.DB, entry, 'DE service not available');
+      return { success: false, error: 'DE service not available' };
+    }
 
-  if (result.success && result.result) {
-    await completeEntry(env.DB, entry, result.result);
-    return { success: true, result: result.result };
+    const healthy = await deClient.healthCheck();
+    if (!healthy) {
+      await failEntry(env.DB, entry, 'DE service health check failed');
+      return { success: false, error: 'DE service health check failed' };
+    }
+
+    const result = await executeTask(deClient, entry, entry, encryptionKey);
+
+    if (result.success && result.result) {
+      await completeEntry(env.DB, entry, result.result);
+      return { success: true, result: result.result };
+    } else {
+      const error = result.error || 'Unknown execution error';
+      await failEntry(env.DB, entry, error);
+      return { success: false, error };
+    }
   } else {
-    const error = result.error || 'Unknown execution error';
-    await failEntry(env.DB, entry, error);
-    return { success: false, error };
+    // Human tasks cannot be auto-executed
+    return {
+      success: false,
+      error: `Cannot auto-execute ${entry.executor_type} tasks. Human tasks require manual action.`,
+    };
+  }
+}
+
+/**
+ * Execute a code task via sandbox-executor
+ * Uses service binding if available, falls back to URL.
+ * For long-running tasks, marks as "dispatched" and returns immediately.
+ */
+async function executeCodeTask(
+  env: Env,
+  entry: QueueEntry,
+  task: TaskRow,
+  encryptionKey: CryptoKey | null,
+  options?: { repo?: string; branch?: string; commitMessage?: string; waitForResult?: boolean }
+): Promise<{ success: boolean; result?: string; error?: string; dispatched?: boolean }> {
+  // Check for service binding first, then URL
+  const useSandboxBinding = !!env.SANDBOX_EXECUTOR;
+  const sandboxUrl = env.SANDBOX_EXECUTOR_URL;
+
+  if (!useSandboxBinding && !sandboxUrl) {
+    await failEntry(env.DB, entry, 'SANDBOX_EXECUTOR not configured (no binding or URL)');
+    return { success: false, error: 'SANDBOX_EXECUTOR not configured' };
+  }
+
+  try {
+    // Decrypt task fields
+    const title = await safeDecrypt(task.title, encryptionKey);
+    const description = await safeDecrypt(task.description, encryptionKey);
+
+    // Parse context for repo/branch info
+    let context: Record<string, unknown> | null = null;
+    if (entry.context) {
+      try {
+        context = JSON.parse(entry.context);
+      } catch {
+        const decryptedContext = await safeDecrypt(entry.context, encryptionKey);
+        if (decryptedContext) {
+          try {
+            context = JSON.parse(decryptedContext);
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+
+    // Determine repo/branch (options override context)
+    const repo = options?.repo || (context?.repo as string) || null;
+    const branch = options?.branch || (context?.branch as string) || 'main';
+    const commitMessage = options?.commitMessage || (context?.commitMessage as string) || title.slice(0, 50);
+
+    // Build task prompt
+    const taskPrompt = `## Task: ${title}\n\n${description || ''}\n\n## Instructions\nComplete this code task. Generate the necessary code changes.`;
+
+    // Build request body - include callback info for async completion
+    const requestBody: Record<string, unknown> = {
+      task: taskPrompt,
+      context: context?.project ? `Project: ${context.project}` : 'Direct task execution',
+      options: {
+        max_tokens: 8192,
+        temperature: 0.3,
+      },
+      // Include metadata for tracking
+      metadata: {
+        queue_entry_id: entry.id,
+        task_id: entry.task_id,
+        tenant_id: entry.tenant_id,
+      },
+    };
+
+    if (repo) {
+      requestBody.repo = repo;
+      requestBody.branch = branch;
+      requestBody.commitMessage = commitMessage;
+    }
+
+    console.log(`Executing code task via sandbox-executor: ${title}, repo: ${repo || 'none'}, branch: ${branch}`);
+
+    // Mark entry as "dispatched" before calling sandbox-executor
+    const now = new Date().toISOString();
+    await env.DB.prepare(`
+      UPDATE execution_queue SET status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?
+    `).bind(now, now, entry.id).run();
+
+    // Call sandbox-executor using service binding or URL
+    let response: Response;
+    if (useSandboxBinding) {
+      response = await env.SANDBOX_EXECUTOR!.fetch('https://sandbox-executor/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+    } else {
+      response = await fetch(`${sandboxUrl}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+    }
+
+    const data = await response.json() as {
+      success: boolean;
+      execution_id?: string;
+      result?: {
+        output: string;
+        files?: Array<{ path: string; content: string }>;
+      };
+      commit?: {
+        success: boolean;
+        sha?: string;
+        url?: string;
+        branch?: string;
+        error?: string;
+      };
+      error?: string;
+    };
+
+    if (!response.ok || !data.success) {
+      const error = data.error || `HTTP ${response.status}`;
+      await failEntry(env.DB, entry, error);
+      return { success: false, error };
+    }
+
+    // Build result summary
+    let resultText = data.result?.output || 'Task completed';
+    if (data.result?.files && data.result.files.length > 0) {
+      resultText += `\n\nGenerated ${data.result.files.length} file(s): ${data.result.files.map(f => f.path).join(', ')}`;
+    }
+    if (data.commit?.success) {
+      resultText += `\n\nCommitted to ${data.commit.branch}: ${data.commit.sha}`;
+      if (data.commit.url) {
+        resultText += `\nURL: ${data.commit.url}`;
+      }
+    } else if (data.commit?.error) {
+      resultText += `\n\nCommit failed: ${data.commit.error}`;
+    }
+
+    await completeEntry(env.DB, entry, resultText);
+    return { success: true, result: resultText };
+
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    await failEntry(env.DB, entry, errorMsg);
+    return { success: false, error: errorMsg };
   }
 }
