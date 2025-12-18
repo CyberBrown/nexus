@@ -3807,6 +3807,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'Execute a queued task immediately via sandbox-executor. Routes claude-ai tasks to /execute/sdk (fast AI path) and claude-code tasks to /execute (container path). Also supports de-agent tasks via DE service. Use this for immediate task execution instead of waiting for the 15-minute cron.',
     {
       queue_id: z.string().uuid().describe('Queue entry ID to execute (from nexus_check_queue)'),
+      repo: z.string().optional().describe('GitHub repo in owner/repo format (e.g., "CyberBrown/nexus"). For claude-code tasks only.'),
+      branch: z.string().optional().describe('Branch to commit to (default: "main"). For claude-code tasks only.'),
+      commit_message: z.string().optional().describe('Custom commit message. For claude-code tasks only.'),
       passphrase: passphraseSchema,
     },
     async (args): Promise<CallToolResult> => {

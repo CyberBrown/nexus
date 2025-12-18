@@ -226,6 +226,10 @@ export interface IdeaTask extends BaseEntity {
   error_message: string | null;
   retry_count: number;
   max_retries: number;
+  // Code execution fields (for sandbox-executor)
+  repo: string | null; // e.g., "CyberBrown/distributed-electrons"
+  branch: string | null; // e.g., "feature/my-feature"
+  commit_message: string | null;
 }
 
 // IdeaExecution - Workflow run tracking

@@ -22,6 +22,10 @@ interface IdeaTask {
   status: string;
   retry_count: number;
   max_retries: number;
+  // Code execution fields
+  repo: string | null;
+  branch: string | null;
+  commit_message: string | null;
 }
 
 // Idea context for execution
@@ -35,7 +39,44 @@ interface ExecutionResult {
   success: boolean;
   output: string;
   artifacts?: string[];
+  commit?: {
+    sha: string;
+    url: string;
+    branch: string;
+  };
 }
+
+// Sandbox executor response
+interface SandboxExecutorResponse {
+  success: boolean;
+  execution_id: string;
+  result?: {
+    output: string;
+    files?: Array<{ path: string; content: string; type?: string }>;
+    metadata?: { tokens_used?: number; execution_time_ms?: number };
+  };
+  commit?: {
+    success: boolean;
+    sha?: string;
+    url?: string;
+    branch?: string;
+    error?: string;
+  };
+  error?: string;
+  error_code?: string;
+}
+
+// Code task detection patterns
+const CODE_TASK_PATTERNS = [
+  /^\[implement\]/i,
+  /^\[deploy\]/i,
+  /^\[fix\]/i,
+  /^\[refactor\]/i,
+  /^\[test\]/i,
+  /^\[debug\]/i,
+  /^\[code\]/i,
+  /^\[CC\]/i,
+];
 
 export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorParams> {
   override async run(event: WorkflowEvent<TaskExecutorParams>, step: WorkflowStep) {
@@ -44,7 +85,8 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
     // Step 1: Load task from D1
     const task = await step.do('load-task', async () => {
       const row = await this.env.DB.prepare(`
-        SELECT id, idea_id, title, description, agent_type, estimated_effort, status, retry_count, max_retries
+        SELECT id, idea_id, title, description, agent_type, estimated_effort, status,
+               retry_count, max_retries, repo, branch, commit_message
         FROM idea_tasks
         WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
       `).bind(task_id, tenant_id).first<IdeaTask>();
@@ -102,7 +144,10 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
       `).bind(now, idea_id).run();
     });
 
-    // Step 4: Execute based on agent type
+    // Step 4: Determine if this is a code task
+    const isCodeTask = this.isCodeTask(task);
+
+    // Step 5: Execute based on task type
     let result: ExecutionResult;
 
     if (task.agent_type === 'human') {
@@ -129,6 +174,9 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
           output: 'Task requires human input. Marked for CEO review.',
         };
       });
+    } else if (isCodeTask) {
+      // Code task - route to sandbox-executor
+      result = await this.executeWithSandbox(step, task, ideaContext);
     } else if (task.agent_type === 'local') {
       // Local model execution (future - for now, fall back to Claude)
       result = await this.executeWithClaude(step, task, ideaContext);
@@ -300,6 +348,163 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
       }
     );
   }
+
+  /**
+   * Execute a code task via sandbox-executor
+   */
+  private async executeWithSandbox(
+    step: WorkflowStep,
+    task: IdeaTask,
+    ideaContext: IdeaContext
+  ): Promise<ExecutionResult> {
+    return step.do(
+      'execute-with-sandbox',
+      {
+        retries: {
+          limit: 2,
+          delay: '30 seconds',
+          backoff: 'exponential',
+        },
+        timeout: '10 minutes', // Code tasks can take longer
+      },
+      async () => {
+        const sandboxUrl = this.env.SANDBOX_EXECUTOR_URL;
+        if (!sandboxUrl) {
+          throw new Error('SANDBOX_EXECUTOR_URL not configured. Set SANDBOX_EXECUTOR_URL in wrangler.toml [vars]');
+        }
+
+        // Parse repo/branch from task fields or description
+        const repoInfo = this.extractRepoInfo(task);
+
+        // Build the task prompt
+        const taskPrompt = buildCodeTaskPrompt(task, ideaContext);
+
+        const requestBody: Record<string, unknown> = {
+          task: taskPrompt,
+          context: `Idea: ${ideaContext.title}\n${ideaContext.description || ''}`,
+          options: {
+            max_tokens: 8192,
+            temperature: 0.3,
+          },
+        };
+
+        // Add repo info if available
+        if (repoInfo.repo) {
+          requestBody.repo = repoInfo.repo;
+          requestBody.branch = repoInfo.branch || 'main';
+          if (task.commit_message) {
+            requestBody.commitMessage = task.commit_message;
+          } else {
+            requestBody.commitMessage = `${task.title.slice(0, 50)}`;
+          }
+        }
+
+        console.log(`Calling sandbox-executor with repo: ${repoInfo.repo}, branch: ${repoInfo.branch}`);
+
+        const response = await fetch(`${sandboxUrl}/execute`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody),
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          throw new Error(`Sandbox executor error: ${response.status} - ${error}`);
+        }
+
+        const data = await response.json() as SandboxExecutorResponse;
+
+        if (!data.success) {
+          throw new Error(data.error || 'Sandbox executor returned failure');
+        }
+
+        // Build output summary
+        let output = data.result?.output || 'Task completed';
+        if (data.result?.files && data.result.files.length > 0) {
+          output += `\n\nGenerated ${data.result.files.length} file(s):\n`;
+          output += data.result.files.map(f => `- ${f.path}`).join('\n');
+        }
+        if (data.commit?.success && data.commit.sha) {
+          output += `\n\nCommitted to ${data.commit.branch}: ${data.commit.sha}`;
+          output += `\nURL: ${data.commit.url}`;
+        }
+
+        return {
+          success: true,
+          output,
+          commit: data.commit?.success ? {
+            sha: data.commit.sha!,
+            url: data.commit.url!,
+            branch: data.commit.branch!,
+          } : undefined,
+        };
+      }
+    );
+  }
+
+  /**
+   * Check if a task is a code task based on title patterns or repo field
+   */
+  private isCodeTask(task: IdeaTask): boolean {
+    // If repo field is set, it's definitely a code task
+    if (task.repo) {
+      return true;
+    }
+
+    // Check title patterns
+    for (const pattern of CODE_TASK_PATTERNS) {
+      if (pattern.test(task.title)) {
+        return true;
+      }
+    }
+
+    // Check description for repo info
+    if (task.description) {
+      const repoPattern = /(?:repo(?:sitory)?|github)[:\s]+([a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+)/i;
+      if (repoPattern.test(task.description)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Extract repo and branch info from task fields and description
+   */
+  private extractRepoInfo(task: IdeaTask): { repo: string | null; branch: string | null } {
+    // First check explicit fields
+    if (task.repo) {
+      return {
+        repo: task.repo,
+        branch: task.branch || 'main',
+      };
+    }
+
+    // Parse from description
+    if (task.description) {
+      // Pattern: repo: owner/repo or Repository: owner/repo
+      const repoPattern = /(?:repo(?:sitory)?)[:\s]+([a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+)/i;
+      const repoMatch = task.description.match(repoPattern);
+
+      // Pattern: branch: branch-name or Branch: branch-name
+      const branchPattern = /(?:branch)[:\s]+([a-zA-Z0-9_\-\/]+)/i;
+      const branchMatch = task.description.match(branchPattern);
+
+      // Pattern: GitHub URL
+      const githubUrlPattern = /github\.com\/([a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+)/i;
+      const githubMatch = task.description.match(githubUrlPattern);
+
+      const repo = repoMatch?.[1] || githubMatch?.[1] || null;
+      const branch = branchMatch?.[1] || null;
+
+      return { repo, branch };
+    }
+
+    return { repo: null, branch: null };
+  }
 }
 
 const EXECUTION_SYSTEM_PROMPT = `You are an AI assistant executing a specific task as part of a larger idea/project.
@@ -329,5 +534,32 @@ function buildExecutionPrompt(task: IdeaTask, ideaContext: IdeaContext): string 
   }
   prompt += `\nEstimated effort: ${task.estimated_effort}\n`;
   prompt += `\nPlease execute this task and provide your output.`;
+  return prompt;
+}
+
+function buildCodeTaskPrompt(task: IdeaTask, ideaContext: IdeaContext): string {
+  // Strip the [implement], [fix], etc. prefix from title for cleaner prompts
+  let cleanTitle = task.title;
+  for (const pattern of CODE_TASK_PATTERNS) {
+    cleanTitle = cleanTitle.replace(pattern, '').trim();
+  }
+
+  let prompt = `## Task: ${cleanTitle}\n\n`;
+
+  if (task.description) {
+    prompt += `## Description\n${task.description}\n\n`;
+  }
+
+  prompt += `## Context\n`;
+  prompt += `This task is part of: "${ideaContext.title}"\n`;
+  if (ideaContext.description) {
+    prompt += `${ideaContext.description}\n`;
+  }
+
+  prompt += `\n## Instructions\n`;
+  prompt += `Complete this coding task. Generate complete, production-ready code.\n`;
+  prompt += `Use the existing codebase patterns and structure.\n`;
+  prompt += `Include all necessary files with their full content.`;
+
   return prompt;
 }

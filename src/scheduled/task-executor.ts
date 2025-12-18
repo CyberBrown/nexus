@@ -649,7 +649,8 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
 export async function executeQueueEntry(
   env: Env,
   queueId: string,
-  tenantId: string
+  tenantId: string,
+  options?: { repo?: string; branch?: string; commitMessage?: string }
 ): Promise<{ success: boolean; result?: string; error?: string }> {
   const executorId = `nexus-manual-${Date.now()}`;
 
