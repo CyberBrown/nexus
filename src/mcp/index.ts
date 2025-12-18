@@ -72,7 +72,7 @@ const WRITE_TOOLS = new Set([
   'nexus_dispatch_task',
   'nexus_dispatch_ready',
   'nexus_execute_task',
-  'nexus_execute_code_task',
+  'nexus_run_executor',
 ]);
 
 /**
@@ -3804,7 +3804,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_execute_task
   server.tool(
     'nexus_execute_task',
-    'Execute a queued task immediately via sandbox-executor (claude-code) or DE (claude-ai/de-agent). Use this for immediate task execution instead of waiting for the cron. For claude-code tasks, you can specify repo/branch for GitHub integration.',
+    'Execute a queued task immediately via sandbox-executor. Routes claude-ai tasks to /execute/sdk (fast AI path) and claude-code tasks to /execute (container path). Also supports de-agent tasks via DE service. Use this for immediate task execution instead of waiting for the 15-minute cron.',
     {
       queue_id: z.string().uuid().describe('Queue entry ID to execute (from nexus_check_queue)'),
       repo: z.string().optional().describe('GitHub repo in owner/repo format (e.g., "CyberBrown/nexus"). For claude-code tasks only.'),
@@ -3820,12 +3820,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const queueId = args.queue_id;
 
-        // Execute the task with optional repo/branch options
-        const options = args.repo || args.branch || args.commit_message
-          ? { repo: args.repo, branch: args.branch, commitMessage: args.commit_message }
-          : undefined;
-
-        const result = await executeQueueEntry(env, queueId, tenantId, options);
+        // Execute the task via sandbox-executor or DE
+        const result = await executeQueueEntry(env, queueId, tenantId);
 
         if (result.success) {
           return {
@@ -3861,257 +3857,45 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_execute_code_task
+  // Tool: nexus_run_executor
   server.tool(
-    'nexus_execute_code_task',
-    'Execute a code task via sandbox-executor (supports GitHub repo integration). Use this for [implement], [fix], [deploy] etc. tasks that need to generate code and optionally commit to a repo. Works with both regular tasks and idea_tasks.',
+    'nexus_run_executor',
+    'Run the task executor immediately to process all queued tasks. This is the same as what the 15-minute cron does, but triggered manually. Processes claude-ai tasks via /execute/sdk, claude-code tasks via /execute container, and de-agent tasks via DE service.',
     {
-      task_id: z.string().uuid().describe('Task ID to execute (from tasks or idea_tasks table)'),
-      repo: z.string().optional().describe('GitHub repo in owner/repo format (e.g., "CyberBrown/distributed-electrons"). Overrides task field.'),
-      branch: z.string().optional().describe('Branch to commit to (default: "main"). Will be created if it does not exist.'),
-      commit_message: z.string().optional().describe('Custom commit message (auto-generated if not provided)'),
-      skip_commit: z.boolean().optional().describe('If true, generate code but do not commit to repo'),
+      executor_type: z.enum(['claude-ai', 'claude-code', 'de-agent', 'all']).optional()
+        .describe('Filter to only execute tasks of this type. Default: all'),
+      limit: z.number().min(1).max(20).optional()
+        .describe('Maximum number of tasks to execute (default: 10)'),
       passphrase: passphraseSchema,
     },
     async (args): Promise<CallToolResult> => {
       // Validate passphrase for write operation
-      const authError = validatePassphrase('nexus_execute_code_task', args, env.WRITE_PASSPHRASE);
+      const authError = validatePassphrase('nexus_run_executor', args, env.WRITE_PASSPHRASE);
       if (authError) return authError;
 
       try {
-        const sandboxUrl = env.SANDBOX_EXECUTOR_URL;
-        if (!sandboxUrl) {
-          return {
-            content: [{ type: 'text', text: 'Error: SANDBOX_EXECUTOR_URL not configured in environment' }],
-            isError: true
-          };
-        }
+        // Import executeTasks
+        const { executeTasks } = await import('../scheduled/task-executor.ts');
 
-        const key = await getEncryptionKey(env.KV, tenantId);
-        let decryptedTitle: string;
-        let decryptedDescription: string | null = null;
-        let taskSource: 'tasks' | 'idea_tasks';
-        let ideaContext: { title: string; description: string | null } | null = null;
-
-        // Try idea_tasks first (has repo/branch fields)
-        const ideaTask = await env.DB.prepare(`
-          SELECT id, idea_id, title, description, repo, branch, commit_message, status
-          FROM idea_tasks
-          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
-        `).bind(args.task_id, tenantId).first<{
-          id: string;
-          idea_id: string;
-          title: string;
-          description: string | null;
-          repo: string | null;
-          branch: string | null;
-          commit_message: string | null;
-          status: string;
-        }>();
-
-        // If not found in idea_tasks, try regular tasks table
-        const regularTask = ideaTask ? null : await env.DB.prepare(`
-          SELECT id, title, description, status, project_id
-          FROM tasks
-          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
-        `).bind(args.task_id, tenantId).first<{
-          id: string;
-          title: string;
-          description: string | null;
-          status: string;
-          project_id: string | null;
-        }>();
-
-        if (!ideaTask && !regularTask) {
-          return {
-            content: [{ type: 'text', text: `Error: Task not found in tasks or idea_tasks: ${args.task_id}` }],
-            isError: true
-          };
-        }
-
-        if (ideaTask) {
-          taskSource = 'idea_tasks';
-          decryptedTitle = await decryptField(ideaTask.title, key);
-          decryptedDescription = ideaTask.description ? await decryptField(ideaTask.description, key) : null;
-
-          // Load idea context for idea_tasks
-          const idea = await env.DB.prepare(`
-            SELECT title, description FROM ideas WHERE id = ? AND tenant_id = ?
-          `).bind(ideaTask.idea_id, tenantId).first<{ title: string; description: string | null }>();
-          if (idea) {
-            ideaContext = {
-              title: await decryptField(idea.title, key),
-              description: idea.description ? await decryptField(idea.description, key) : null
-            };
-          }
-        } else {
-          taskSource = 'tasks';
-          decryptedTitle = await decryptField(regularTask!.title, key);
-          decryptedDescription = regularTask!.description ? await decryptField(regularTask!.description, key) : null;
-
-          // Load project context for regular tasks if available
-          if (regularTask!.project_id) {
-            const project = await env.DB.prepare(`
-              SELECT name, description FROM projects WHERE id = ? AND tenant_id = ?
-            `).bind(regularTask!.project_id, tenantId).first<{ name: string; description: string | null }>();
-            if (project) {
-              ideaContext = {
-                title: await decryptField(project.name, key),
-                description: project.description ? await decryptField(project.description, key) : null
-              };
-            }
-          }
-        }
-
-        // Determine repo info (args override task fields, which override description parsing)
-        let repo = args.repo || (ideaTask?.repo) || null;
-        let branch = args.branch || (ideaTask?.branch) || 'main';
-        let commitMessage = args.commit_message || (ideaTask?.commit_message) || null;
-
-        // Parse from description if not set
-        if (!repo && decryptedDescription) {
-          const repoPattern = /(?:repo(?:sitory)?)[:\s]+([a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+)/i;
-          const repoMatch = decryptedDescription.match(repoPattern);
-          const githubUrlPattern = /github\.com\/([a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+)/i;
-          const githubMatch = decryptedDescription.match(githubUrlPattern);
-          repo = repoMatch?.[1] || githubMatch?.[1] || null;
-
-          const branchPattern = /(?:branch)[:\s]+([a-zA-Z0-9_\-\/]+)/i;
-          const branchMatch = decryptedDescription.match(branchPattern);
-          if (branchMatch?.[1]) {
-            branch = branchMatch[1];
-          }
-        }
-
-        // Build the task prompt
-        const contextPart = ideaContext
-          ? `\n\n## Context\nThis task is part of: "${ideaContext.title}"\n${ideaContext.description || ''}`
-          : '';
-        const taskPrompt = `## Task: ${decryptedTitle}\n\n${decryptedDescription || ''}${contextPart}`;
-
-        // Build request body
-        const requestBody: Record<string, unknown> = {
-          task: taskPrompt,
-          context: ideaContext ? `Context: ${ideaContext.title}` : 'Direct task execution',
-          options: {
-            max_tokens: 8192,
-            temperature: 0.3,
-          },
-        };
-
-        if (repo && !args.skip_commit) {
-          requestBody.repo = repo;
-          requestBody.branch = branch;
-          requestBody.commitMessage = commitMessage || decryptedTitle.slice(0, 50);
-        } else if (args.skip_commit) {
-          requestBody.skipCommit = true;
-        }
-
-        // Update task status to in_progress (update correct table)
-        const now = new Date().toISOString();
-        if (taskSource === 'idea_tasks') {
-          await env.DB.prepare(`
-            UPDATE idea_tasks SET status = 'in_progress', started_at = ?, updated_at = ? WHERE id = ?
-          `).bind(now, now, args.task_id).run();
-        } else {
-          await env.DB.prepare(`
-            UPDATE tasks SET status = 'next', updated_at = ? WHERE id = ?
-          `).bind(now, args.task_id).run();
-        }
-
-        // Call sandbox-executor
-        const response = await fetch(`${sandboxUrl}/execute`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody),
-        });
-
-        const data = await response.json() as {
-          success: boolean;
-          execution_id?: string;
-          result?: {
-            output: string;
-            files?: Array<{ path: string; content: string }>;
-            metadata?: { tokens_used?: number; execution_time_ms?: number };
-          };
-          commit?: {
-            success: boolean;
-            sha?: string;
-            url?: string;
-            branch?: string;
-            error?: string;
-          };
-          error?: string;
-        };
-
-        if (!response.ok || !data.success) {
-          // Mark task as failed (update correct table)
-          if (taskSource === 'idea_tasks') {
-            await env.DB.prepare(`
-              UPDATE idea_tasks SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?
-            `).bind(data.error || `HTTP ${response.status}`, now, args.task_id).run();
-          }
-          // Regular tasks don't have error_message field, leave as-is
-
-          return {
-            content: [{ type: 'text', text: `Error executing code task: ${data.error || response.statusText}` }],
-            isError: true
-          };
-        }
-
-        // Mark task as completed and store result
-        const resultJson = JSON.stringify({
-          output: data.result?.output?.slice(0, 2000),
-          files: data.result?.files?.map(f => f.path),
-          commit: data.commit,
-        });
-
-        if (taskSource === 'idea_tasks') {
-          const encryptedResult = await encryptField(resultJson, key);
-          await env.DB.prepare(`
-            UPDATE idea_tasks SET status = 'completed', result = ?, completed_at = ?, updated_at = ? WHERE id = ?
-          `).bind(encryptedResult, now, now, args.task_id).run();
-        } else {
-          // For regular tasks, mark as completed
-          await env.DB.prepare(`
-            UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?
-          `).bind(now, now, args.task_id).run();
-        }
-
-        // Build response
-        let responseText = `## Code Task Executed Successfully\n\n`;
-        responseText += `**Task:** ${decryptedTitle}\n`;
-        responseText += `**Execution ID:** ${data.execution_id}\n\n`;
-
-        if (data.result?.files && data.result.files.length > 0) {
-          responseText += `### Generated Files (${data.result.files.length}):\n`;
-          responseText += data.result.files.map(f => `- ${f.path}`).join('\n');
-          responseText += '\n\n';
-        }
-
-        if (data.commit?.success) {
-          responseText += `### Committed to GitHub\n`;
-          responseText += `- **Branch:** ${data.commit.branch}\n`;
-          responseText += `- **SHA:** ${data.commit.sha}\n`;
-          responseText += `- **URL:** ${data.commit.url}\n`;
-        } else if (data.commit?.error) {
-          responseText += `### Commit Failed\n`;
-          responseText += `Error: ${data.commit.error}\n`;
-        } else if (!repo) {
-          responseText += `### No Commit\n`;
-          responseText += `No repo specified - code generated but not committed.\n`;
-        }
-
-        if (data.result?.metadata) {
-          responseText += `\n### Metadata\n`;
-          responseText += `- Tokens used: ${data.result.metadata.tokens_used}\n`;
-          responseText += `- Execution time: ${data.result.metadata.execution_time_ms}ms\n`;
-        }
+        // Run the executor
+        const stats = await executeTasks(env);
 
         return {
-          content: [{ type: 'text', text: responseText }]
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              message: 'Task executor run completed',
+              stats: {
+                processed: stats.processed,
+                completed: stats.completed,
+                failed: stats.failed,
+                skipped: stats.skipped,
+                errors: stats.errors.length > 0 ? stats.errors : undefined,
+              },
+            }, null, 2)
+          }]
         };
-
       } catch (error: any) {
         return {
           content: [{ type: 'text', text: `Error: ${error.message}` }],

@@ -30,11 +30,12 @@ export interface Env {
   IDEA_EXECUTOR: DurableObjectNamespace;
   // Service Bindings
   DE: Fetcher; // DE (distributed-electrons) service for LLM operations
-  SANDBOX_EXECUTOR?: Fetcher; // Sandbox executor service for code tasks
+  SANDBOX_EXECUTOR?: Fetcher; // Sandbox executor service for task execution
   // DE text-gen URL (for workflows that can't use service bindings)
   TEXT_GEN_URL?: string;
-  // Sandbox executor URL (for code generation/deployment tasks)
+  // Sandbox executor URL for task execution
   SANDBOX_EXECUTOR_URL?: string;
+  SANDBOX_AUTH_TOKEN?: string;
   // Fallback Anthropic API key (for environments without DE)
   ANTHROPIC_API_KEY?: string;
   // Write passphrase for MCP destructive operations

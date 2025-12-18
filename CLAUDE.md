@@ -368,13 +368,18 @@ curl http://localhost:8787/api/tasks
 
 ## Deployment
 
+**Worker name:** `nexus-mcp` (configured in wrangler.toml)
+**MCP URL:** `https://nexus-mcp.solamp.workers.dev/mcp`
+
 ```bash
-# Deploy to Cloudflare
-npm run deploy
+# Deploy to Cloudflare (deploys to nexus-mcp worker)
+bun run deploy
 
 # Deploy schema to remote D1
-npm run db:migrate:remote
+bun run db:migrate:remote
 ```
+
+**Important:** Always use `bun run deploy` which deploys to the `nexus-mcp` worker that Claude.ai connects to.
 
 ## Important Notes
 

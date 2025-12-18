@@ -1,9 +1,15 @@
-// Task Executor - Execute queued tasks via DE (Distributed Electrons)
+// Task Executor - Execute queued tasks via sandbox-executor
 // Runs after dispatchTasks() to process queued work items
+//
+// Routes tasks to sandbox-executor service:
+// - claude-ai tasks -> /execute/sdk (fast AI path)
+// - claude-code tasks -> /execute (container path)
+// - de-agent tasks -> DE service binding (legacy)
 
 import type { Env, Task } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
 import { DEClient, createDEClient } from '../lib/de-client.ts';
+import { SandboxClient, createSandboxClient } from '../lib/sandbox-client.ts';
 import type { ExecutorType } from './task-dispatcher.ts';
 
 // ========================================
@@ -240,9 +246,9 @@ Please complete this task now:`;
 }
 
 /**
- * Execute a single task via DE
+ * Execute a single task via DE (legacy path for de-agent tasks)
  */
-async function executeTask(
+async function executeTaskViaDE(
   deClient: DEClient,
   entry: QueueEntry,
   task: TaskRow,
@@ -293,14 +299,152 @@ async function executeTask(
   }
 }
 
+/**
+ * Execute a claude-ai task via sandbox-executor SDK path
+ */
+async function executeTaskViaSandboxSdk(
+  sandboxClient: SandboxClient,
+  entry: QueueEntry,
+  task: TaskRow,
+  encryptionKey: CryptoKey | null
+): Promise<{ success: boolean; result?: string; error?: string }> {
+  try {
+    // Decrypt task fields
+    const title = await safeDecrypt(task.title, encryptionKey);
+    const description = await safeDecrypt(task.description, encryptionKey);
+
+    // Parse context if available
+    let context: Record<string, unknown> | null = null;
+    if (entry.context) {
+      try {
+        context = JSON.parse(entry.context);
+      } catch {
+        const decryptedContext = await safeDecrypt(entry.context, encryptionKey);
+        if (decryptedContext) {
+          try {
+            context = JSON.parse(decryptedContext);
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+
+    // Build prompt for SDK execution
+    const prompt = buildTaskPrompt(title, description, context);
+
+    // Execute via sandbox SDK path
+    const response = await sandboxClient.executeQuick(prompt, {
+      max_tokens: 2000,
+      temperature: 0.7,
+    });
+
+    if (response.success && response.result) {
+      return {
+        success: true,
+        result: response.result,
+      };
+    } else {
+      return {
+        success: false,
+        error: response.error || 'SDK execution returned no result',
+      };
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Execute a claude-code task via sandbox-executor container path
+ */
+async function executeTaskViaSandboxContainer(
+  sandboxClient: SandboxClient,
+  entry: QueueEntry,
+  task: TaskRow,
+  encryptionKey: CryptoKey | null
+): Promise<{ success: boolean; result?: string; error?: string }> {
+  try {
+    // Decrypt task fields
+    const title = await safeDecrypt(task.title, encryptionKey);
+    const description = await safeDecrypt(task.description, encryptionKey);
+
+    // Parse context for repo info
+    let context: Record<string, unknown> | null = null;
+    if (entry.context) {
+      try {
+        context = JSON.parse(entry.context);
+      } catch {
+        const decryptedContext = await safeDecrypt(entry.context, encryptionKey);
+        if (decryptedContext) {
+          try {
+            context = JSON.parse(decryptedContext);
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+
+    // Build task description for container execution
+    let taskDescription = `## Task: ${title}`;
+    if (description) {
+      taskDescription += `\n\n## Description\n${description}`;
+    }
+    if (context) {
+      if (context.domain) {
+        taskDescription += `\n\n## Domain: ${context.domain}`;
+      }
+      if (context.source_reference) {
+        taskDescription += `\n## Reference: ${context.source_reference}`;
+      }
+    }
+
+    // Extract repo from context if available
+    const repo = context?.repo as string | undefined;
+    const branch = context?.branch as string | undefined;
+
+    // Execute via sandbox container path
+    const response = await sandboxClient.executeCode(taskDescription, {
+      repo,
+      branch,
+      timeout_seconds: 600, // 10 minute timeout for code tasks
+    });
+
+    if (response.success) {
+      return {
+        success: true,
+        result: response.logs || 'Task completed successfully',
+      };
+    } else {
+      return {
+        success: false,
+        error: response.error || `Container execution failed (exit code: ${response.exit_code})`,
+      };
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 // ========================================
 // Main Executor Function
 // ========================================
 
 /**
- * Execute queued tasks via DE
- * Only processes tasks routed to 'de-agent' or 'claude-ai' executors
- * (claude-code and human tasks require external executors)
+ * Execute queued tasks via sandbox-executor or DE
+ *
+ * Routes tasks based on executor_type:
+ * - claude-ai -> sandbox-executor /execute/sdk (fast AI path)
+ * - claude-code -> sandbox-executor /execute (container path)
+ * - de-agent -> DE service binding (legacy)
+ * - human -> skipped (requires human action)
  */
 export async function executeTasks(env: Env): Promise<ExecutionStats> {
   console.log('Task executor starting...');
@@ -313,18 +457,36 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
     errors: [],
   };
 
-  // Check if DE is available
+  // Check available execution services
+  const sandboxClient = createSandboxClient(env);
   const deClient = createDEClient(env);
-  if (!deClient) {
-    console.log('DE service not available, skipping task execution');
-    return stats;
+
+  // Check sandbox availability
+  let sandboxAvailable = false;
+  if (sandboxClient) {
+    sandboxAvailable = await sandboxClient.isAvailable();
+    if (sandboxAvailable) {
+      console.log('Sandbox executor available');
+    } else {
+      console.warn('Sandbox executor configured but not healthy');
+    }
+  } else {
+    console.log('Sandbox executor not configured (SANDBOX_EXECUTOR_URL not set)');
   }
 
-  // Verify DE is healthy
-  const healthy = await deClient.healthCheck();
-  if (!healthy) {
-    console.warn('DE service health check failed, skipping task execution');
-    stats.errors.push('DE service health check failed');
+  // Check DE availability (for legacy de-agent tasks)
+  let deAvailable = false;
+  if (deClient) {
+    deAvailable = await deClient.healthCheck();
+    if (deAvailable) {
+      console.log('DE service available (for de-agent tasks)');
+    }
+  }
+
+  // If no execution services available, skip
+  if (!sandboxAvailable && !deAvailable) {
+    console.log('No execution services available, skipping task execution');
+    stats.errors.push('No execution services available');
     return stats;
   }
 
@@ -341,14 +503,28 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
       return stats;
     }
 
+    // Build executor type filter based on available services
+    const executorTypes: string[] = [];
+    if (sandboxAvailable) {
+      executorTypes.push('claude-ai', 'claude-code');
+    }
+    if (deAvailable) {
+      executorTypes.push('de-agent');
+    }
+
+    if (executorTypes.length === 0) {
+      console.log('No executor types available');
+      return stats;
+    }
+
+    const executorTypePlaceholders = executorTypes.map(() => '?').join(', ');
+
     // Process each tenant
     for (const tenant of tenants.results) {
       const tenantId = tenant.id;
 
       try {
-        // Get queued tasks that can be executed by DE
-        // Only process 'de-agent' and 'claude-ai' tasks
-        // (claude-code requires Claude Code CLI, human requires human action)
+        // Get queued tasks that can be executed
         const entries = await env.DB.prepare(`
           SELECT eq.*, t.title, t.description, t.project_id, t.domain,
                  t.due_date, t.energy_required, t.source_type, t.source_reference
@@ -356,10 +532,10 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
           JOIN tasks t ON eq.task_id = t.id
           WHERE eq.tenant_id = ?
             AND eq.status = 'queued'
-            AND eq.executor_type IN ('de-agent', 'claude-ai')
+            AND eq.executor_type IN (${executorTypePlaceholders})
           ORDER BY eq.priority DESC, eq.queued_at ASC
           LIMIT 10
-        `).bind(tenantId).all<QueueEntry & TaskRow>();
+        `).bind(tenantId, ...executorTypes).all<QueueEntry & TaskRow>();
 
         if (!entries.results || entries.results.length === 0) {
           continue;
@@ -385,8 +561,37 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
 
             console.log(`Executing task: ${entry.task_id} (${entry.executor_type})`);
 
-            // Execute the task
-            const result = await executeTask(deClient, entry, entry, encryptionKey);
+            // Route to appropriate executor
+            let result: { success: boolean; result?: string; error?: string };
+
+            switch (entry.executor_type) {
+              case 'claude-ai':
+                if (!sandboxClient) {
+                  result = { success: false, error: 'Sandbox executor not available for claude-ai task' };
+                } else {
+                  result = await executeTaskViaSandboxSdk(sandboxClient, entry, entry, encryptionKey);
+                }
+                break;
+
+              case 'claude-code':
+                if (!sandboxClient) {
+                  result = { success: false, error: 'Sandbox executor not available for claude-code task' };
+                } else {
+                  result = await executeTaskViaSandboxContainer(sandboxClient, entry, entry, encryptionKey);
+                }
+                break;
+
+              case 'de-agent':
+                if (!deClient) {
+                  result = { success: false, error: 'DE service not available for de-agent task' };
+                } else {
+                  result = await executeTaskViaDE(deClient, entry, entry, encryptionKey);
+                }
+                break;
+
+              default:
+                result = { success: false, error: `Unknown executor type: ${entry.executor_type}` };
+            }
 
             if (result.success && result.result) {
               await completeEntry(env.DB, entry, result.result);
@@ -435,6 +640,11 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
 /**
  * Execute a single task by queue entry ID
  * Used for manual triggering via MCP tool
+ *
+ * Routes to appropriate executor based on executor_type:
+ * - claude-ai -> sandbox-executor /execute/sdk
+ * - claude-code -> sandbox-executor /execute
+ * - de-agent -> DE service binding
  */
 export async function executeQueueEntry(
   env: Env,
@@ -457,12 +667,46 @@ export async function executeQueueEntry(
     return { success: false, error: 'Queue entry not found' };
   }
 
+  // Validate executor type
+  if (!['de-agent', 'claude-ai', 'claude-code'].includes(entry.executor_type)) {
+    return {
+      success: false,
+      error: `Cannot execute ${entry.executor_type} tasks automatically. Only de-agent, claude-ai, and claude-code tasks are supported.`,
+    };
+  }
+
   // Check status
   if (entry.status !== 'queued' && entry.status !== 'claimed') {
     return {
       success: false,
       error: `Queue entry has status '${entry.status}', expected 'queued' or 'claimed'`,
     };
+  }
+
+  // Initialize clients based on executor type
+  const sandboxClient = createSandboxClient(env);
+  const deClient = createDEClient(env);
+
+  // Check if the required executor is available
+  if ((entry.executor_type === 'claude-ai' || entry.executor_type === 'claude-code') && !sandboxClient) {
+    return { success: false, error: 'Sandbox executor not configured (SANDBOX_EXECUTOR_URL not set)' };
+  }
+
+  if (entry.executor_type === 'de-agent' && !deClient) {
+    return { success: false, error: 'DE service not available' };
+  }
+
+  // Check service health
+  if (entry.executor_type === 'claude-ai' || entry.executor_type === 'claude-code') {
+    const available = await sandboxClient!.isAvailable();
+    if (!available) {
+      return { success: false, error: 'Sandbox executor not healthy' };
+    }
+  } else if (entry.executor_type === 'de-agent') {
+    const healthy = await deClient!.healthCheck();
+    if (!healthy) {
+      return { success: false, error: 'DE service health check failed' };
+    }
   }
 
   // Claim if not already claimed
@@ -476,183 +720,32 @@ export async function executeQueueEntry(
   // Get encryption key
   const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
-  // Route based on executor type
-  if (entry.executor_type === 'claude-code') {
-    // Execute via sandbox-executor
-    return executeCodeTask(env, entry, entry, encryptionKey, options);
-  } else if (['de-agent', 'claude-ai'].includes(entry.executor_type)) {
-    // Execute via DE
-    const deClient = createDEClient(env);
-    if (!deClient) {
-      await failEntry(env.DB, entry, 'DE service not available');
-      return { success: false, error: 'DE service not available' };
-    }
+  // Route to appropriate executor
+  let result: { success: boolean; result?: string; error?: string };
 
-    const healthy = await deClient.healthCheck();
-    if (!healthy) {
-      await failEntry(env.DB, entry, 'DE service health check failed');
-      return { success: false, error: 'DE service health check failed' };
-    }
+  switch (entry.executor_type) {
+    case 'claude-ai':
+      result = await executeTaskViaSandboxSdk(sandboxClient!, entry, entry, encryptionKey);
+      break;
 
-    const result = await executeTask(deClient, entry, entry, encryptionKey);
+    case 'claude-code':
+      result = await executeTaskViaSandboxContainer(sandboxClient!, entry, entry, encryptionKey);
+      break;
 
-    if (result.success && result.result) {
-      await completeEntry(env.DB, entry, result.result);
-      return { success: true, result: result.result };
-    } else {
-      const error = result.error || 'Unknown execution error';
-      await failEntry(env.DB, entry, error);
-      return { success: false, error };
-    }
+    case 'de-agent':
+      result = await executeTaskViaDE(deClient!, entry, entry, encryptionKey);
+      break;
+
+    default:
+      result = { success: false, error: `Unknown executor type: ${entry.executor_type}` };
+  }
+
+  if (result.success && result.result) {
+    await completeEntry(env.DB, entry, result.result);
+    return { success: true, result: result.result };
   } else {
-    // Human tasks cannot be auto-executed
-    return {
-      success: false,
-      error: `Cannot auto-execute ${entry.executor_type} tasks. Human tasks require manual action.`,
-    };
-  }
-}
-
-/**
- * Execute a code task via sandbox-executor
- * Uses service binding if available, falls back to URL.
- * For long-running tasks, marks as "dispatched" and returns immediately.
- */
-async function executeCodeTask(
-  env: Env,
-  entry: QueueEntry,
-  task: TaskRow,
-  encryptionKey: CryptoKey | null,
-  options?: { repo?: string; branch?: string; commitMessage?: string; waitForResult?: boolean }
-): Promise<{ success: boolean; result?: string; error?: string; dispatched?: boolean }> {
-  // Check for service binding first, then URL
-  const useSandboxBinding = !!env.SANDBOX_EXECUTOR;
-  const sandboxUrl = env.SANDBOX_EXECUTOR_URL;
-
-  if (!useSandboxBinding && !sandboxUrl) {
-    await failEntry(env.DB, entry, 'SANDBOX_EXECUTOR not configured (no binding or URL)');
-    return { success: false, error: 'SANDBOX_EXECUTOR not configured' };
-  }
-
-  try {
-    // Decrypt task fields
-    const title = await safeDecrypt(task.title, encryptionKey);
-    const description = await safeDecrypt(task.description, encryptionKey);
-
-    // Parse context for repo/branch info
-    let context: Record<string, unknown> | null = null;
-    if (entry.context) {
-      try {
-        context = JSON.parse(entry.context);
-      } catch {
-        const decryptedContext = await safeDecrypt(entry.context, encryptionKey);
-        if (decryptedContext) {
-          try {
-            context = JSON.parse(decryptedContext);
-          } catch {
-            // Ignore parse errors
-          }
-        }
-      }
-    }
-
-    // Determine repo/branch (options override context)
-    const repo = options?.repo || (context?.repo as string) || null;
-    const branch = options?.branch || (context?.branch as string) || 'main';
-    const commitMessage = options?.commitMessage || (context?.commitMessage as string) || title.slice(0, 50);
-
-    // Build task prompt
-    const taskPrompt = `## Task: ${title}\n\n${description || ''}\n\n## Instructions\nComplete this code task. Generate the necessary code changes.`;
-
-    // Build request body - include callback info for async completion
-    const requestBody: Record<string, unknown> = {
-      task: taskPrompt,
-      context: context?.project ? `Project: ${context.project}` : 'Direct task execution',
-      options: {
-        max_tokens: 8192,
-        temperature: 0.3,
-      },
-      // Include metadata for tracking
-      metadata: {
-        queue_entry_id: entry.id,
-        task_id: entry.task_id,
-        tenant_id: entry.tenant_id,
-      },
-    };
-
-    if (repo) {
-      requestBody.repo = repo;
-      requestBody.branch = branch;
-      requestBody.commitMessage = commitMessage;
-    }
-
-    console.log(`Executing code task via sandbox-executor: ${title}, repo: ${repo || 'none'}, branch: ${branch}`);
-
-    // Mark entry as "dispatched" before calling sandbox-executor
-    const now = new Date().toISOString();
-    await env.DB.prepare(`
-      UPDATE execution_queue SET status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?
-    `).bind(now, now, entry.id).run();
-
-    // Call sandbox-executor using service binding or URL
-    let response: Response;
-    if (useSandboxBinding) {
-      response = await env.SANDBOX_EXECUTOR!.fetch('https://sandbox-executor/execute', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody),
-      });
-    } else {
-      response = await fetch(`${sandboxUrl}/execute`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody),
-      });
-    }
-
-    const data = await response.json() as {
-      success: boolean;
-      execution_id?: string;
-      result?: {
-        output: string;
-        files?: Array<{ path: string; content: string }>;
-      };
-      commit?: {
-        success: boolean;
-        sha?: string;
-        url?: string;
-        branch?: string;
-        error?: string;
-      };
-      error?: string;
-    };
-
-    if (!response.ok || !data.success) {
-      const error = data.error || `HTTP ${response.status}`;
-      await failEntry(env.DB, entry, error);
-      return { success: false, error };
-    }
-
-    // Build result summary
-    let resultText = data.result?.output || 'Task completed';
-    if (data.result?.files && data.result.files.length > 0) {
-      resultText += `\n\nGenerated ${data.result.files.length} file(s): ${data.result.files.map(f => f.path).join(', ')}`;
-    }
-    if (data.commit?.success) {
-      resultText += `\n\nCommitted to ${data.commit.branch}: ${data.commit.sha}`;
-      if (data.commit.url) {
-        resultText += `\nURL: ${data.commit.url}`;
-      }
-    } else if (data.commit?.error) {
-      resultText += `\n\nCommit failed: ${data.commit.error}`;
-    }
-
-    await completeEntry(env.DB, entry, resultText);
-    return { success: true, result: resultText };
-
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    await failEntry(env.DB, entry, errorMsg);
-    return { success: false, error: errorMsg };
+    const error = result.error || 'Unknown execution error';
+    await failEntry(env.DB, entry, error);
+    return { success: false, error };
   }
 }
