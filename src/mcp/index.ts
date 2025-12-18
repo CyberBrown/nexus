@@ -72,6 +72,7 @@ const WRITE_TOOLS = new Set([
   'nexus_dispatch_task',
   'nexus_dispatch_ready',
   'nexus_execute_task',
+  'nexus_run_executor',
 ]);
 
 /**
@@ -3803,7 +3804,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_execute_task
   server.tool(
     'nexus_execute_task',
-    'Execute a queued task immediately via DE (Distributed Electrons). Only works for tasks routed to de-agent or claude-ai executors. Use this for immediate task execution instead of waiting for the cron.',
+    'Execute a queued task immediately via sandbox-executor. Routes claude-ai tasks to /execute/sdk (fast AI path) and claude-code tasks to /execute (container path). Also supports de-agent tasks via DE service. Use this for immediate task execution instead of waiting for the 15-minute cron.',
     {
       queue_id: z.string().uuid().describe('Queue entry ID to execute (from nexus_check_queue)'),
       passphrase: passphraseSchema,
@@ -3816,7 +3817,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const queueId = args.queue_id;
 
-        // Execute the task via DE
+        // Execute the task via sandbox-executor or DE
         const result = await executeQueueEntry(env, queueId, tenantId);
 
         if (result.success) {
@@ -3826,7 +3827,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               text: JSON.stringify({
                 success: true,
                 queue_id: queueId,
-                message: 'Task executed successfully via DE',
+                message: 'Task executed successfully',
                 result: result.result,
               }, null, 2)
             }]
@@ -3844,6 +3845,54 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             isError: true
           };
         }
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_run_executor
+  server.tool(
+    'nexus_run_executor',
+    'Run the task executor immediately to process all queued tasks. This is the same as what the 15-minute cron does, but triggered manually. Processes claude-ai tasks via /execute/sdk, claude-code tasks via /execute container, and de-agent tasks via DE service.',
+    {
+      executor_type: z.enum(['claude-ai', 'claude-code', 'de-agent', 'all']).optional()
+        .describe('Filter to only execute tasks of this type. Default: all'),
+      limit: z.number().min(1).max(20).optional()
+        .describe('Maximum number of tasks to execute (default: 10)'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_run_executor', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      try {
+        // Import executeTasks
+        const { executeTasks } = await import('../scheduled/task-executor.ts');
+
+        // Run the executor
+        const stats = await executeTasks(env);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              message: 'Task executor run completed',
+              stats: {
+                processed: stats.processed,
+                completed: stats.completed,
+                failed: stats.failed,
+                skipped: stats.skipped,
+                errors: stats.errors.length > 0 ? stats.errors : undefined,
+              },
+            }, null, 2)
+          }]
+        };
       } catch (error: any) {
         return {
           content: [{ type: 'text', text: `Error: ${error.message}` }],
