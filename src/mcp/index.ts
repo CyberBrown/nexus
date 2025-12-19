@@ -3807,6 +3807,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'Execute a queued task immediately via sandbox-executor. Routes claude-ai tasks to /execute/sdk (fast AI path) and claude-code tasks to /execute (container path). Also supports de-agent tasks via DE service. Use this for immediate task execution instead of waiting for the 15-minute cron.',
     {
       queue_id: z.string().uuid().describe('Queue entry ID to execute (from nexus_check_queue)'),
+      repo: z.string().optional().describe('GitHub repo to work on (e.g., "owner/repo"). Overrides any repo in task context.'),
+      branch: z.string().optional().describe('Git branch to create/use. Overrides any branch in task context.'),
+      commit_message: z.string().optional().describe('Commit message for changes. If not provided, auto-generates from task title.'),
       passphrase: passphraseSchema,
     },
     async (args): Promise<CallToolResult> => {
@@ -3817,8 +3820,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const queueId = args.queue_id;
 
+        // Build override options from MCP params
+        const overrideOptions = {
+          repo: args.repo,
+          branch: args.branch,
+          commit_message: args.commit_message,
+        };
+
         // Execute the task via sandbox-executor or DE
-        const result = await executeQueueEntry(env, queueId, tenantId);
+        const result = await executeQueueEntry(env, queueId, tenantId, overrideOptions);
 
         if (result.success) {
           return {

@@ -81,14 +81,31 @@ export class SandboxClient {
    * Make a fetch request using service binding if available, otherwise fall back to URL
    */
   private async doFetch(path: string, init?: RequestInit): Promise<Response> {
-    if (this.serviceBinding) {
-      // Use service binding - no base URL needed, just the path
-      console.log(`Sandbox fetch via service binding: ${path}`);
-      return this.serviceBinding.fetch(`https://sandbox-executor${path}`, init);
-    } else {
-      // Fall back to URL-based fetch
-      console.log(`Sandbox fetch via URL: ${this.baseUrl}${path}`);
-      return fetch(`${this.baseUrl}${path}`, init);
+    const startTime = Date.now();
+    try {
+      if (this.serviceBinding) {
+        // Use service binding - no base URL needed, just the path
+        const url = `https://sandbox-executor${path}`;
+        console.log(`Sandbox fetch via service binding: ${url}`);
+        const response = await this.serviceBinding.fetch(url, init);
+        const elapsed = Date.now() - startTime;
+        console.log(`Sandbox response: ${response.status} (${elapsed}ms)`);
+        return response;
+      } else {
+        // Fall back to URL-based fetch
+        const url = `${this.baseUrl}${path}`;
+        console.log(`Sandbox fetch via URL: ${url}`);
+        const response = await fetch(url, init);
+        const elapsed = Date.now() - startTime;
+        console.log(`Sandbox response: ${response.status} (${elapsed}ms)`);
+        return response;
+      }
+    } catch (error) {
+      const elapsed = Date.now() - startTime;
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`Sandbox fetch failed after ${elapsed}ms:`, errorMsg);
+      // Re-throw with more context
+      throw new Error(`Sandbox fetch to ${path} failed: ${errorMsg}`);
     }
   }
 
@@ -124,29 +141,44 @@ export class SandboxClient {
    * Execute a code task via the container path.
    * Best for implementation, deployment, testing, and other code tasks.
    */
-  async executeCode(task: string, options?: { repo?: string; branch?: string; timeout_seconds?: number }): Promise<ContainerExecuteResponse> {
-    const body: ContainerExecuteRequest = {
+  async executeCode(task: string, options?: { repo?: string; branch?: string; timeout_seconds?: number; commit_message?: string }): Promise<ContainerExecuteResponse> {
+    const body: ContainerExecuteRequest & { commit_message?: string } = {
       task,
       repo: options?.repo,
       branch: options?.branch,
       timeout_seconds: options?.timeout_seconds,
+      commit_message: options?.commit_message,
     };
 
-    const response = await this.doFetch('/execute', {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify(body),
-    });
+    console.log(`Sandbox executeCode: repo=${options?.repo}, branch=${options?.branch}, task length=${task.length}`);
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
+    try {
+      const response = await this.doFetch('/execute', {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        console.error(`Sandbox executeCode failed: ${response.status} - ${errorText}`);
+        return {
+          success: false,
+          error: `Container execution failed (${response.status}): ${errorText}`,
+        };
+      }
+
+      const result = await response.json() as ContainerExecuteResponse;
+      console.log(`Sandbox executeCode result: success=${result.success}, has_logs=${!!result.logs}`);
+      return result;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`Sandbox executeCode exception: ${errorMsg}`);
       return {
         success: false,
-        error: `Container execution failed (${response.status}): ${errorText}`,
+        error: `Container execution exception: ${errorMsg}`,
       };
     }
-
-    return response.json() as Promise<ContainerExecuteResponse>;
   }
 
   /**

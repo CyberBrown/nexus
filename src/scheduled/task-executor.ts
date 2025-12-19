@@ -16,6 +16,16 @@ import type { ExecutorType } from './task-dispatcher.ts';
 // Types
 // ========================================
 
+/**
+ * Override options for task execution
+ * Passed from MCP tool to override context values
+ */
+export interface ExecuteOverrideOptions {
+  repo?: string;
+  branch?: string;
+  commit_message?: string;
+}
+
 interface QueueEntry {
   id: string;
   tenant_id: string;
@@ -365,7 +375,8 @@ async function executeTaskViaSandboxContainer(
   sandboxClient: SandboxClient,
   entry: QueueEntry,
   task: TaskRow,
-  encryptionKey: CryptoKey | null
+  encryptionKey: CryptoKey | null,
+  overrideOptions?: ExecuteOverrideOptions
 ): Promise<{ success: boolean; result?: string; error?: string }> {
   try {
     // Decrypt task fields
@@ -403,15 +414,20 @@ async function executeTaskViaSandboxContainer(
       }
     }
 
-    // Extract repo from context if available
-    const repo = context?.repo as string | undefined;
-    const branch = context?.branch as string | undefined;
+    // Extract repo from override options first, then context
+    // Override options take precedence over context values
+    const repo = overrideOptions?.repo || (context?.repo as string | undefined);
+    const branch = overrideOptions?.branch || (context?.branch as string | undefined);
+    const commitMessage = overrideOptions?.commit_message || (context?.commit_message as string | undefined);
+
+    console.log(`executeTaskViaSandboxContainer: repo=${repo}, branch=${branch}, commit_message=${commitMessage}, override=${!!overrideOptions}`);
 
     // Execute via sandbox container path
     const response = await sandboxClient.executeCode(taskDescription, {
       repo,
       branch,
       timeout_seconds: 600, // 10 minute timeout for code tasks
+      commit_message: commitMessage || `chore: ${title.slice(0, 50)}`,
     });
 
     if (response.success) {
@@ -649,7 +665,8 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
 export async function executeQueueEntry(
   env: Env,
   queueId: string,
-  tenantId: string
+  tenantId: string,
+  overrideOptions?: ExecuteOverrideOptions
 ): Promise<{ success: boolean; result?: string; error?: string }> {
   const executorId = `nexus-manual-${Date.now()}`;
 
@@ -728,7 +745,8 @@ export async function executeQueueEntry(
       break;
 
     case 'claude-code':
-      result = await executeTaskViaSandboxContainer(sandboxClient!, entry, entry, encryptionKey);
+      // Pass override options to container execution for repo/branch/commit_message
+      result = await executeTaskViaSandboxContainer(sandboxClient!, entry, entry, encryptionKey, overrideOptions);
       break;
 
     case 'de-agent':
