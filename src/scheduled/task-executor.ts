@@ -2,8 +2,8 @@
 // Runs after dispatchTasks() to process queued work items
 //
 // Routes tasks to sandbox-executor service:
-// - claude-ai tasks -> /execute/sdk (fast AI path)
-// - claude-code tasks -> /execute (container path)
+// - claude-ai tasks -> /execute (uses OAuth credentials via sandbox-executor)
+// - claude-code tasks -> /execute (container path with repo/branch support)
 // - de-agent tasks -> DE service binding (legacy)
 
 import type { Env, Task } from '../types/index.ts';
@@ -310,7 +310,8 @@ async function executeTaskViaDE(
 }
 
 /**
- * Execute a claude-ai task via sandbox-executor SDK path
+ * Execute a claude-ai task via sandbox-executor container path
+ * Routes through /execute endpoint to use OAuth credentials instead of API credits
  */
 async function executeTaskViaSandboxSdk(
   sandboxClient: SandboxClient,
@@ -340,24 +341,24 @@ async function executeTaskViaSandboxSdk(
       }
     }
 
-    // Build prompt for SDK execution
+    // Build prompt for execution
     const prompt = buildTaskPrompt(title, description, context);
 
-    // Execute via sandbox SDK path
-    const response = await sandboxClient.executeQuick(prompt, {
-      max_tokens: 2000,
-      temperature: 0.7,
+    // Execute via sandbox container path (uses OAuth credentials)
+    // claude-ai tasks don't need repo/branch since they're research/analysis tasks
+    const response = await sandboxClient.executeCode(prompt, {
+      timeout_seconds: 300, // 5 minute timeout for AI tasks (shorter than code tasks)
     });
 
-    if (response.success && response.result) {
+    if (response.success) {
       return {
         success: true,
-        result: response.result,
+        result: response.logs || 'Task completed successfully',
       };
     } else {
       return {
         success: false,
-        error: response.error || 'SDK execution returned no result',
+        error: response.error || 'Execution returned no result',
       };
     }
   } catch (error) {
@@ -457,8 +458,8 @@ async function executeTaskViaSandboxContainer(
  * Execute queued tasks via sandbox-executor or DE
  *
  * Routes tasks based on executor_type:
- * - claude-ai -> sandbox-executor /execute/sdk (fast AI path)
- * - claude-code -> sandbox-executor /execute (container path)
+ * - claude-ai -> sandbox-executor /execute (uses OAuth credentials)
+ * - claude-code -> sandbox-executor /execute (container path with repo/branch)
  * - de-agent -> DE service binding (legacy)
  * - human -> skipped (requires human action)
  */
@@ -658,8 +659,8 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
  * Used for manual triggering via MCP tool
  *
  * Routes to appropriate executor based on executor_type:
- * - claude-ai -> sandbox-executor /execute/sdk
- * - claude-code -> sandbox-executor /execute
+ * - claude-ai -> sandbox-executor /execute (uses OAuth credentials)
+ * - claude-code -> sandbox-executor /execute (container path with repo/branch)
  * - de-agent -> DE service binding
  */
 export async function executeQueueEntry(

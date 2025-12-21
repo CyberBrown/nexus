@@ -2,9 +2,9 @@
  * Sandbox Executor Client
  *
  * Connects Nexus to the sandbox-executor service for task execution.
- * Routes tasks to appropriate execution paths:
- * - /execute/sdk - Fast path for simple AI tasks (claude-ai)
- * - /execute - Container path for code tasks (claude-code)
+ * All task types route through /execute endpoint which uses OAuth credentials.
+ * - /execute - Main execution path for all tasks (uses OAuth credentials)
+ * - /execute/sdk - Legacy SDK path (deprecated, not used - would consume API credits)
  */
 
 // ========================================
@@ -111,7 +111,8 @@ export class SandboxClient {
 
   /**
    * Execute a quick AI task via the SDK path.
-   * Best for research, analysis, writing, and other non-code tasks.
+   * @deprecated This method uses the Anthropic API directly and consumes credits.
+   * Use executeCode() instead which routes through /execute with OAuth credentials.
    */
   async executeQuick(prompt: string, options?: { max_tokens?: number; temperature?: number }): Promise<SdkExecuteResponse> {
     const body: SdkExecuteRequest = {
@@ -138,8 +139,9 @@ export class SandboxClient {
   }
 
   /**
-   * Execute a code task via the container path.
-   * Best for implementation, deployment, testing, and other code tasks.
+   * Execute a task via the container path using OAuth credentials.
+   * Works for all task types (research, code, analysis, etc).
+   * For code tasks, pass repo/branch to work on a specific repository.
    */
   async executeCode(task: string, options?: { repo?: string; branch?: string; timeout_seconds?: number; commit_message?: string }): Promise<ContainerExecuteResponse> {
     const body: ContainerExecuteRequest & { commit_message?: string } = {

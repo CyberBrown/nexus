@@ -231,9 +231,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (!executorType) {
             // Auto-detect from title tag patterns
             const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
+              // Literal executor names (highest priority)
+              { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
+              { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
+              { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
+              // Shorthand tags
               { pattern: /^\[CC\]/i, executor: 'claude-code' },
               { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+              { pattern: /^\[DE\]/i, executor: 'de-agent' },
               { pattern: /^\[HUMAN\]/i, executor: 'human' },
+              { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+              // Semantic tags
               { pattern: /^\[implement\]/i, executor: 'claude-code' },
               { pattern: /^\[deploy\]/i, executor: 'claude-code' },
               { pattern: /^\[fix\]/i, executor: 'claude-code' },
@@ -3232,12 +3240,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           // Auto-detect executor patterns
           const patterns: Array<{ pattern: RegExp; executor: string }> = [
-            // Shorthand tags (highest priority)
+            // Literal executor names (highest priority)
+            { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
+            { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
+            { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
+            // Shorthand tags
             { pattern: /^\[CC\]/i, executor: 'claude-code' },
             { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+            { pattern: /^\[DE\]/i, executor: 'de-agent' },
             { pattern: /^\[HUMAN\]/i, executor: 'human' },
             { pattern: /^\[BLOCKED\]/i, executor: 'human' },
-            // Detailed tags
+            // Semantic tags
             { pattern: /^\[implement\]/i, executor: 'claude-code' },
             { pattern: /^\[deploy\]/i, executor: 'claude-code' },
             { pattern: /^\[fix\]/i, executor: 'claude-code' },
@@ -3492,12 +3505,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         if (!executorType) {
           // Auto-detect from title tag patterns
           const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
-            // Shorthand tags (highest priority)
+            // Literal executor names (highest priority)
+            { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
+            { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
+            { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
+            // Shorthand tags
             { pattern: /^\[CC\]/i, executor: 'claude-code' },
             { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+            { pattern: /^\[DE\]/i, executor: 'de-agent' },
             { pattern: /^\[HUMAN\]/i, executor: 'human' },
             { pattern: /^\[BLOCKED\]/i, executor: 'human' },
-            // Detailed tags
+            // Semantic tags
             { pattern: /^\[implement\]/i, executor: 'claude-code' },
             { pattern: /^\[deploy\]/i, executor: 'claude-code' },
             { pattern: /^\[fix\]/i, executor: 'claude-code' },
@@ -3661,12 +3679,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Auto-detect executor patterns
         const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
-          // Shorthand tags (highest priority)
+          // Literal executor names (highest priority)
+          { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
+          { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
+          { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
+          // Shorthand tags
           { pattern: /^\[CC\]/i, executor: 'claude-code' },
           { pattern: /^\[AI\]/i, executor: 'claude-ai' },
+          { pattern: /^\[DE\]/i, executor: 'de-agent' },
           { pattern: /^\[HUMAN\]/i, executor: 'human' },
           { pattern: /^\[BLOCKED\]/i, executor: 'human' },
-          // Detailed tags
+          // Semantic tags
           { pattern: /^\[implement\]/i, executor: 'claude-code' },
           { pattern: /^\[deploy\]/i, executor: 'claude-code' },
           { pattern: /^\[fix\]/i, executor: 'claude-code' },
@@ -3804,7 +3827,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_execute_task
   server.tool(
     'nexus_execute_task',
-    'Execute a queued task immediately via sandbox-executor. Routes claude-ai tasks to /execute/sdk (fast AI path) and claude-code tasks to /execute (container path). Also supports de-agent tasks via DE service. Use this for immediate task execution instead of waiting for the 15-minute cron.',
+    'Execute a queued task immediately via sandbox-executor. Routes both claude-ai and claude-code tasks to /execute endpoint (uses OAuth credentials). Also supports de-agent tasks via DE service. Use this for immediate task execution instead of waiting for the 15-minute cron.',
     {
       queue_id: z.string().uuid().describe('Queue entry ID to execute (from nexus_check_queue)'),
       repo: z.string().optional().describe('GitHub repo to work on (e.g., "owner/repo"). Overrides any repo in task context.'),
@@ -3867,7 +3890,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_run_executor
   server.tool(
     'nexus_run_executor',
-    'Run the task executor immediately to process all queued tasks. This is the same as what the 15-minute cron does, but triggered manually. Processes claude-ai tasks via /execute/sdk, claude-code tasks via /execute container, and de-agent tasks via DE service.',
+    'Run the task executor immediately to process all queued tasks. This is the same as what the 15-minute cron does, but triggered manually. Processes both claude-ai and claude-code tasks via /execute endpoint (uses OAuth credentials), and de-agent tasks via DE service.',
     {
       executor_type: z.enum(['claude-ai', 'claude-code', 'de-agent', 'all']).optional()
         .describe('Filter to only execute tasks of this type. Default: all'),
