@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "wrangler dev",
     "dev:remote": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler dev --remote",
-    "deploy": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler deploy",
+    "deploy": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler deploy && wrangler deploy --config wrangler.nexus-mcp.toml",
+    "deploy:nexus": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler deploy",
+    "deploy:mcp": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler deploy --config wrangler.nexus-mcp.toml",
     "db:migrate": "wrangler d1 execute nexus-db --file=./schema.sql",
     "db:migrate:remote": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler d1 execute nexus-db --file=./schema.sql --remote",
     "secret:list": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler secret list",
