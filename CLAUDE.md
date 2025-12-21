@@ -1,4 +1,5 @@
 <!-- Developer Guides MCP Setup v1.1.0 - Check for updates: docs/CLAUDE-MD-SETUP.md -->
+<!-- Last execution test: 2025-12-21 -->
 # CLAUDE.md - Nexus Project Instructions
 
 ## Project Overview
