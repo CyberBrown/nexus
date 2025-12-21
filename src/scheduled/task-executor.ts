@@ -2,8 +2,8 @@
 // Runs after dispatchTasks() to process queued work items
 //
 // Routes tasks to sandbox-executor service:
-// - claude-ai tasks -> /execute/sdk (fast AI path)
-// - claude-code tasks -> /execute (container path)
+// - claude-ai tasks -> /execute (uses OAuth credentials via sandbox-executor)
+// - claude-code tasks -> /execute (container path with repo/branch support)
 // - de-agent tasks -> DE service binding (legacy)
 
 import type { Env, Task } from '../types/index.ts';
@@ -15,6 +15,16 @@ import type { ExecutorType } from './task-dispatcher.ts';
 // ========================================
 // Types
 // ========================================
+
+/**
+ * Override options for task execution
+ * Passed from MCP tool to override context values
+ */
+export interface ExecuteOverrideOptions {
+  repo?: string;
+  branch?: string;
+  commit_message?: string;
+}
 
 interface QueueEntry {
   id: string;
@@ -300,7 +310,8 @@ async function executeTaskViaDE(
 }
 
 /**
- * Execute a claude-ai task via sandbox-executor SDK path
+ * Execute a claude-ai task via sandbox-executor container path
+ * Routes through /execute endpoint to use OAuth credentials instead of API credits
  */
 async function executeTaskViaSandboxSdk(
   sandboxClient: SandboxClient,
@@ -330,24 +341,24 @@ async function executeTaskViaSandboxSdk(
       }
     }
 
-    // Build prompt for SDK execution
+    // Build prompt for execution
     const prompt = buildTaskPrompt(title, description, context);
 
-    // Execute via sandbox SDK path
-    const response = await sandboxClient.executeQuick(prompt, {
-      max_tokens: 2000,
-      temperature: 0.7,
+    // Execute via sandbox container path (uses OAuth credentials)
+    // claude-ai tasks don't need repo/branch since they're research/analysis tasks
+    const response = await sandboxClient.executeCode(prompt, {
+      timeout_seconds: 300, // 5 minute timeout for AI tasks (shorter than code tasks)
     });
 
-    if (response.success && response.result) {
+    if (response.success) {
       return {
         success: true,
-        result: response.result,
+        result: response.logs || 'Task completed successfully',
       };
     } else {
       return {
         success: false,
-        error: response.error || 'SDK execution returned no result',
+        error: response.error || 'Execution returned no result',
       };
     }
   } catch (error) {
@@ -365,7 +376,8 @@ async function executeTaskViaSandboxContainer(
   sandboxClient: SandboxClient,
   entry: QueueEntry,
   task: TaskRow,
-  encryptionKey: CryptoKey | null
+  encryptionKey: CryptoKey | null,
+  overrideOptions?: ExecuteOverrideOptions
 ): Promise<{ success: boolean; result?: string; error?: string }> {
   try {
     // Decrypt task fields
@@ -403,15 +415,20 @@ async function executeTaskViaSandboxContainer(
       }
     }
 
-    // Extract repo from context if available
-    const repo = context?.repo as string | undefined;
-    const branch = context?.branch as string | undefined;
+    // Extract repo from override options first, then context
+    // Override options take precedence over context values
+    const repo = overrideOptions?.repo || (context?.repo as string | undefined);
+    const branch = overrideOptions?.branch || (context?.branch as string | undefined);
+    const commitMessage = overrideOptions?.commit_message || (context?.commit_message as string | undefined);
+
+    console.log(`executeTaskViaSandboxContainer: repo=${repo}, branch=${branch}, commit_message=${commitMessage}, override=${!!overrideOptions}`);
 
     // Execute via sandbox container path
     const response = await sandboxClient.executeCode(taskDescription, {
       repo,
       branch,
       timeout_seconds: 600, // 10 minute timeout for code tasks
+      commit_message: commitMessage || `chore: ${title.slice(0, 50)}`,
     });
 
     if (response.success) {
@@ -441,8 +458,8 @@ async function executeTaskViaSandboxContainer(
  * Execute queued tasks via sandbox-executor or DE
  *
  * Routes tasks based on executor_type:
- * - claude-ai -> sandbox-executor /execute/sdk (fast AI path)
- * - claude-code -> sandbox-executor /execute (container path)
+ * - claude-ai -> sandbox-executor /execute (uses OAuth credentials)
+ * - claude-code -> sandbox-executor /execute (container path with repo/branch)
  * - de-agent -> DE service binding (legacy)
  * - human -> skipped (requires human action)
  */
@@ -642,15 +659,15 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
  * Used for manual triggering via MCP tool
  *
  * Routes to appropriate executor based on executor_type:
- * - claude-ai -> sandbox-executor /execute/sdk
- * - claude-code -> sandbox-executor /execute
+ * - claude-ai -> sandbox-executor /execute (uses OAuth credentials)
+ * - claude-code -> sandbox-executor /execute (container path with repo/branch)
  * - de-agent -> DE service binding
  */
 export async function executeQueueEntry(
   env: Env,
   queueId: string,
   tenantId: string,
-  options?: { repo?: string; branch?: string; commitMessage?: string }
+  overrideOptions?: ExecuteOverrideOptions
 ): Promise<{ success: boolean; result?: string; error?: string }> {
   const executorId = `nexus-manual-${Date.now()}`;
 
@@ -729,7 +746,8 @@ export async function executeQueueEntry(
       break;
 
     case 'claude-code':
-      result = await executeTaskViaSandboxContainer(sandboxClient!, entry, entry, encryptionKey);
+      // Pass override options to container execution for repo/branch/commit_message
+      result = await executeTaskViaSandboxContainer(sandboxClient!, entry, entry, encryptionKey, overrideOptions);
       break;
 
     case 'de-agent':

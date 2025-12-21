@@ -13,6 +13,10 @@
     "db:migrate:remote": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler d1 execute nexus-db --file=./schema.sql --remote",
     "secret:list": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler secret list",
     "secret:put": "export $(grep -v '^#' .dev.vars 2>/dev/null | xargs) && wrangler secret put",
+    "de-auth": "bun run scripts/de-auth.ts",
+    "de-auth:status": "bun run scripts/de-auth.ts status",
+    "de-auth:refresh": "bun run scripts/de-auth.ts refresh",
+    "de-auth:deploy": "bun run scripts/de-auth.ts deploy",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:ui": "vitest --ui"
