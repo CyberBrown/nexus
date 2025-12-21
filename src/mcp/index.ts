@@ -39,6 +39,30 @@ async function safeDecrypt(value: unknown, key: CryptoKey | null): Promise<strin
 }
 
 // ========================================
+// EXECUTOR ROUTING NOTES
+// ========================================
+
+/**
+ * Generate routing explanation for dispatch messages.
+ * Currently all tasks route through claude-code (on-prem runner) since SDK mode isn't operational.
+ */
+function getRoutingNote(executorType: string): string {
+  if (executorType === 'claude-code') {
+    return 'Routes to on-prem claude-runner via Cloudflare Tunnel.';
+  }
+  if (executorType === 'claude-ai') {
+    return 'Note: claude-ai tasks currently execute via claude-code path (SDK mode not yet operational).';
+  }
+  if (executorType === 'human') {
+    return 'Requires human action - will not auto-execute.';
+  }
+  if (executorType === 'de-agent') {
+    return 'Routes to DE service binding.';
+  }
+  return '';
+}
+
+// ========================================
 // PASSPHRASE AUTH HELPERS
 // ========================================
 
@@ -332,7 +356,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           title: args.title,
           status,
           message: dispatchResult
-            ? `Task created and queued for ${dispatchResult.executor_type} executor. Use nexus_task_status to track progress.`
+            ? `Task created and queued for ${dispatchResult.executor_type} executor. ${getRoutingNote(dispatchResult.executor_type)} Use nexus_task_status to track progress.`
             : status === 'next'
               ? `Task created with status "next". Use nexus_dispatch_task to queue it, or wait for the 15-minute cron.`
               : `Task created successfully.`,
@@ -3608,7 +3632,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               executor_type: executorType,
               priority: priority,
               queued_at: now,
-              message: `Task dispatched to ${executorType} queue. Use nexus_check_queue to see pending work.`,
+              message: `Task dispatched to ${executorType} queue. ${getRoutingNote(executorType)} Use nexus_check_queue to see pending work.`,
             }, null, 2)
           }]
         };

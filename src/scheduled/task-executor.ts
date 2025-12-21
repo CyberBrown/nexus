@@ -10,6 +10,7 @@ import type { Env, Task } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
 import { DEClient, createDEClient } from '../lib/de-client.ts';
 import { SandboxClient, createSandboxClient } from '../lib/sandbox-client.ts';
+import { isOAuthError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
 import type { ExecutorType } from './task-dispatcher.ts';
 
 // ========================================
@@ -158,14 +159,57 @@ async function completeEntry(
 
 /**
  * Mark queue entry as failed
+ * Detects OAuth errors and immediately quarantines with notification (no retries)
  */
 async function failEntry(
   db: D1Database,
-  entry: QueueEntry,
+  entry: QueueEntry & { title?: string },
   error: string
 ): Promise<void> {
   const now = new Date().toISOString();
   const newRetryCount = entry.retry_count + 1;
+
+  // Check if this is an OAuth error - these should quarantine immediately (no retries)
+  if (isOAuthError(error)) {
+    console.log(`OAuth error detected for task ${entry.task_id}, quarantining immediately`);
+
+    const quarantineReason = `OAuth/authentication error: ${error.slice(0, 200)}`;
+
+    // Immediately quarantine - no point retrying OAuth errors
+    await db.prepare(`
+      UPDATE execution_queue
+      SET status = 'quarantine',
+          error = ?,
+          quarantine_reason = ?,
+          quarantined_at = ?,
+          retry_count = ?,
+          updated_at = ?
+      WHERE id = ?
+    `).bind(error, quarantineReason, now, newRetryCount, now, entry.id).run();
+
+    await db.prepare(`
+      INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+      VALUES (?, ?, ?, ?, ?, 'quarantined', ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      entry.tenant_id,
+      entry.id,
+      entry.task_id,
+      entry.executor_type,
+      JSON.stringify({ error, reason: 'oauth_error', quarantine_reason: quarantineReason }),
+      now
+    ).run();
+
+    // Send phone notification
+    await sendOAuthExpirationAlert(
+      entry.task_id,
+      entry.title || 'Unknown task',
+      error,
+      entry.executor_type
+    );
+
+    return;
+  }
 
   // If we have retries left, requeue instead of failing
   if (newRetryCount < entry.max_retries) {
@@ -188,25 +232,40 @@ async function failEntry(
       now
     ).run();
   } else {
-    // No more retries - mark as failed
+    // No more retries - quarantine with notification
+    const quarantineReason = `Max attempts (${newRetryCount}) exceeded: ${error.slice(0, 200)}`;
+
     await db.prepare(`
       UPDATE execution_queue
-      SET status = 'failed', error = ?, retry_count = ?, updated_at = ?
+      SET status = 'quarantine',
+          error = ?,
+          quarantine_reason = ?,
+          quarantined_at = ?,
+          retry_count = ?,
+          updated_at = ?
       WHERE id = ?
-    `).bind(error, newRetryCount, now, entry.id).run();
+    `).bind(error, quarantineReason, now, newRetryCount, now, entry.id).run();
 
     await db.prepare(`
       INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
-      VALUES (?, ?, ?, ?, ?, 'failed', ?, ?)
+      VALUES (?, ?, ?, ?, ?, 'quarantined', ?, ?)
     `).bind(
       crypto.randomUUID(),
       entry.tenant_id,
       entry.id,
       entry.task_id,
       entry.executor_type,
-      JSON.stringify({ error, retry_count: newRetryCount, exhausted_retries: true }),
+      JSON.stringify({ error, retry_count: newRetryCount, exhausted_retries: true, quarantine_reason: quarantineReason }),
       now
     ).run();
+
+    // Send notification for quarantined task
+    await sendQuarantineAlert(
+      entry.task_id,
+      entry.title || 'Unknown task',
+      quarantineReason,
+      newRetryCount
+    );
   }
 }
 
