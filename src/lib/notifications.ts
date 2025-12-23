@@ -30,6 +30,7 @@ export function isOAuthError(errorMessage: string): boolean {
 
 /**
  * Send a notification via ntfy.sh
+ * DISABLED: Notifications temporarily disabled to reduce noise
  */
 export async function sendNtfyNotification(
   topic: string,
@@ -41,6 +42,10 @@ export async function sendNtfyNotification(
     click?: string;
   }
 ): Promise<boolean> {
+  // DISABLED: Uncomment to re-enable notifications
+  console.log(`[NTFY DISABLED] Would send: ${title}`);
+  return true;
+
   try {
     const headers: Record<string, string> = {
       'Title': title,
