@@ -98,6 +98,7 @@ const WRITE_TOOLS = new Set([
   'nexus_dispatch_ready',
   'nexus_execute_task',
   'nexus_run_executor',
+  'nexus_reset_quarantine',
 ]);
 
 /**
@@ -3988,6 +3989,127 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     return false;
   }
 
+
+  // Tool: nexus_reset_quarantine
+  server.tool(
+    'nexus_reset_quarantine',
+    'Reset quarantined tasks back to queued status so they can be retried. Use this after fixing the underlying issue (e.g., re-authenticating OAuth).',
+    {
+      executor_type: z.enum(['claude-code', 'claude-ai', 'de-agent', 'human', 'all']).optional()
+        .describe('Filter to only reset tasks of this executor type. Default: all'),
+      task_id: z.string().uuid().optional()
+        .describe('Reset a specific task by ID instead of all quarantined tasks'),
+      limit: z.number().min(1).max(100).optional()
+        .describe('Maximum number of tasks to reset (default: 50, max: 100)'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      // Validate passphrase for write operation
+      const authError = validatePassphrase('nexus_reset_quarantine', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      try {
+        const executorType = args.executor_type;
+        const taskId = args.task_id;
+        const limit = Math.min(args.limit || 50, 100);
+        const now = new Date().toISOString();
+
+        let query: string;
+        let bindings: unknown[];
+
+        if (taskId) {
+          // Reset specific task
+          query = `
+            UPDATE execution_queue
+            SET status = 'queued',
+                attempt_count = 0,
+                quarantine_reason = NULL,
+                quarantined_at = NULL,
+                error = NULL,
+                failure_history = NULL,
+                updated_at = ?
+            WHERE tenant_id = ? AND task_id = ? AND status = 'quarantine'
+          `;
+          bindings = [now, tenantId, taskId];
+        } else if (executorType && executorType !== 'all') {
+          // Reset by executor type
+          query = `
+            UPDATE execution_queue
+            SET status = 'queued',
+                attempt_count = 0,
+                quarantine_reason = NULL,
+                quarantined_at = NULL,
+                error = NULL,
+                failure_history = NULL,
+                updated_at = ?
+            WHERE tenant_id = ? AND executor_type = ? AND status = 'quarantine'
+            AND id IN (
+              SELECT id FROM execution_queue
+              WHERE tenant_id = ? AND executor_type = ? AND status = 'quarantine'
+              ORDER BY priority DESC, queued_at ASC
+              LIMIT ?
+            )
+          `;
+          bindings = [now, tenantId, executorType, tenantId, executorType, limit];
+        } else {
+          // Reset all quarantined
+          query = `
+            UPDATE execution_queue
+            SET status = 'queued',
+                attempt_count = 0,
+                quarantine_reason = NULL,
+                quarantined_at = NULL,
+                error = NULL,
+                failure_history = NULL,
+                updated_at = ?
+            WHERE tenant_id = ? AND status = 'quarantine'
+            AND id IN (
+              SELECT id FROM execution_queue
+              WHERE tenant_id = ? AND status = 'quarantine'
+              ORDER BY priority DESC, queued_at ASC
+              LIMIT ?
+            )
+          `;
+          bindings = [now, tenantId, tenantId, limit];
+        }
+
+        const result = await env.DB.prepare(query).bind(...bindings).run();
+
+        // Get count of remaining quarantined tasks
+        const remainingResult = await env.DB.prepare(`
+          SELECT COUNT(*) as count FROM execution_queue
+          WHERE tenant_id = ? AND status = 'quarantine'
+        `).bind(tenantId).first<{ count: number }>();
+
+        const resetCount = result.meta?.changes || 0;
+        const remaining = remainingResult?.count || 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              reset_count: resetCount,
+              remaining_quarantined: remaining,
+              message: resetCount > 0
+                ? `Reset ${resetCount} quarantined task(s) back to queued status. They will be picked up by the next executor run.`
+                : 'No quarantined tasks found matching the criteria.',
+              filter: {
+                executor_type: executorType || 'all',
+                task_id: taskId || null,
+                limit: limit,
+              },
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
 
   // ========================================
   // PROMPTS (become slash commands)
