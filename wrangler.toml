@@ -85,7 +85,7 @@ new_sqlite_classes = ["IdeaExecutor"]
 # Service Bindings - Worker-to-Worker communication
 [[services]]
 binding = "DE"
-service = "text-gen"  # DE's text-gen worker for LLM operations
+service = "de-text-gen"  # DE's text-gen worker for LLM operations
 
 [[services]]
 binding = "SANDBOX_EXECUTOR"
