@@ -7,46 +7,56 @@ import { getEncryptionKey, decryptFields } from '../lib/encryption.ts';
 const ENCRYPTED_FIELDS = ['title', 'description'];
 
 // Executor types that can handle tasks
-export type ExecutorType = 'claude-code' | 'claude-ai' | 'de-agent' | 'human';
+// - 'human': Human only, never auto-dispatch
+// - 'human-ai': Human leads, AI assists (human pulls from queue, can request DE help)
+// - 'ai': Full AI autonomy, auto-dispatch to DE
+export type ExecutorType = 'human' | 'human-ai' | 'ai';
 
 // Task tag patterns and their executor mappings
+// Key principle: Nexus asks "Does a human need to be involved?"
+// - Yes, fully → human
+// - Yes, partially → human-ai
+// - No → ai (send to DE, done)
 const EXECUTOR_PATTERNS: Array<{ pattern: RegExp; executor: ExecutorType }> = [
   // Literal executor names (highest priority - check first)
-  { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
-  { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
-  { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
-
-  // Shorthand tags
-  { pattern: /^\[CC\]/i, executor: 'claude-code' },
-  { pattern: /^\[AI\]/i, executor: 'claude-ai' },
-  { pattern: /^\[DE\]/i, executor: 'de-agent' },
-  { pattern: /^\[HUMAN\]/i, executor: 'human' },
-  { pattern: /^\[BLOCKED\]/i, executor: 'human' },
-
-  // Code-related tasks -> Claude Code
-  { pattern: /^\[implement\]/i, executor: 'claude-code' },
-  { pattern: /^\[deploy\]/i, executor: 'claude-code' },
-  { pattern: /^\[fix\]/i, executor: 'claude-code' },
-  { pattern: /^\[refactor\]/i, executor: 'claude-code' },
-  { pattern: /^\[test\]/i, executor: 'claude-code' },
-  { pattern: /^\[debug\]/i, executor: 'claude-code' },
-  { pattern: /^\[code\]/i, executor: 'claude-code' },
-
-  // Research/design tasks -> Claude AI or DE
-  { pattern: /^\[research\]/i, executor: 'claude-ai' },
-  { pattern: /^\[design\]/i, executor: 'claude-ai' },
-  { pattern: /^\[document\]/i, executor: 'claude-ai' },
-  { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
-  { pattern: /^\[plan\]/i, executor: 'claude-ai' },
-  { pattern: /^\[write\]/i, executor: 'claude-ai' },
-
-  // Human-required tasks
   { pattern: /^\[human\]/i, executor: 'human' },
-  { pattern: /^\[review\]/i, executor: 'human' },
-  { pattern: /^\[approve\]/i, executor: 'human' },
-  { pattern: /^\[decide\]/i, executor: 'human' },
+  { pattern: /^\[human-ai\]/i, executor: 'human-ai' },
+  { pattern: /^\[ai\]/i, executor: 'ai' },
+
+  // Legacy tags - map to new types
+  { pattern: /^\[claude-code\]/i, executor: 'ai' },
+  { pattern: /^\[claude-ai\]/i, executor: 'ai' },
+  { pattern: /^\[de-agent\]/i, executor: 'ai' },
+  { pattern: /^\[CC\]/i, executor: 'ai' },
+  { pattern: /^\[DE\]/i, executor: 'ai' },
+
+  // Human-only tasks (physical action, account access, final decisions)
   { pattern: /^\[call\]/i, executor: 'human' },
   { pattern: /^\[meeting\]/i, executor: 'human' },
+  { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+
+  // Human-AI collaborative tasks (human leads, AI assists)
+  { pattern: /^\[review\]/i, executor: 'human-ai' },
+  { pattern: /^\[approve\]/i, executor: 'human-ai' },
+  { pattern: /^\[decide\]/i, executor: 'human-ai' },
+
+  // All AI-executable tasks -> 'ai' (DE decides how to handle)
+  // Code tasks
+  { pattern: /^\[implement\]/i, executor: 'ai' },
+  { pattern: /^\[deploy\]/i, executor: 'ai' },
+  { pattern: /^\[fix\]/i, executor: 'ai' },
+  { pattern: /^\[refactor\]/i, executor: 'ai' },
+  { pattern: /^\[test\]/i, executor: 'ai' },
+  { pattern: /^\[debug\]/i, executor: 'ai' },
+  { pattern: /^\[code\]/i, executor: 'ai' },
+
+  // Research/analysis tasks
+  { pattern: /^\[research\]/i, executor: 'ai' },
+  { pattern: /^\[design\]/i, executor: 'ai' },
+  { pattern: /^\[document\]/i, executor: 'ai' },
+  { pattern: /^\[analyze\]/i, executor: 'ai' },
+  { pattern: /^\[plan\]/i, executor: 'ai' },
+  { pattern: /^\[write\]/i, executor: 'ai' },
 ];
 
 /**
@@ -206,10 +216,9 @@ export async function dispatchTasks(env: Env): Promise<{
   const stats = {
     processed: 0,
     queued: {
-      'claude-code': 0,
-      'claude-ai': 0,
-      'de-agent': 0,
       'human': 0,
+      'human-ai': 0,
+      'ai': 0,
     } as Record<ExecutorType, number>,
     skipped: 0,
     errors: 0,

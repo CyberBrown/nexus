@@ -423,27 +423,41 @@ tasks.post('/:id/dispatch', async (c) => {
   const decrypted = await decryptFields(task, ENCRYPTED_FIELDS, key);
 
   // Auto-detect executor type if not provided
+  // Key principle: Does a human need to be involved?
   if (!executorType) {
     const patterns: Array<{ pattern: RegExp; executor: string }> = [
-      { pattern: /^\[implement\]/i, executor: 'claude-code' },
-      { pattern: /^\[deploy\]/i, executor: 'claude-code' },
-      { pattern: /^\[fix\]/i, executor: 'claude-code' },
-      { pattern: /^\[refactor\]/i, executor: 'claude-code' },
-      { pattern: /^\[test\]/i, executor: 'claude-code' },
-      { pattern: /^\[debug\]/i, executor: 'claude-code' },
-      { pattern: /^\[code\]/i, executor: 'claude-code' },
-      { pattern: /^\[research\]/i, executor: 'claude-ai' },
-      { pattern: /^\[design\]/i, executor: 'claude-ai' },
-      { pattern: /^\[document\]/i, executor: 'claude-ai' },
-      { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
-      { pattern: /^\[plan\]/i, executor: 'claude-ai' },
-      { pattern: /^\[write\]/i, executor: 'claude-ai' },
+      // Literal executor names (highest priority)
       { pattern: /^\[human\]/i, executor: 'human' },
-      { pattern: /^\[review\]/i, executor: 'human' },
-      { pattern: /^\[approve\]/i, executor: 'human' },
-      { pattern: /^\[decide\]/i, executor: 'human' },
+      { pattern: /^\[human-ai\]/i, executor: 'human-ai' },
+      { pattern: /^\[ai\]/i, executor: 'ai' },
+      // Legacy tags - map to new types
+      { pattern: /^\[claude-code\]/i, executor: 'ai' },
+      { pattern: /^\[claude-ai\]/i, executor: 'ai' },
+      { pattern: /^\[de-agent\]/i, executor: 'ai' },
+      { pattern: /^\[CC\]/i, executor: 'ai' },
+      { pattern: /^\[DE\]/i, executor: 'ai' },
+      { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+      // Human-only tasks
       { pattern: /^\[call\]/i, executor: 'human' },
       { pattern: /^\[meeting\]/i, executor: 'human' },
+      // Human-AI collaborative tasks
+      { pattern: /^\[review\]/i, executor: 'human-ai' },
+      { pattern: /^\[approve\]/i, executor: 'human-ai' },
+      { pattern: /^\[decide\]/i, executor: 'human-ai' },
+      // All AI-executable tasks
+      { pattern: /^\[implement\]/i, executor: 'ai' },
+      { pattern: /^\[deploy\]/i, executor: 'ai' },
+      { pattern: /^\[fix\]/i, executor: 'ai' },
+      { pattern: /^\[refactor\]/i, executor: 'ai' },
+      { pattern: /^\[test\]/i, executor: 'ai' },
+      { pattern: /^\[debug\]/i, executor: 'ai' },
+      { pattern: /^\[code\]/i, executor: 'ai' },
+      { pattern: /^\[research\]/i, executor: 'ai' },
+      { pattern: /^\[design\]/i, executor: 'ai' },
+      { pattern: /^\[document\]/i, executor: 'ai' },
+      { pattern: /^\[analyze\]/i, executor: 'ai' },
+      { pattern: /^\[plan\]/i, executor: 'ai' },
+      { pattern: /^\[write\]/i, executor: 'ai' },
     ];
 
     executorType = 'human'; // default

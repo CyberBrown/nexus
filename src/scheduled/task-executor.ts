@@ -1,14 +1,12 @@
-// Task Executor - Execute queued tasks via DE Workflows (parallel, durable)
+// Task Executor - Execute queued tasks via DE
 // Runs after dispatchTasks() to process queued work items
 //
-// PARALLEL WORKFLOW EXECUTION (preferred for claude-ai/claude-code):
-// - Triggers CodeExecutionWorkflow via intake service binding
-// - Workflows run in parallel with automatic fallover (Claude -> Gemini)
-// - Built-in retries, crash recovery, callbacks to Nexus
-// - No batch limit - all tasks triggered immediately
+// Simplified executor types:
+// - 'ai': Full AI autonomy, auto-dispatch to DE (via intake workflows or sandbox fallback)
+// - 'human-ai': Human leads with AI assist (human pulls from queue)
+// - 'human': Human only, never auto-dispatch
 //
-// LEGACY SEQUENTIAL EXECUTION (fallback for de-agent tasks):
-// - de-agent tasks -> DE service binding
+// Only 'ai' tasks are auto-executed. DE decides the HOW (model, OAuth vs API, etc.)
 
 import type { Env, Task } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
@@ -628,7 +626,7 @@ async function triggerWorkflowForEntry(
         executor_type: entry.executor_type,
         title: title,
       },
-      timeout_ms: entry.executor_type === 'claude-code' ? 600000 : 300000, // 10min for code, 5min for AI
+      timeout_ms: 600000, // 10 minutes for AI tasks
     });
 
     if (response.success && response.workflow_instance_id) {
@@ -734,19 +732,15 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
       return stats;
     }
 
-    // Build executor type filter based on available services
-    const executorTypes: string[] = [];
-    if (intakeAvailable || sandboxAvailable) {
-      executorTypes.push('claude-ai', 'claude-code');
-    }
-    if (deAvailable) {
-      executorTypes.push('de-agent');
-    }
-
-    if (executorTypes.length === 0) {
-      console.log('No executor types available');
+    // Only auto-execute 'ai' tasks (human and human-ai stay in queue for humans to pull)
+    // We need at least one execution service available
+    if (!intakeAvailable && !sandboxAvailable && !deAvailable) {
+      console.log('No execution services available for ai tasks');
       return stats;
     }
+
+    // Only process 'ai' executor type
+    const executorTypes = ['ai'];
 
     const executorTypePlaceholders = executorTypes.map(() => '?').join(', ');
 
@@ -784,19 +778,22 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
         // Separate entries into workflow tasks (parallel) and sequential tasks
+        // All 'ai' tasks go to intake if available, otherwise fallback to sequential
         const workflowEntries: (QueueEntry & TaskRow)[] = [];
         const sequentialEntries: (QueueEntry & TaskRow)[] = [];
 
         for (const entry of entries.results) {
-          if ((entry.executor_type === 'claude-ai' || entry.executor_type === 'claude-code') && intakeAvailable) {
+          if (entry.executor_type === 'ai' && intakeAvailable) {
             workflowEntries.push(entry);
-          } else {
+          } else if (entry.executor_type === 'ai') {
+            // Fallback to sequential execution if intake not available
             sequentialEntries.push(entry);
           }
+          // human and human-ai tasks are NOT auto-executed
         }
 
         // ========================================
-        // PARALLEL WORKFLOW EXECUTION (claude-ai, claude-code via intake)
+        // PARALLEL WORKFLOW EXECUTION (ai tasks via intake)
         // ========================================
         if (workflowEntries.length > 0 && intakeClient) {
           console.log(`Triggering ${workflowEntries.length} workflows in parallel via intake`);
@@ -861,7 +858,7 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
         }
 
         // ========================================
-        // SEQUENTIAL EXECUTION (de-agent, fallback sandbox execution)
+        // SEQUENTIAL EXECUTION (ai tasks when intake not available)
         // ========================================
         for (const entry of sequentialEntries) {
           stats.processed++;
@@ -877,38 +874,21 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
 
             console.log(`Executing task sequentially: ${entry.task_id} (${entry.executor_type})`);
 
-            // Route to appropriate executor
+            // Route to appropriate executor - all 'ai' tasks go to DE
             let result: { success: boolean; result?: string; error?: string };
 
-            switch (entry.executor_type) {
-              case 'claude-ai':
-                // Fallback to sandbox when intake not available
-                if (!sandboxClient) {
-                  result = { success: false, error: 'Sandbox executor not available for claude-ai task' };
-                } else {
-                  result = await executeTaskViaSandboxSdk(sandboxClient, entry, entry, encryptionKey);
-                }
-                break;
-
-              case 'claude-code':
-                // Fallback to sandbox when intake not available
-                if (!sandboxClient) {
-                  result = { success: false, error: 'Sandbox executor not available for claude-code task' };
-                } else {
-                  result = await executeTaskViaSandboxContainer(sandboxClient, entry, entry, encryptionKey);
-                }
-                break;
-
-              case 'de-agent':
-                if (!deClient) {
-                  result = { success: false, error: 'DE service not available for de-agent task' };
-                } else {
-                  result = await executeTaskViaDE(deClient, entry, entry, encryptionKey);
-                }
-                break;
-
-              default:
-                result = { success: false, error: `Unknown executor type: ${entry.executor_type}` };
+            if (entry.executor_type === 'ai') {
+              // Try sandbox first (uses OAuth), fallback to DE service binding
+              if (sandboxClient) {
+                result = await executeTaskViaSandboxSdk(sandboxClient, entry, entry, encryptionKey);
+              } else if (deClient) {
+                result = await executeTaskViaDE(deClient, entry, entry, encryptionKey);
+              } else {
+                result = { success: false, error: 'No execution service available for ai task' };
+              }
+            } else {
+              // human and human-ai tasks should not be in sequential execution
+              result = { success: false, error: `Executor type '${entry.executor_type}' is not auto-executable` };
             }
 
             if (result.success && result.result) {
@@ -985,11 +965,11 @@ export async function executeQueueEntry(
     return { success: false, error: 'Queue entry not found' };
   }
 
-  // Validate executor type
-  if (!['de-agent', 'claude-ai', 'claude-code'].includes(entry.executor_type)) {
+  // Validate executor type - only 'ai' tasks are auto-executable
+  if (entry.executor_type !== 'ai') {
     return {
       success: false,
-      error: `Cannot execute ${entry.executor_type} tasks automatically. Only de-agent, claude-ai, and claude-code tasks are supported.`,
+      error: `Cannot execute '${entry.executor_type}' tasks automatically. Only 'ai' tasks are auto-executable. Use the queue to view and manually handle human/human-ai tasks.`,
     };
   }
 
@@ -1001,30 +981,31 @@ export async function executeQueueEntry(
     };
   }
 
-  // Initialize clients based on executor type
+  // Initialize clients for 'ai' task execution
   const sandboxClient = createSandboxClient(env);
   const deClient = createDEClient(env);
 
-  // Check if the required executor is available
-  if ((entry.executor_type === 'claude-ai' || entry.executor_type === 'claude-code') && !sandboxClient) {
-    return { success: false, error: 'Sandbox executor not configured (SANDBOX_EXECUTOR_URL not set)' };
+  // Check if at least one execution service is available
+  if (!sandboxClient && !deClient) {
+    return { success: false, error: 'No execution service available (neither sandbox nor DE configured)' };
   }
 
-  if (entry.executor_type === 'de-agent' && !deClient) {
-    return { success: false, error: 'DE service not available' };
+  // Check service health - prefer sandbox, fallback to DE
+  let useSandbox = false;
+  if (sandboxClient) {
+    useSandbox = await sandboxClient.isAvailable();
+    if (!useSandbox) {
+      console.log('Sandbox not available, will try DE fallback');
+    }
   }
 
-  // Check service health
-  if (entry.executor_type === 'claude-ai' || entry.executor_type === 'claude-code') {
-    const available = await sandboxClient!.isAvailable();
-    if (!available) {
-      return { success: false, error: 'Sandbox executor not healthy' };
+  if (!useSandbox && deClient) {
+    const deHealthy = await deClient.healthCheck();
+    if (!deHealthy) {
+      return { success: false, error: 'No execution service healthy (sandbox unavailable, DE health check failed)' };
     }
-  } else if (entry.executor_type === 'de-agent') {
-    const healthy = await deClient!.healthCheck();
-    if (!healthy) {
-      return { success: false, error: 'DE service health check failed' };
-    }
+  } else if (!useSandbox) {
+    return { success: false, error: 'No execution service healthy' };
   }
 
   // Claim if not already claimed
@@ -1038,25 +1019,23 @@ export async function executeQueueEntry(
   // Get encryption key
   const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
-  // Route to appropriate executor
+  // Execute 'ai' task - prefer sandbox (OAuth), fallback to DE
   let result: { success: boolean; result?: string; error?: string };
 
-  switch (entry.executor_type) {
-    case 'claude-ai':
-      result = await executeTaskViaSandboxSdk(sandboxClient!, entry, entry, encryptionKey);
-      break;
-
-    case 'claude-code':
-      // Pass override options to container execution for repo/branch/commit_message
-      result = await executeTaskViaSandboxContainer(sandboxClient!, entry, entry, encryptionKey, overrideOptions);
-      break;
-
-    case 'de-agent':
-      result = await executeTaskViaDE(deClient!, entry, entry, encryptionKey);
-      break;
-
-    default:
-      result = { success: false, error: `Unknown executor type: ${entry.executor_type}` };
+  if (useSandbox && sandboxClient) {
+    // Use sandbox with override options for repo/branch/commit_message if provided
+    if (overrideOptions?.repo) {
+      // Task has repo context, use container path
+      result = await executeTaskViaSandboxContainer(sandboxClient, entry, entry, encryptionKey, overrideOptions);
+    } else {
+      // No repo context, use SDK path
+      result = await executeTaskViaSandboxSdk(sandboxClient, entry, entry, encryptionKey);
+    }
+  } else if (deClient) {
+    // Fallback to DE service binding
+    result = await executeTaskViaDE(deClient, entry, entry, encryptionKey);
+  } else {
+    result = { success: false, error: 'No execution service available' };
   }
 
   if (result.success && result.result) {

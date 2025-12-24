@@ -204,7 +204,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       project_id: z.string().uuid().optional().describe('Project ID to associate this task with'),
       time_estimate_minutes: z.number().optional().describe('Estimated time in minutes'),
       auto_dispatch: z.boolean().optional().describe('If true and status is "next", immediately queue for execution'),
-      executor_type: z.enum(['claude-code', 'claude-ai', 'de-agent', 'human']).optional()
+      executor_type: z.enum(['human', 'human-ai', 'ai']).optional()
         .describe('Override auto-detected executor type (only used with auto_dispatch)'),
       passphrase: passphraseSchema,
     },
@@ -258,34 +258,43 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           let executorType = args.executor_type;
           if (!executorType) {
             // Auto-detect from title tag patterns
-            const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
+            // Key principle: Does a human need to be involved?
+            // - Yes, fully → human
+            // - Yes, partially → human-ai
+            // - No → ai (DE decides how to handle)
+            const patterns: Array<{ pattern: RegExp; executor: 'human' | 'human-ai' | 'ai' }> = [
               // Literal executor names (highest priority)
-              { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
-              { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
-              { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
-              // Shorthand tags
-              { pattern: /^\[CC\]/i, executor: 'claude-code' },
-              { pattern: /^\[AI\]/i, executor: 'claude-ai' },
-              { pattern: /^\[DE\]/i, executor: 'de-agent' },
-              { pattern: /^\[HUMAN\]/i, executor: 'human' },
+              { pattern: /^\[human\]/i, executor: 'human' },
+              { pattern: /^\[human-ai\]/i, executor: 'human-ai' },
+              { pattern: /^\[ai\]/i, executor: 'ai' },
+              // Legacy tags - map to new types
+              { pattern: /^\[claude-code\]/i, executor: 'ai' },
+              { pattern: /^\[claude-ai\]/i, executor: 'ai' },
+              { pattern: /^\[de-agent\]/i, executor: 'ai' },
+              { pattern: /^\[CC\]/i, executor: 'ai' },
+              { pattern: /^\[DE\]/i, executor: 'ai' },
               { pattern: /^\[BLOCKED\]/i, executor: 'human' },
-              // Semantic tags
-              { pattern: /^\[implement\]/i, executor: 'claude-code' },
-              { pattern: /^\[deploy\]/i, executor: 'claude-code' },
-              { pattern: /^\[fix\]/i, executor: 'claude-code' },
-              { pattern: /^\[refactor\]/i, executor: 'claude-code' },
-              { pattern: /^\[test\]/i, executor: 'claude-code' },
-              { pattern: /^\[debug\]/i, executor: 'claude-code' },
-              { pattern: /^\[code\]/i, executor: 'claude-code' },
-              { pattern: /^\[research\]/i, executor: 'claude-ai' },
-              { pattern: /^\[design\]/i, executor: 'claude-ai' },
-              { pattern: /^\[document\]/i, executor: 'claude-ai' },
-              { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
-              { pattern: /^\[plan\]/i, executor: 'claude-ai' },
-              { pattern: /^\[write\]/i, executor: 'claude-ai' },
-              { pattern: /^\[review\]/i, executor: 'human' },
-              { pattern: /^\[approve\]/i, executor: 'human' },
-              { pattern: /^\[decide\]/i, executor: 'human' },
+              // Human-only tasks (physical action, account access)
+              { pattern: /^\[call\]/i, executor: 'human' },
+              { pattern: /^\[meeting\]/i, executor: 'human' },
+              // Human-AI collaborative tasks
+              { pattern: /^\[review\]/i, executor: 'human-ai' },
+              { pattern: /^\[approve\]/i, executor: 'human-ai' },
+              { pattern: /^\[decide\]/i, executor: 'human-ai' },
+              // All AI-executable tasks -> 'ai'
+              { pattern: /^\[implement\]/i, executor: 'ai' },
+              { pattern: /^\[deploy\]/i, executor: 'ai' },
+              { pattern: /^\[fix\]/i, executor: 'ai' },
+              { pattern: /^\[refactor\]/i, executor: 'ai' },
+              { pattern: /^\[test\]/i, executor: 'ai' },
+              { pattern: /^\[debug\]/i, executor: 'ai' },
+              { pattern: /^\[code\]/i, executor: 'ai' },
+              { pattern: /^\[research\]/i, executor: 'ai' },
+              { pattern: /^\[design\]/i, executor: 'ai' },
+              { pattern: /^\[document\]/i, executor: 'ai' },
+              { pattern: /^\[analyze\]/i, executor: 'ai' },
+              { pattern: /^\[plan\]/i, executor: 'ai' },
+              { pattern: /^\[write\]/i, executor: 'ai' },
             ];
 
             for (const { pattern, executor } of patterns) {
@@ -354,11 +363,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             workflow_error: undefined as string | undefined,
           };
 
-          // Trigger CodeExecutionWorkflow for claude-code and claude-ai tasks via HTTP
+          // Trigger CodeExecutionWorkflow for 'ai' tasks via HTTP
           // The workflow handles execution via sandbox-executor and reports back
           // Note: Cross-worker workflow bindings are NOT supported by CF Workflows,
           // so we trigger via HTTP to the de-workflows worker instead
-          if ((executorType === 'claude-code' || executorType === 'claude-ai') && env.DE_WORKFLOWS_URL) {
+          if (executorType === 'ai' && env.DE_WORKFLOWS_URL) {
             try {
               const workflowUrl = `${env.DE_WORKFLOWS_URL}/workflows/code-execution`;
 
@@ -373,7 +382,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                   params: {
                     task_id: taskId,
                     prompt: `${args.title}\n\n${args.description || ''}`,
-                    preferred_executor: executorType === 'claude-code' ? 'claude' : 'gemini',
+                    preferred_executor: 'claude', // DE decides the actual model
                     timeout_ms: 300000, // 5 minutes
                   },
                 }),
@@ -3025,7 +3034,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'nexus_check_queue',
     'Check the execution queue for tasks waiting to be processed by a specific executor type',
     {
-      executor_type: z.enum(['claude-code', 'claude-ai', 'de-agent', 'human']).describe('The type of executor to check queue for'),
+      executor_type: z.enum(['human', 'human-ai', 'ai']).describe('The type of executor to check queue for'),
       status: z.enum(['queued', 'claimed', 'dispatched', 'all']).optional().describe('Filter by queue status (default: queued)'),
       limit: z.number().optional().describe('Maximum number of results to return (default: 10)'),
     },
@@ -3660,7 +3669,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'Immediately dispatch a single task to the execution queue. Use this when you want a task executed right away instead of waiting for the 15-minute cron.',
     {
       task_id: z.string().uuid().describe('Task ID to dispatch'),
-      executor_type: z.enum(['claude-code', 'claude-ai', 'de-agent', 'human']).optional()
+      executor_type: z.enum(['human', 'human-ai', 'ai']).optional()
         .describe('Override auto-detected executor type (auto-detects from title tag if not provided)'),
       passphrase: passphraseSchema,
     },
@@ -3727,37 +3736,40 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let executorType = args.executor_type;
         if (!executorType) {
           // Auto-detect from title tag patterns
-          const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
+          // Key principle: Does a human need to be involved?
+          const patterns: Array<{ pattern: RegExp; executor: 'human' | 'human-ai' | 'ai' }> = [
             // Literal executor names (highest priority)
-            { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
-            { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
-            { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
-            // Shorthand tags
-            { pattern: /^\[CC\]/i, executor: 'claude-code' },
-            { pattern: /^\[AI\]/i, executor: 'claude-ai' },
-            { pattern: /^\[DE\]/i, executor: 'de-agent' },
-            { pattern: /^\[HUMAN\]/i, executor: 'human' },
-            { pattern: /^\[BLOCKED\]/i, executor: 'human' },
-            // Semantic tags
-            { pattern: /^\[implement\]/i, executor: 'claude-code' },
-            { pattern: /^\[deploy\]/i, executor: 'claude-code' },
-            { pattern: /^\[fix\]/i, executor: 'claude-code' },
-            { pattern: /^\[refactor\]/i, executor: 'claude-code' },
-            { pattern: /^\[test\]/i, executor: 'claude-code' },
-            { pattern: /^\[debug\]/i, executor: 'claude-code' },
-            { pattern: /^\[code\]/i, executor: 'claude-code' },
-            { pattern: /^\[research\]/i, executor: 'claude-ai' },
-            { pattern: /^\[design\]/i, executor: 'claude-ai' },
-            { pattern: /^\[document\]/i, executor: 'claude-ai' },
-            { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
-            { pattern: /^\[plan\]/i, executor: 'claude-ai' },
-            { pattern: /^\[write\]/i, executor: 'claude-ai' },
             { pattern: /^\[human\]/i, executor: 'human' },
-            { pattern: /^\[review\]/i, executor: 'human' },
-            { pattern: /^\[approve\]/i, executor: 'human' },
-            { pattern: /^\[decide\]/i, executor: 'human' },
+            { pattern: /^\[human-ai\]/i, executor: 'human-ai' },
+            { pattern: /^\[ai\]/i, executor: 'ai' },
+            // Legacy tags - map to new types
+            { pattern: /^\[claude-code\]/i, executor: 'ai' },
+            { pattern: /^\[claude-ai\]/i, executor: 'ai' },
+            { pattern: /^\[de-agent\]/i, executor: 'ai' },
+            { pattern: /^\[CC\]/i, executor: 'ai' },
+            { pattern: /^\[DE\]/i, executor: 'ai' },
+            { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+            // Human-only tasks
             { pattern: /^\[call\]/i, executor: 'human' },
             { pattern: /^\[meeting\]/i, executor: 'human' },
+            // Human-AI collaborative tasks
+            { pattern: /^\[review\]/i, executor: 'human-ai' },
+            { pattern: /^\[approve\]/i, executor: 'human-ai' },
+            { pattern: /^\[decide\]/i, executor: 'human-ai' },
+            // All AI-executable tasks
+            { pattern: /^\[implement\]/i, executor: 'ai' },
+            { pattern: /^\[deploy\]/i, executor: 'ai' },
+            { pattern: /^\[fix\]/i, executor: 'ai' },
+            { pattern: /^\[refactor\]/i, executor: 'ai' },
+            { pattern: /^\[test\]/i, executor: 'ai' },
+            { pattern: /^\[debug\]/i, executor: 'ai' },
+            { pattern: /^\[code\]/i, executor: 'ai' },
+            { pattern: /^\[research\]/i, executor: 'ai' },
+            { pattern: /^\[design\]/i, executor: 'ai' },
+            { pattern: /^\[document\]/i, executor: 'ai' },
+            { pattern: /^\[analyze\]/i, executor: 'ai' },
+            { pattern: /^\[plan\]/i, executor: 'ai' },
+            { pattern: /^\[write\]/i, executor: 'ai' },
           ];
 
           executorType = 'human'; // default
@@ -3848,7 +3860,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'nexus_dispatch_ready',
     'Dispatch all tasks with status="next" to the execution queue. Use this to immediately queue all ready tasks instead of waiting for the cron.',
     {
-      executor_type: z.enum(['claude-code', 'claude-ai', 'de-agent', 'human']).optional()
+      executor_type: z.enum(['human', 'human-ai', 'ai']).optional()
         .describe('Filter to only dispatch tasks that would route to this executor'),
       limit: z.number().optional().describe('Maximum number of tasks to dispatch (default: 50)'),
       passphrase: passphraseSchema,
@@ -3901,37 +3913,40 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Auto-detect executor patterns
-        const patterns: Array<{ pattern: RegExp; executor: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' }> = [
+        // Key principle: Does a human need to be involved?
+        const patterns: Array<{ pattern: RegExp; executor: 'human' | 'human-ai' | 'ai' }> = [
           // Literal executor names (highest priority)
-          { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
-          { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
-          { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
-          // Shorthand tags
-          { pattern: /^\[CC\]/i, executor: 'claude-code' },
-          { pattern: /^\[AI\]/i, executor: 'claude-ai' },
-          { pattern: /^\[DE\]/i, executor: 'de-agent' },
-          { pattern: /^\[HUMAN\]/i, executor: 'human' },
-          { pattern: /^\[BLOCKED\]/i, executor: 'human' },
-          // Semantic tags
-          { pattern: /^\[implement\]/i, executor: 'claude-code' },
-          { pattern: /^\[deploy\]/i, executor: 'claude-code' },
-          { pattern: /^\[fix\]/i, executor: 'claude-code' },
-          { pattern: /^\[refactor\]/i, executor: 'claude-code' },
-          { pattern: /^\[test\]/i, executor: 'claude-code' },
-          { pattern: /^\[debug\]/i, executor: 'claude-code' },
-          { pattern: /^\[code\]/i, executor: 'claude-code' },
-          { pattern: /^\[research\]/i, executor: 'claude-ai' },
-          { pattern: /^\[design\]/i, executor: 'claude-ai' },
-          { pattern: /^\[document\]/i, executor: 'claude-ai' },
-          { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
-          { pattern: /^\[plan\]/i, executor: 'claude-ai' },
-          { pattern: /^\[write\]/i, executor: 'claude-ai' },
           { pattern: /^\[human\]/i, executor: 'human' },
-          { pattern: /^\[review\]/i, executor: 'human' },
-          { pattern: /^\[approve\]/i, executor: 'human' },
-          { pattern: /^\[decide\]/i, executor: 'human' },
+          { pattern: /^\[human-ai\]/i, executor: 'human-ai' },
+          { pattern: /^\[ai\]/i, executor: 'ai' },
+          // Legacy tags - map to new types
+          { pattern: /^\[claude-code\]/i, executor: 'ai' },
+          { pattern: /^\[claude-ai\]/i, executor: 'ai' },
+          { pattern: /^\[de-agent\]/i, executor: 'ai' },
+          { pattern: /^\[CC\]/i, executor: 'ai' },
+          { pattern: /^\[DE\]/i, executor: 'ai' },
+          { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+          // Human-only tasks
           { pattern: /^\[call\]/i, executor: 'human' },
           { pattern: /^\[meeting\]/i, executor: 'human' },
+          // Human-AI collaborative tasks
+          { pattern: /^\[review\]/i, executor: 'human-ai' },
+          { pattern: /^\[approve\]/i, executor: 'human-ai' },
+          { pattern: /^\[decide\]/i, executor: 'human-ai' },
+          // All AI-executable tasks
+          { pattern: /^\[implement\]/i, executor: 'ai' },
+          { pattern: /^\[deploy\]/i, executor: 'ai' },
+          { pattern: /^\[fix\]/i, executor: 'ai' },
+          { pattern: /^\[refactor\]/i, executor: 'ai' },
+          { pattern: /^\[test\]/i, executor: 'ai' },
+          { pattern: /^\[debug\]/i, executor: 'ai' },
+          { pattern: /^\[code\]/i, executor: 'ai' },
+          { pattern: /^\[research\]/i, executor: 'ai' },
+          { pattern: /^\[design\]/i, executor: 'ai' },
+          { pattern: /^\[document\]/i, executor: 'ai' },
+          { pattern: /^\[analyze\]/i, executor: 'ai' },
+          { pattern: /^\[plan\]/i, executor: 'ai' },
+          { pattern: /^\[write\]/i, executor: 'ai' },
         ];
 
         const dispatched: Array<{ task_id: string; task_title: string; executor_type: string; queue_id: string }> = [];
@@ -3955,7 +3970,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           const decryptedTitle = await safeDecrypt(task.title, encryptionKey);
 
           // Determine executor type
-          let executorType: 'claude-code' | 'claude-ai' | 'de-agent' | 'human' = 'human';
+          let executorType: 'human' | 'human-ai' | 'ai' = 'human';
           for (const { pattern, executor } of patterns) {
             if (pattern.test(decryptedTitle)) {
               executorType = executor;
@@ -4113,10 +4128,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_run_executor
   server.tool(
     'nexus_run_executor',
-    'Run the task executor immediately to process all queued tasks. This is the same as what the 15-minute cron does, but triggered manually. Processes both claude-ai and claude-code tasks via /execute endpoint (uses OAuth credentials), and de-agent tasks via DE service.',
+    'Run the task executor immediately to process all queued AI tasks. This is the same as what the 15-minute cron does, but triggered manually. Only processes "ai" executor_type tasks.',
     {
-      executor_type: z.enum(['claude-ai', 'claude-code', 'de-agent', 'all']).optional()
-        .describe('Filter to only execute tasks of this type. Default: all'),
+      executor_type: z.enum(['ai', 'all']).optional()
+        .describe('Filter to only execute tasks of this type. Default: all (which only runs ai tasks)'),
       limit: z.number().min(1).max(20).optional()
         .describe('Maximum number of tasks to execute (default: 10)'),
       passphrase: passphraseSchema,
@@ -4191,7 +4206,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'nexus_reset_quarantine',
     'Reset quarantined tasks back to queued status so they can be retried. Use this after fixing the underlying issue (e.g., re-authenticating OAuth).',
     {
-      executor_type: z.enum(['claude-code', 'claude-ai', 'de-agent', 'human', 'all']).optional()
+      executor_type: z.enum(['human', 'human-ai', 'ai', 'all']).optional()
         .describe('Filter to only reset tasks of this executor type. Default: all'),
       task_id: z.string().uuid().optional()
         .describe('Reset a specific task by ID instead of all quarantined tasks'),

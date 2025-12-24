@@ -465,12 +465,15 @@ Automated task routing system that polls for ready tasks and dispatches them to 
 
 ### Executor Types
 
-| Type | Description | Routed From |
-|------|-------------|-------------|
-| `claude-code` | Claude Code CLI for code tasks | `[implement]`, `[deploy]`, `[fix]`, `[refactor]`, `[test]`, `[debug]`, `[code]` |
-| `claude-ai` | Claude.ai for research/writing | `[research]`, `[design]`, `[document]`, `[analyze]`, `[plan]`, `[write]` |
-| `de-agent` | DE service for automated tasks | (reserved for future use) |
-| `human` | Human attention required | `[human]`, `[review]`, `[approve]`, `[decide]`, `[call]`, `[meeting]` |
+Key principle: **Nexus asks "Does a human need to be involved?"** - it does NOT care about HOW AI tasks are executed (that's DE's problem).
+
+| Type | Description | Routed From | Auto-Dispatch |
+|------|-------------|-------------|---------------|
+| `human` | Human only, never auto-dispatch | `[human]`, `[call]`, `[meeting]`, `[BLOCKED]` | No |
+| `human-ai` | Human leads, AI assists | `[review]`, `[approve]`, `[decide]` | No |
+| `ai` | Full AI autonomy, auto-dispatch to DE | `[implement]`, `[fix]`, `[research]`, `[write]`, etc. | Yes |
+
+**Legacy tag support**: `[claude-code]`, `[claude-ai]`, `[de-agent]`, `[CC]`, `[DE]` all map to `ai`.
 
 Tasks without prefix tags default to `human` for triage.
 
@@ -478,7 +481,7 @@ Tasks without prefix tags default to `human` for triage.
 
 ```typescript
 // Check queue for tasks ready to execute
-nexus_check_queue({ executor_type: 'claude-code' })
+nexus_check_queue({ executor_type: 'ai' })
 
 // Claim a task to work on it
 nexus_claim_task({ queue_id: '...', passphrase: '...' })
@@ -491,7 +494,7 @@ nexus_queue_stats()
 
 // MANUAL DISPATCH - Immediately queue tasks without waiting for cron
 nexus_dispatch_task({ task_id: '...', passphrase: '...' })  // Single task
-nexus_dispatch_ready({ executor_type: 'claude-code', passphrase: '...' })  // All ready tasks
+nexus_dispatch_ready({ executor_type: 'ai', passphrase: '...' })  // All ready tasks
 ```
 
 ### REST API Endpoints
