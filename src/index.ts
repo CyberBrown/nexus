@@ -1322,6 +1322,132 @@ async function getOrCreateMcpTenant(env: Env): Promise<{ tenantId: string; userI
   return { tenantId, userId };
 }
 
+// ========================================
+// Workflow Callback Endpoint (public, no auth)
+// Called by DE CodeExecutionWorkflow when tasks complete/fail
+// ========================================
+app.post('/api/workflow-callback', async (c) => {
+  try {
+    const body = await c.req.json() as {
+      success: boolean;
+      task_id?: string;
+      queue_entry_id?: string;
+      tenant_id?: string;
+      workflow_instance_id?: string;
+      result?: string;
+      error?: string;
+      logs?: string;
+      metadata?: Record<string, unknown>;
+    };
+
+    console.log(`Workflow callback received: task_id=${body.task_id}, success=${body.success}`);
+
+    // Validate required fields
+    if (!body.queue_entry_id && !body.task_id) {
+      return c.json({ success: false, error: 'Missing queue_entry_id or task_id' }, 400);
+    }
+
+    const now = new Date().toISOString();
+
+    // Find the queue entry - try by queue_entry_id first, then by task_id
+    let entry: { id: string; tenant_id: string; task_id: string; status: string } | null = null;
+
+    if (body.queue_entry_id) {
+      entry = await c.env.DB.prepare(`
+        SELECT id, tenant_id, task_id, status FROM execution_queue WHERE id = ?
+      `).bind(body.queue_entry_id).first();
+    }
+
+    if (!entry && body.task_id) {
+      // Find the most recent dispatched entry for this task
+      entry = await c.env.DB.prepare(`
+        SELECT id, tenant_id, task_id, status FROM execution_queue
+        WHERE task_id = ? AND status = 'dispatched'
+        ORDER BY updated_at DESC LIMIT 1
+      `).bind(body.task_id).first();
+    }
+
+    if (!entry) {
+      console.log(`Workflow callback: queue entry not found for task_id=${body.task_id}, queue_entry_id=${body.queue_entry_id}`);
+      return c.json({ success: false, error: 'Queue entry not found' }, 404);
+    }
+
+    // Skip if not in dispatched status (already processed or cancelled)
+    if (entry.status !== 'dispatched') {
+      console.log(`Workflow callback: entry ${entry.id} already has status ${entry.status}, skipping`);
+      return c.json({ success: true, message: 'Already processed' });
+    }
+
+    if (body.success) {
+      // Mark as completed
+      const result = body.result || body.logs || 'Task completed via workflow';
+
+      await c.env.DB.prepare(`
+        UPDATE execution_queue
+        SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
+        WHERE id = ?
+      `).bind(now, result.substring(0, 10000), now, entry.id).run();
+
+      // Update task status to completed
+      await c.env.DB.prepare(`
+        UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?
+      `).bind(now, now, entry.task_id).run();
+
+      // Log completion
+      await c.env.DB.prepare(`
+        INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+        VALUES (?, ?, ?, ?, 'workflow', 'completed', ?, ?)
+      `).bind(
+        crypto.randomUUID(),
+        entry.tenant_id,
+        entry.id,
+        entry.task_id,
+        JSON.stringify({
+          workflow_instance_id: body.workflow_instance_id,
+          source: 'workflow_callback',
+          result_preview: result.substring(0, 200),
+        }),
+        now
+      ).run();
+
+      console.log(`Workflow callback: task ${entry.task_id} completed successfully`);
+    } else {
+      // Mark as failed
+      const error = body.error || 'Workflow execution failed';
+
+      await c.env.DB.prepare(`
+        UPDATE execution_queue
+        SET status = 'failed', error = ?, updated_at = ?
+        WHERE id = ?
+      `).bind(error.substring(0, 2000), now, entry.id).run();
+
+      // Log failure
+      await c.env.DB.prepare(`
+        INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+        VALUES (?, ?, ?, ?, 'workflow', 'failed', ?, ?)
+      `).bind(
+        crypto.randomUUID(),
+        entry.tenant_id,
+        entry.id,
+        entry.task_id,
+        JSON.stringify({
+          workflow_instance_id: body.workflow_instance_id,
+          source: 'workflow_callback',
+          error: error.substring(0, 500),
+        }),
+        now
+      ).run();
+
+      console.log(`Workflow callback: task ${entry.task_id} failed: ${error}`);
+    }
+
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('Workflow callback error:', error);
+    return c.json({ success: false, error: 'Callback processing failed' }, 500);
+  }
+});
+
 // 404 handler
 app.notFound((c) => {
   return c.json({ success: false, error: 'Not found' }, 404);

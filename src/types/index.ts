@@ -31,6 +31,9 @@ export interface Env {
   // Service Bindings
   DE: Fetcher; // DE (distributed-electrons) service for LLM operations
   SANDBOX_EXECUTOR?: Fetcher; // Sandbox executor service for task execution
+  INTAKE?: Fetcher; // DE intake worker for workflow-based parallel execution
+  // Self URL for workflow callbacks
+  NEXUS_URL?: string;
   // DE text-gen URL (for workflows that can't use service bindings)
   TEXT_GEN_URL?: string;
   // Sandbox executor URL for task execution

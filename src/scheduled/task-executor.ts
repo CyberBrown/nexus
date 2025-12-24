@@ -1,15 +1,20 @@
-// Task Executor - Execute queued tasks via sandbox-executor
+// Task Executor - Execute queued tasks via DE Workflows (parallel, durable)
 // Runs after dispatchTasks() to process queued work items
 //
-// Routes tasks to sandbox-executor service:
-// - claude-ai tasks -> /execute (uses OAuth credentials via sandbox-executor)
-// - claude-code tasks -> /execute (container path with repo/branch support)
-// - de-agent tasks -> DE service binding (legacy)
+// PARALLEL WORKFLOW EXECUTION (preferred for claude-ai/claude-code):
+// - Triggers CodeExecutionWorkflow via intake service binding
+// - Workflows run in parallel with automatic fallover (Claude -> Gemini)
+// - Built-in retries, crash recovery, callbacks to Nexus
+// - No batch limit - all tasks triggered immediately
+//
+// LEGACY SEQUENTIAL EXECUTION (fallback for de-agent tasks):
+// - de-agent tasks -> DE service binding
 
 import type { Env, Task } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
 import { DEClient, createDEClient } from '../lib/de-client.ts';
 import { SandboxClient, createSandboxClient } from '../lib/sandbox-client.ts';
+import { IntakeClient, createIntakeClient } from '../lib/intake-client.ts';
 import { isOAuthError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
 import type { ExecutorType } from './task-dispatcher.ts';
 
@@ -270,6 +275,38 @@ async function failEntry(
 }
 
 /**
+ * Mark queue entry as dispatched to workflow
+ * Used when triggering parallel workflows via intake - we don't wait for completion
+ */
+async function markEntryAsDispatched(
+  db: D1Database,
+  entry: QueueEntry,
+  workflowInstanceId: string
+): Promise<void> {
+  const now = new Date().toISOString();
+
+  await db.prepare(`
+    UPDATE execution_queue
+    SET status = 'dispatched', claimed_at = ?, claimed_by = ?, updated_at = ?
+    WHERE id = ?
+  `).bind(now, `workflow:${workflowInstanceId}`, now, entry.id).run();
+
+  // Log dispatch
+  await db.prepare(`
+    INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+    VALUES (?, ?, ?, ?, ?, 'dispatched', ?, ?)
+  `).bind(
+    crypto.randomUUID(),
+    entry.tenant_id,
+    entry.id,
+    entry.task_id,
+    entry.executor_type,
+    JSON.stringify({ workflow_instance_id: workflowInstanceId, source: 'task_executor_parallel' }),
+    now
+  ).run();
+}
+
+/**
  * Build prompt for DE based on task context
  */
 function buildTaskPrompt(
@@ -509,21 +546,113 @@ async function executeTaskViaSandboxContainer(
   }
 }
 
+/**
+ * Trigger a workflow for a task via intake service
+ * Returns immediately after workflow is created - callbacks handle completion
+ */
+async function triggerWorkflowForEntry(
+  intakeClient: IntakeClient,
+  entry: QueueEntry & TaskRow,
+  encryptionKey: CryptoKey | null,
+  callbackBaseUrl: string
+): Promise<{ success: boolean; workflowInstanceId?: string; error?: string }> {
+  try {
+    // Decrypt task fields
+    const title = await safeDecrypt(entry.title, encryptionKey);
+    const description = await safeDecrypt(entry.description, encryptionKey);
+
+    // Parse context for repo/branch info
+    let context: Record<string, unknown> | null = null;
+    if (entry.context) {
+      try {
+        context = JSON.parse(entry.context);
+      } catch {
+        const decryptedContext = await safeDecrypt(entry.context, encryptionKey);
+        if (decryptedContext) {
+          try {
+            context = JSON.parse(decryptedContext);
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+
+    // Build task description
+    let taskDescription = `## Task: ${title}`;
+    if (description) {
+      taskDescription += `\n\n## Description\n${description}`;
+    }
+    if (context) {
+      if (context.domain) {
+        taskDescription += `\n\n## Domain: ${context.domain}`;
+      }
+      if (context.source_reference) {
+        taskDescription += `\n## Reference: ${context.source_reference}`;
+      }
+    }
+
+    // Extract repo info from context (for code tasks)
+    const repo = context?.repo as string | undefined;
+    const repoUrl = repo ? `https://github.com/${repo}` : undefined;
+
+    // Trigger workflow via intake
+    const response = await intakeClient.triggerWorkflow({
+      query: taskDescription,
+      task_type: 'code',
+      app_id: 'nexus',
+      task_id: entry.task_id,
+      prompt: taskDescription,
+      repo_url: repoUrl,
+      executor: 'claude', // Prefer Claude, workflow will fallover to Gemini if needed
+      callback_url: `${callbackBaseUrl}/api/workflow-callback`,
+      metadata: {
+        queue_entry_id: entry.id,
+        tenant_id: entry.tenant_id,
+        executor_type: entry.executor_type,
+        title: title,
+      },
+      timeout_ms: entry.executor_type === 'claude-code' ? 600000 : 300000, // 10min for code, 5min for AI
+    });
+
+    if (response.success && response.workflow_instance_id) {
+      return {
+        success: true,
+        workflowInstanceId: response.workflow_instance_id,
+      };
+    } else {
+      return {
+        success: false,
+        error: response.error || response.message || 'Unknown intake error',
+      };
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 // ========================================
 // Main Executor Function
 // ========================================
 
 /**
- * Execute queued tasks via sandbox-executor or DE
+ * Execute queued tasks via DE Workflows (parallel) or sandbox-executor (fallback)
  *
- * Routes tasks based on executor_type:
- * - claude-ai -> sandbox-executor /execute (uses OAuth credentials)
- * - claude-code -> sandbox-executor /execute (container path with repo/branch)
- * - de-agent -> DE service binding (legacy)
+ * PARALLEL WORKFLOW EXECUTION (preferred for claude-ai/claude-code):
+ * - Triggers CodeExecutionWorkflow via intake service binding
+ * - Workflows run in parallel with automatic fallover (Claude -> Gemini)
+ * - Built-in retries, crash recovery, callbacks to Nexus
+ * - No batch limit - all tasks triggered immediately
+ *
+ * SEQUENTIAL EXECUTION (fallback for de-agent tasks):
+ * - de-agent -> DE service binding
  * - human -> skipped (requires human action)
  */
 export async function executeTasks(env: Env): Promise<ExecutionStats> {
-  console.log('Task executor starting...');
+  console.log('Task executor starting (parallel workflow mode)...');
 
   const stats: ExecutionStats = {
     processed: 0,
@@ -534,20 +663,30 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
   };
 
   // Check available execution services
+  const intakeClient = createIntakeClient(env);
   const sandboxClient = createSandboxClient(env);
   const deClient = createDEClient(env);
 
-  // Check sandbox availability
+  // Check intake availability (preferred for parallel workflow execution)
+  let intakeAvailable = false;
+  if (intakeClient) {
+    intakeAvailable = await intakeClient.healthCheck();
+    if (intakeAvailable) {
+      console.log('Intake available - parallel workflow execution enabled');
+    } else {
+      console.warn('Intake configured but not healthy, falling back to sandbox');
+    }
+  }
+
+  // Check sandbox availability (fallback for sequential execution)
   let sandboxAvailable = false;
-  if (sandboxClient) {
+  if (!intakeAvailable && sandboxClient) {
     sandboxAvailable = await sandboxClient.isAvailable();
     if (sandboxAvailable) {
-      console.log('Sandbox executor available');
+      console.log('Sandbox executor available (sequential fallback)');
     } else {
       console.warn('Sandbox executor configured but not healthy');
     }
-  } else {
-    console.log('Sandbox executor not configured (SANDBOX_EXECUTOR_URL not set)');
   }
 
   // Check DE availability (for legacy de-agent tasks)
@@ -560,7 +699,7 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
   }
 
   // If no execution services available, skip
-  if (!sandboxAvailable && !deAvailable) {
+  if (!intakeAvailable && !sandboxAvailable && !deAvailable) {
     console.log('No execution services available, skipping task execution');
     stats.errors.push('No execution services available');
     return stats;
@@ -581,7 +720,7 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
 
     // Build executor type filter based on available services
     const executorTypes: string[] = [];
-    if (sandboxAvailable) {
+    if (intakeAvailable || sandboxAvailable) {
       executorTypes.push('claude-ai', 'claude-code');
     }
     if (deAvailable) {
@@ -594,6 +733,12 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
     }
 
     const executorTypePlaceholders = executorTypes.map(() => '?').join(', ');
+
+    // Use higher limit when intake is available (parallel mode)
+    const taskLimit = intakeAvailable ? 100 : 10;
+
+    // Get callback base URL for workflow callbacks (use NEXUS_URL or fallback)
+    const callbackBaseUrl = env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev';
 
     // Process each tenant
     for (const tenant of tenants.results) {
@@ -610,20 +755,99 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
             AND eq.status = 'queued'
             AND eq.executor_type IN (${executorTypePlaceholders})
           ORDER BY eq.priority DESC, eq.queued_at ASC
-          LIMIT 10
-        `).bind(tenantId, ...executorTypes).all<QueueEntry & TaskRow>();
+          LIMIT ?
+        `).bind(tenantId, ...executorTypes, taskLimit).all<QueueEntry & TaskRow>();
 
         if (!entries.results || entries.results.length === 0) {
           continue;
         }
 
-        console.log(`Found ${entries.results.length} queued tasks for tenant ${tenantId}`);
+        console.log(`Found ${entries.results.length} queued tasks for tenant ${tenantId} (limit: ${taskLimit})`);
 
         // Get encryption key for this tenant
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
-        // Process each entry
+        // Separate entries into workflow tasks (parallel) and sequential tasks
+        const workflowEntries: (QueueEntry & TaskRow)[] = [];
+        const sequentialEntries: (QueueEntry & TaskRow)[] = [];
+
         for (const entry of entries.results) {
+          if ((entry.executor_type === 'claude-ai' || entry.executor_type === 'claude-code') && intakeAvailable) {
+            workflowEntries.push(entry);
+          } else {
+            sequentialEntries.push(entry);
+          }
+        }
+
+        // ========================================
+        // PARALLEL WORKFLOW EXECUTION (claude-ai, claude-code via intake)
+        // ========================================
+        if (workflowEntries.length > 0 && intakeClient) {
+          console.log(`Triggering ${workflowEntries.length} workflows in parallel via intake`);
+
+          // Trigger all workflows in parallel
+          const workflowPromises = workflowEntries.map(async (entry) => {
+            stats.processed++;
+
+            try {
+              // Try to claim the entry first
+              const claimed = await claimEntry(env.DB, entry, executorId);
+              if (!claimed) {
+                console.log(`Entry ${entry.id} already claimed, skipping`);
+                stats.skipped++;
+                return { entry, status: 'skipped' as const };
+              }
+
+              console.log(`Triggering workflow for task: ${entry.task_id} (${entry.executor_type})`);
+
+              // Trigger workflow via intake
+              const result = await triggerWorkflowForEntry(intakeClient, entry, encryptionKey, callbackBaseUrl);
+
+              if (result.success && result.workflowInstanceId) {
+                // Mark as dispatched - workflow callbacks will handle completion
+                await markEntryAsDispatched(env.DB, entry, result.workflowInstanceId);
+                console.log(`Workflow triggered for task ${entry.task_id}: ${result.workflowInstanceId}`);
+                return { entry, status: 'dispatched' as const, workflowInstanceId: result.workflowInstanceId };
+              } else {
+                // Workflow trigger failed - use failEntry for retry logic
+                const error = result.error || 'Unknown workflow trigger error';
+                await failEntry(env.DB, entry, error);
+                stats.failed++;
+                stats.errors.push(`Task ${entry.task_id}: ${error}`);
+                console.error(`Workflow trigger failed for task ${entry.task_id}:`, error);
+                return { entry, status: 'failed' as const, error };
+              }
+            } catch (err) {
+              const error = err instanceof Error ? err.message : String(err);
+              console.error(`Error triggering workflow for entry ${entry.id}:`, error);
+              try {
+                await failEntry(env.DB, entry, error);
+              } catch {
+                // Ignore failure logging errors
+              }
+              stats.failed++;
+              stats.errors.push(`Entry ${entry.id}: ${error}`);
+              return { entry, status: 'error' as const, error };
+            }
+          });
+
+          // Wait for all workflow triggers to complete
+          const workflowResults = await Promise.allSettled(workflowPromises);
+
+          // Count dispatched (successful workflow triggers count as "in progress", not completed)
+          let dispatched = 0;
+          for (const result of workflowResults) {
+            if (result.status === 'fulfilled' && result.value.status === 'dispatched') {
+              dispatched++;
+            }
+          }
+          console.log(`Workflow dispatch complete: ${dispatched} dispatched, ${stats.failed} failed`);
+        }
+
+        // ========================================
+        // SEQUENTIAL EXECUTION (de-agent, fallback sandbox execution)
+        // ========================================
+        for (const entry of sequentialEntries) {
           stats.processed++;
 
           try {
@@ -635,13 +859,14 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
               continue;
             }
 
-            console.log(`Executing task: ${entry.task_id} (${entry.executor_type})`);
+            console.log(`Executing task sequentially: ${entry.task_id} (${entry.executor_type})`);
 
             // Route to appropriate executor
             let result: { success: boolean; result?: string; error?: string };
 
             switch (entry.executor_type) {
               case 'claude-ai':
+                // Fallback to sandbox when intake not available
                 if (!sandboxClient) {
                   result = { success: false, error: 'Sandbox executor not available for claude-ai task' };
                 } else {
@@ -650,6 +875,7 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
                 break;
 
               case 'claude-code':
+                // Fallback to sandbox when intake not available
                 if (!sandboxClient) {
                   result = { success: false, error: 'Sandbox executor not available for claude-code task' };
                 } else {
