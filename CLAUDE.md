@@ -405,13 +405,15 @@ bun run db:migrate:remote
 
 ### In Progress
 - **Task Review Loop** - Triage framework for task routing (see `docs/TASK_REVIEW_LOOP.md`)
-- **CodeExecutionLoop** - Auto-execute code/documentation tasks
-  - ⚠️ **Blocked on DE**: Requires DE to support container-based execution
-  - Tasks route to queue correctly, but cannot execute until DE has container service
-  - See `docs/EXECUTION_LOOP.md` "DE Integration Required" section for full spec
 - **Web Dashboard Completion** - Finish placeholder pages (Projects, Ideas, People, Commitments)
 - **Mnemo Integration** - Context orchestration (Nexus tells Mnemo what to load)
 - **Email Integration** - Gmail/IMAP ingestion and classification
+
+### Recently Completed
+- **CodeExecutionLoop** - Auto-execute code/documentation tasks via DE Workflows ✅
+  - HTTP triggers for cross-worker workflow execution
+  - Callback handlers for execution results
+  - See `docs/EXECUTION_LOOP.md` for full architecture
 
 ## Execution Loop Hierarchy
 
@@ -431,7 +433,7 @@ See `docs/EXECUTION_LOOP.md` for full documentation (idea triage, task review, e
 │ CodeExecutionLoop │ │  ResearchLoop   │ │  ContentLoop    │
 │ (Code/Docs tasks) │ │ (Investigation) │ │ (Writing/Media) │
 └───────────────────┘ └─────────────────┘ └─────────────────┘
-        (partial)          (planned)           (planned)
+    (implemented)          (planned)           (planned)
 ```
 
 ### Loop Trigger Flow

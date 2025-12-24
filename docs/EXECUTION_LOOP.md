@@ -248,82 +248,91 @@ No planning phase. No complex review. Just triage → do → done.
 | Quick Win Fast Path | ⏳ Planned | Skip planning for small items |
 | IdeaExecutionLoop | ✅ Implemented | Manual trigger via API |
 | Task Review Questions | ⏳ Planned | Schema additions needed |
-| CodeExecutionLoop | ⚠️ Blocked | Tasks created, but **blocked on DE container support** |
-| Auto-trigger System | ❌ Not started | Needs cron or event system |
+| CodeExecutionLoop | ✅ Implemented | Via DE Workflows with HTTP triggers |
+| Auto-trigger System | ✅ Implemented | Cron (15 min) + manual dispatch via MCP |
 | Escalation to Bridge | ❌ Not started | Bridge project not yet built |
 
-## DE Integration - Required for Execution
+## DE Integration - Event-Driven Execution
 
-### Current Blocker
+### Architecture (Implemented)
 
-Nexus routes tasks to executor queues but **cannot execute them**. The execution loops
-(CodeExecutionLoop, ResearchLoop, etc.) require DE to support container-based execution.
+Nexus dispatches tasks to the execution queue, then triggers DE Workflows via HTTP.
+DE Workflows execute autonomously and report back to Nexus via callback endpoints.
 
-**The gap**: Nexus is an orchestrator (the Brain), not an executor. When a task like
-"[implement] Update README.md" hits the `claude-code` queue, nothing actually does the work.
-DE needs to provide the "Arms & Legs" - container infrastructure that can run Claude Code CLI.
+**Key insight**: Cloudflare Workflows cannot be triggered cross-worker via bindings,
+so we use HTTP triggers instead. This decouples the services while maintaining reliability.
 
-### Architecture
+### Current Architecture
 
 ```
 Nexus (Brain/Orchestrator)
-    ↓ sends task via API
-DE (Arms & Legs)
-    ↓ spins up
-Container with Claude Code CLI
-    ↓ executes task
-Reports results back to Nexus
+    ↓ dispatches task to queue
+    ↓ calls POST /workflow/execute
+DE Workflows Worker
+    ↓ triggers CodeExecutionWorkflow
+    ↓ sandbox-executor runs Claude Code
+    ↓ calls POST /api/workflow/callback
+Nexus receives result, updates task status
 ```
 
-### What DE Needs to Support
+### Implemented Components
 
-1. **Container Execution Service**
-   - Spin up containers on demand (Docker, Fly.io, etc.)
-   - Mount workspace/repo (clone from GitHub)
-   - Run Claude Code CLI or other executors
-   - Stream output back to Nexus
-   - Handle timeouts and resource limits
+1. **Nexus Side**
+   - `nexus_dispatch_task` / `nexus_dispatch_ready` - Queue tasks for execution
+   - `nexus_execute_task` - Trigger DE workflow execution immediately
+   - `POST /api/workflow/callback` - Receive execution results from DE
+   - Auto-dispatch on task completion (chains ready tasks)
 
-2. **Execution API**
+2. **DE Workflows Side**
+   - `POST /workflow/execute` - HTTP trigger for CodeExecutionWorkflow
+   - `CodeExecutionWorkflow` - Durable workflow with retry/timeout handling
+   - Calls sandbox-executor with task context
+   - Reports back to Nexus callback URL on completion
+
+3. **Execution Flow**
    ```
-   POST /execute
-   {
-     "executor": "claude-code",
-     "task": {
-       "id": "task-uuid",
-       "title": "[implement] Update README.md",
-       "description": "Add MCP command documentation",
-       "context": { ... }
-     },
-     "repo": "github.com/CyberBrown/nexus",
-     "branch": "dev",
-     "callback_url": "https://nexus.solamp.workers.dev/api/execution/callback"
-   }
+   Task created with status="next"
+           ↓
+   Cron (15 min) OR manual: nexus_dispatch_task
+           ↓
+   Queue entry created with executor type
+           ↓
+   nexus_execute_task triggers DE workflow
+           ↓
+   CodeExecutionWorkflow runs in sandbox-executor
+           ↓
+   Callback to Nexus with result
+           ↓
+   Task marked complete, auto-dispatch checks for next tasks
    ```
 
-3. **Status Reporting**
-   - Progress updates during execution (streaming)
-   - Final result/error reporting
-   - Artifact collection (files changed, commit hash, logs)
-   - Webhook callback to Nexus when complete
+### MCP Tools for Execution
 
-### Nexus Side Requirements
+```typescript
+// Dispatch single task immediately
+nexus_dispatch_task({ task_id: '...', passphrase: '...' })
 
-When DE container execution is ready, Nexus needs:
+// Dispatch all ready tasks
+nexus_dispatch_ready({ executor_type: 'claude-code', passphrase: '...' })
 
-1. **Dispatch to DE**: Call DE's `/execute` API when task is claimed
-2. **Callback Handler**: `POST /api/execution/callback` to receive results
-3. **Status Sync**: Update `execution_queue` and task status from callbacks
-4. **Error Handling**: Handle timeouts, failures, retries
+// Execute queued task via DE workflow
+nexus_execute_task({ queue_id: '...', passphrase: '...' })
 
-### Next Steps
+// Run batch executor (processes multiple queued tasks)
+nexus_run_executor({ executor_type: 'claude-code', limit: 10, passphrase: '...' })
+```
 
-When implementing CodeExecutionLoop:
-1. ⏳ Build container execution service in DE first
-2. Add Nexus → DE execution API call
-3. Add callback handler in Nexus for results
-4. Wire up queue → DE dispatch
-5. Add streaming status updates
+### Remaining Work
+
+Core execution loop is functional. Remaining enhancements:
+
+1. ✅ ~~Build container execution service in DE~~ - sandbox-executor implemented
+2. ✅ ~~Add Nexus → DE execution API call~~ - nexus_execute_task implemented
+3. ✅ ~~Add callback handler in Nexus for results~~ - /api/workflow/callback implemented
+4. ✅ ~~Wire up queue → DE dispatch~~ - nexus_run_executor implemented
+5. ⏳ Add streaming status updates (nice-to-have)
+6. ⏳ Improve error handling and retry logic
+7. ⏳ Add execution metrics and monitoring
 
 See: https://github.com/CyberBrown/distributed-electrons
 
