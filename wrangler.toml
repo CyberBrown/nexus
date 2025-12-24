@@ -16,7 +16,7 @@ ENVIRONMENT = "development"
 # Nexus self URL for workflow callbacks
 NEXUS_URL = "https://nexus-mcp.solamp.workers.dev"
 # DE text-gen URL for workflows (workflows can't use service bindings)
-TEXT_GEN_URL = "https://text-gen.solamp.workers.dev"
+TEXT_GEN_URL = "https://de-text-gen.solamp.workers.dev"
 # Sandbox executor URL for task execution (claude-code and claude-ai tasks)
 SANDBOX_EXECUTOR_URL = "https://sandbox-executor.solamp.workers.dev"
 # Cloudflare Access - set these for production auth

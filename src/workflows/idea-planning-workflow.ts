@@ -206,10 +206,10 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
 
   /**
    * Generate execution plan using DE text-gen worker via HTTP
+   * Routes through DE's LLM router for automatic provider fallback
    * Note: Cloudflare Workflows can't use service bindings, must use HTTP fetch
    */
   private async generatePlanWithDE(idea: IdeaData): Promise<ExecutionPlan> {
-    // Workflows can't use service bindings - must use TEXT_GEN_URL
     const textGenUrl = this.env.TEXT_GEN_URL;
     if (!textGenUrl) {
       throw new Error('TEXT_GEN_URL not configured. Set TEXT_GEN_URL in wrangler.toml [vars]');
@@ -221,6 +221,7 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
     // DE's text-gen service expects a prompt-based request
     const prompt = `System: ${systemPrompt}\n\nUser: ${userPrompt}\n\nAssistant:`;
 
+    // Route through DE text-gen - let the router use its provider chain
     const response = await fetch(`${textGenUrl}/generate`, {
       method: 'POST',
       headers: {
@@ -228,7 +229,6 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
       },
       body: JSON.stringify({
         prompt,
-        model: 'claude-sonnet-4-20250514',
         max_tokens: 2048,
         temperature: 0.7,
       }),
@@ -242,7 +242,7 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
     const data = await response.json() as {
       success: boolean;
       text: string;
-      metadata: {
+      metadata?: {
         provider: string;
         model: string;
         tokens_used: number;
@@ -253,6 +253,7 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
       throw new Error('DE returned empty response');
     }
 
+    console.log(`Plan generated via DE text-gen (${data.metadata?.provider || 'unknown'})`);
     return this.parsePlanResponseFromText(data.text);
   }
 
