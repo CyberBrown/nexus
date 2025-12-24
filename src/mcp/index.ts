@@ -99,6 +99,7 @@ const WRITE_TOOLS = new Set([
   'nexus_execute_task',
   'nexus_run_executor',
   'nexus_reset_quarantine',
+  'nexus_cleanup_queue',
 ]);
 
 /**
@@ -4089,6 +4090,111 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 task_id: taskId || null,
                 limit: limit,
               },
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_cleanup_queue
+  server.tool(
+    'nexus_cleanup_queue',
+    'Clean up duplicate and stale entries from execution_queue. Removes quarantine entries where the task already has an active entry, and optionally clears old completed/failed/cancelled entries.',
+    {
+      mode: z.enum(['duplicates', 'stale', 'all']).default('duplicates')
+        .describe('Cleanup mode: "duplicates" removes quarantine entries with active task entries, "stale" removes old completed/failed/cancelled entries (>7 days), "all" does both'),
+      dry_run: z.boolean().default(false)
+        .describe('If true, only report what would be deleted without actually deleting'),
+      passphrase: passphraseSchema,
+    },
+    async ({ mode, dry_run, passphrase }) => {
+      try {
+        const authError = validatePassphrase('nexus_cleanup_queue', { passphrase }, env.WRITE_PASSPHRASE);
+        if (authError) return authError;
+
+        const tenantId = 'default';
+        const results: { duplicates_removed: number; stale_removed: number; details: string[] } = {
+          duplicates_removed: 0,
+          stale_removed: 0,
+          details: [],
+        };
+
+        // Find and remove quarantine entries where task already has an active entry
+        if (mode === 'duplicates' || mode === 'all') {
+          // First, identify duplicates
+          const duplicates = await env.DB.prepare(`
+            SELECT q1.id, q1.task_id, q1.status as quarantine_status, q2.status as active_status
+            FROM execution_queue q1
+            INNER JOIN execution_queue q2 ON q1.task_id = q2.task_id AND q1.id != q2.id
+            WHERE q1.tenant_id = ?
+              AND q1.status = 'quarantine'
+              AND q2.status IN ('queued', 'claimed', 'dispatched')
+          `).bind(tenantId).all();
+
+          if (duplicates.results && duplicates.results.length > 0) {
+            results.details.push(`Found ${duplicates.results.length} quarantine entries with active task entries`);
+
+            if (!dry_run) {
+              // Delete the duplicate quarantine entries
+              const ids = duplicates.results.map((d: any) => d.id);
+              for (const id of ids) {
+                await env.DB.prepare(`
+                  DELETE FROM execution_queue WHERE id = ? AND tenant_id = ?
+                `).bind(id, tenantId).run();
+              }
+              results.duplicates_removed = ids.length;
+            } else {
+              results.duplicates_removed = duplicates.results.length;
+            }
+          }
+        }
+
+        // Remove stale entries (completed/failed/cancelled older than 7 days)
+        if (mode === 'stale' || mode === 'all') {
+          const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+          // Count stale entries
+          const staleCount = await env.DB.prepare(`
+            SELECT COUNT(*) as count FROM execution_queue
+            WHERE tenant_id = ?
+              AND status IN ('completed', 'failed', 'cancelled')
+              AND updated_at < ?
+          `).bind(tenantId, sevenDaysAgo).first<{ count: number }>();
+
+          if (staleCount && staleCount.count > 0) {
+            results.details.push(`Found ${staleCount.count} stale entries older than 7 days`);
+
+            if (!dry_run) {
+              await env.DB.prepare(`
+                DELETE FROM execution_queue
+                WHERE tenant_id = ?
+                  AND status IN ('completed', 'failed', 'cancelled')
+                  AND updated_at < ?
+              `).bind(tenantId, sevenDaysAgo).run();
+              results.stale_removed = staleCount.count;
+            } else {
+              results.stale_removed = staleCount.count;
+            }
+          }
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              dry_run,
+              mode,
+              ...results,
+              message: dry_run
+                ? `Dry run complete. Would remove ${results.duplicates_removed} duplicates and ${results.stale_removed} stale entries.`
+                : `Cleanup complete. Removed ${results.duplicates_removed} duplicates and ${results.stale_removed} stale entries.`,
             }, null, 2)
           }]
         };
