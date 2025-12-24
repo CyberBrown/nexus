@@ -3968,22 +3968,21 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Helper: Check and apply quarantine if needed
   async function checkAndQuarantine(db: D1Database, queueId: string, tenantId: string): Promise<boolean> {
     const entry = await db.prepare(`
-      SELECT id, attempt_count, max_attempts, failure_history FROM execution_queue
+      SELECT id, retry_count, max_retries FROM execution_queue
       WHERE id = ? AND tenant_id = ?
-    `).bind(queueId, tenantId).first<{ id: string; attempt_count: number; max_attempts: number; failure_history: string }>();
+    `).bind(queueId, tenantId).first<{ id: string; retry_count: number; max_retries: number }>();
 
     if (!entry) return false;
 
-    if (entry.attempt_count >= entry.max_attempts) {
+    if (entry.retry_count >= entry.max_retries) {
       const now = new Date().toISOString();
       await db.prepare(`
         UPDATE execution_queue
         SET status = 'quarantine',
-            quarantine_reason = 'Max attempts exceeded after ' || ? || ' failures',
-            quarantined_at = ?,
+            error = 'Max attempts (' || ? || ') exceeded',
             updated_at = ?
         WHERE id = ?
-      `).bind(entry.attempt_count, now, now, queueId).run();
+      `).bind(entry.retry_count, now, queueId).run();
       return true;
     }
     return false;
@@ -4022,11 +4021,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           query = `
             UPDATE execution_queue
             SET status = 'queued',
-                attempt_count = 0,
-                quarantine_reason = NULL,
-                quarantined_at = NULL,
+                retry_count = 0,
                 error = NULL,
-                failure_history = NULL,
                 updated_at = ?
             WHERE tenant_id = ? AND task_id = ? AND status = 'quarantine'
           `;
@@ -4036,11 +4032,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           query = `
             UPDATE execution_queue
             SET status = 'queued',
-                attempt_count = 0,
-                quarantine_reason = NULL,
-                quarantined_at = NULL,
+                retry_count = 0,
                 error = NULL,
-                failure_history = NULL,
                 updated_at = ?
             WHERE tenant_id = ? AND executor_type = ? AND status = 'quarantine'
             AND id IN (
@@ -4056,11 +4049,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           query = `
             UPDATE execution_queue
             SET status = 'queued',
-                attempt_count = 0,
-                quarantine_reason = NULL,
-                quarantined_at = NULL,
+                retry_count = 0,
                 error = NULL,
-                failure_history = NULL,
                 updated_at = ?
             WHERE tenant_id = ? AND status = 'quarantine'
             AND id IN (
