@@ -39,6 +39,8 @@ export interface Env {
   // Sandbox executor URL for task execution
   SANDBOX_EXECUTOR_URL?: string;
   SANDBOX_AUTH_TOKEN?: string;
+  // DE Workflows URL for triggering CodeExecutionWorkflow via HTTP
+  DE_WORKFLOWS_URL?: string;
   // Fallback Anthropic API key (for environments without DE)
   ANTHROPIC_API_KEY?: string;
   // Write passphrase for MCP destructive operations
@@ -49,11 +51,13 @@ export interface Env {
   // Cloudflare Access
   TEAM_DOMAIN?: string; // e.g., https://your-team.cloudflareaccess.com
   POLICY_AUD?: string; // Application Audience (AUD) tag
-  // Cloudflare Workflows
+  // Cloudflare Workflows (local workflows only)
   IDEA_EXECUTION_WORKFLOW: Workflow; // Legacy workflow binding
   IDEA_TO_PLAN_WORKFLOW: Workflow;
   TASK_EXECUTOR_WORKFLOW: Workflow;
   IDEA_PLANNING_WORKFLOW: Workflow;
+  // Note: CodeExecutionWorkflow is triggered via HTTP to DE_WORKFLOWS_URL
+  // Cross-worker workflow bindings are NOT supported by CF Workflows
 }
 
 // Cloudflare Scheduled Event

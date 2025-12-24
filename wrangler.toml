@@ -19,6 +19,8 @@ NEXUS_URL = "https://nexus-mcp.solamp.workers.dev"
 TEXT_GEN_URL = "https://de-text-gen.solamp.workers.dev"
 # Sandbox executor URL for task execution (claude-code and claude-ai tasks)
 SANDBOX_EXECUTOR_URL = "https://sandbox-executor.solamp.workers.dev"
+# DE Workflows URL for triggering CodeExecutionWorkflow via HTTP
+DE_WORKFLOWS_URL = "https://de-workflows.solamp.workers.dev"
 # Cloudflare Access - set these for production auth
 # TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 # POLICY_AUD = "your-application-audience-tag"
@@ -129,3 +131,7 @@ class_name = "TaskExecutorWorkflow"
 name = "idea-planning-workflow"
 binding = "IDEA_PLANNING_WORKFLOW"
 class_name = "IdeaPlanningWorkflow"
+
+# NOTE: Cross-worker workflow bindings are NOT supported by CF Workflows
+# CODE_EXECUTION_WORKFLOW is triggered via HTTP to de-workflows worker instead
+# See DE_WORKFLOWS_URL in [vars] section

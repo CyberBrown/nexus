@@ -350,7 +350,67 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             queue_id: queueId,
             executor_type: executorType,
             priority,
+            workflow_triggered: false as boolean,
+            workflow_error: undefined as string | undefined,
           };
+
+          // Trigger CodeExecutionWorkflow for claude-code and claude-ai tasks via HTTP
+          // The workflow handles execution via sandbox-executor and reports back
+          // Note: Cross-worker workflow bindings are NOT supported by CF Workflows,
+          // so we trigger via HTTP to the de-workflows worker instead
+          if ((executorType === 'claude-code' || executorType === 'claude-ai') && env.DE_WORKFLOWS_URL) {
+            try {
+              const workflowUrl = `${env.DE_WORKFLOWS_URL}/workflows/code-execution`;
+
+              const workflowResponse = await fetch(workflowUrl, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Passphrase': env.WRITE_PASSPHRASE || '',
+                },
+                body: JSON.stringify({
+                  id: taskId, // Use task_id as workflow instance ID to prevent duplicates
+                  params: {
+                    task_id: taskId,
+                    prompt: `${args.title}\n\n${args.description || ''}`,
+                    preferred_executor: executorType === 'claude-code' ? 'claude' : 'gemini',
+                    timeout_ms: 300000, // 5 minutes
+                  },
+                }),
+              });
+
+              const workflowResult = await workflowResponse.json() as { success: boolean; error?: string; code?: string };
+
+              if (workflowResult.success) {
+                // Update queue status to 'dispatched' since workflow is triggered
+                await env.DB.prepare(`
+                  UPDATE execution_queue SET status = 'dispatched', updated_at = ? WHERE id = ?
+                `).bind(now, queueId).run();
+
+                // Update task status to 'scheduled' since workflow is running
+                await env.DB.prepare(`
+                  UPDATE tasks SET status = 'scheduled', updated_at = ? WHERE id = ?
+                `).bind(now, taskId).run();
+
+                dispatchResult.workflow_triggered = true;
+                console.log(`[nexus_create_task] CodeExecutionWorkflow triggered for task ${taskId}`);
+              } else {
+                // Handle duplicate workflow gracefully
+                if (workflowResult.code === 'DUPLICATE_WORKFLOW') {
+                  dispatchResult.workflow_triggered = false;
+                  dispatchResult.workflow_error = 'Workflow already exists for this task';
+                } else {
+                  throw new Error(workflowResult.error || 'Failed to trigger workflow');
+                }
+              }
+            } catch (workflowError: any) {
+              // Log but don't fail - task is still queued even if workflow trigger fails
+              // Cron will pick it up as a fallback
+              console.warn(`[nexus_create_task] Failed to trigger workflow: ${workflowError.message}`);
+              dispatchResult.workflow_triggered = false;
+              dispatchResult.workflow_error = workflowError.message;
+            }
+          }
         }
 
         const response: Record<string, unknown> = {

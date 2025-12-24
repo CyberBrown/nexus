@@ -1323,6 +1323,151 @@ async function getOrCreateMcpTenant(env: Env): Promise<{ tenantId: string; userI
 }
 
 // ========================================
+// Task Callback Endpoints (public, passphrase auth)
+// Called by DE CodeExecutionWorkflow to report task completion/failure
+// ========================================
+
+// POST /api/tasks/:id/complete - Mark task as completed (called by workflows)
+app.post('/api/tasks/:id/complete', async (c) => {
+  try {
+    const taskId = c.req.param('id');
+    const passphrase = c.req.header('X-Passphrase');
+
+    // Validate passphrase
+    if (c.env.WRITE_PASSPHRASE && passphrase !== c.env.WRITE_PASSPHRASE) {
+      return c.json({ success: false, error: 'Invalid passphrase' }, 401);
+    }
+
+    const body = await c.req.json().catch(() => ({})) as {
+      notes?: string;
+      output?: string;
+      executor?: string;
+      duration_ms?: number;
+    };
+
+    const now = new Date().toISOString();
+
+    // Find the task
+    const task = await c.env.DB.prepare(`
+      SELECT id, tenant_id, user_id, status FROM tasks WHERE id = ? AND deleted_at IS NULL
+    `).bind(taskId).first<{ id: string; tenant_id: string; user_id: string; status: string }>();
+
+    if (!task) {
+      return c.json({ success: false, error: 'Task not found' }, 404);
+    }
+
+    // Update task to completed
+    await c.env.DB.prepare(`
+      UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?
+    `).bind(now, now, taskId).run();
+
+    // Update any execution queue entries
+    await c.env.DB.prepare(`
+      UPDATE execution_queue
+      SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
+      WHERE task_id = ? AND status IN ('dispatched', 'claimed', 'queued')
+    `).bind(now, body.notes || body.output || 'Completed', now, taskId).run();
+
+    // Log completion
+    await c.env.DB.prepare(`
+      INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+      VALUES (?, ?, NULL, ?, 'workflow', 'completed', ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      task.tenant_id,
+      taskId,
+      JSON.stringify({
+        source: 'task_complete_callback',
+        executor: body.executor,
+        duration_ms: body.duration_ms,
+        notes: body.notes?.substring(0, 200),
+      }),
+      now
+    ).run();
+
+    console.log(`Task ${taskId} marked complete via callback`);
+    return c.json({ success: true, task_id: taskId, status: 'completed' });
+  } catch (error) {
+    console.error('Task complete callback error:', error);
+    return c.json({ success: false, error: 'Callback processing failed' }, 500);
+  }
+});
+
+// POST /api/tasks/:id/error - Mark task as failed (called by workflows)
+app.post('/api/tasks/:id/error', async (c) => {
+  try {
+    const taskId = c.req.param('id');
+    const passphrase = c.req.header('X-Passphrase');
+
+    // Validate passphrase
+    if (c.env.WRITE_PASSPHRASE && passphrase !== c.env.WRITE_PASSPHRASE) {
+      return c.json({ success: false, error: 'Invalid passphrase' }, 401);
+    }
+
+    const body = await c.req.json().catch(() => ({})) as {
+      error?: string;
+      executor?: string;
+      duration_ms?: number;
+      quarantine?: boolean;
+      retry_count?: number;
+    };
+
+    const now = new Date().toISOString();
+
+    // Find the task
+    const task = await c.env.DB.prepare(`
+      SELECT id, tenant_id, user_id, status FROM tasks WHERE id = ? AND deleted_at IS NULL
+    `).bind(taskId).first<{ id: string; tenant_id: string; user_id: string; status: string }>();
+
+    if (!task) {
+      return c.json({ success: false, error: 'Task not found' }, 404);
+    }
+
+    // Determine new status based on quarantine flag
+    const newStatus = body.quarantine ? 'cancelled' : 'next'; // 'next' allows retry
+
+    // Update task
+    await c.env.DB.prepare(`
+      UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?
+    `).bind(newStatus, now, taskId).run();
+
+    // Update any execution queue entries
+    const queueStatus = body.quarantine ? 'quarantine' : 'failed';
+    await c.env.DB.prepare(`
+      UPDATE execution_queue
+      SET status = ?, error = ?, updated_at = ?
+      WHERE task_id = ? AND status IN ('dispatched', 'claimed', 'queued')
+    `).bind(queueStatus, body.error?.substring(0, 2000) || 'Unknown error', now, taskId).run();
+
+    // Log failure
+    await c.env.DB.prepare(`
+      INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+      VALUES (?, ?, NULL, ?, 'workflow', ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      task.tenant_id,
+      taskId,
+      body.quarantine ? 'quarantined' : 'failed',
+      JSON.stringify({
+        source: 'task_error_callback',
+        executor: body.executor,
+        duration_ms: body.duration_ms,
+        error: body.error?.substring(0, 500),
+        retry_count: body.retry_count,
+        quarantine: body.quarantine,
+      }),
+      now
+    ).run();
+
+    console.log(`Task ${taskId} marked ${queueStatus} via callback: ${body.error}`);
+    return c.json({ success: true, task_id: taskId, status: newStatus, retry_count: body.retry_count });
+  } catch (error) {
+    console.error('Task error callback error:', error);
+    return c.json({ success: false, error: 'Callback processing failed' }, 500);
+  }
+});
+
+// ========================================
 // Workflow Callback Endpoint (public, no auth)
 // Called by DE CodeExecutionWorkflow when tasks complete/fail
 // NOTE: Path is /workflow-callback (not /api/workflow-callback) to avoid auth middleware
