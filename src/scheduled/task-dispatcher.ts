@@ -82,12 +82,13 @@ interface QueueEntry {
 }
 
 /**
- * Check if a task is already queued or being executed
+ * Check if a task is already queued, being executed, or in quarantine
+ * Note: quarantine status means the task failed and needs attention - don't re-dispatch
  */
 async function isTaskQueued(db: D1Database, taskId: string): Promise<boolean> {
   const existing = await db.prepare(`
     SELECT id FROM execution_queue
-    WHERE task_id = ? AND status IN ('queued', 'claimed', 'dispatched')
+    WHERE task_id = ? AND status IN ('queued', 'claimed', 'dispatched', 'quarantine')
     LIMIT 1
   `).bind(taskId).first<QueueEntry>();
 

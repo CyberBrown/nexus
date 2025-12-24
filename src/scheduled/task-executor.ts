@@ -192,6 +192,14 @@ async function failEntry(
       WHERE id = ?
     `).bind(error, quarantineReason, now, newRetryCount, now, entry.id).run();
 
+    // Update task status to 'waiting' so it's visible but not re-dispatched
+    await db.prepare(`
+      UPDATE tasks
+      SET status = 'waiting',
+          updated_at = ?
+      WHERE id = ?
+    `).bind(now, entry.task_id).run();
+
     await db.prepare(`
       INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
       VALUES (?, ?, ?, ?, ?, 'quarantined', ?, ?)
@@ -250,6 +258,14 @@ async function failEntry(
           updated_at = ?
       WHERE id = ?
     `).bind(error, quarantineReason, now, newRetryCount, now, entry.id).run();
+
+    // Update task status to 'waiting' so it's visible but not re-dispatched
+    await db.prepare(`
+      UPDATE tasks
+      SET status = 'waiting',
+          updated_at = ?
+      WHERE id = ?
+    `).bind(now, entry.task_id).run();
 
     await db.prepare(`
       INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)

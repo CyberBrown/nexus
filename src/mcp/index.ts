@@ -15,7 +15,7 @@ import { createMcpHandler } from 'agents/mcp';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { Env } from '../types/index.ts';
 import type { D1Database } from '@cloudflare/workers-types';
-import { getEncryptionKey, encryptField, decryptField } from '../lib/encryption.ts';
+import { getEncryptionKey, encryptField, decryptField, decryptFields } from '../lib/encryption.ts';
 import { executeQueueEntry } from '../scheduled/task-executor.ts';
 
 // ========================================
@@ -121,6 +121,7 @@ const READ_TOOLS = new Set([
   'nexus_check_queue',
   'nexus_queue_stats',
   'nexus_task_status',
+  'nexus_list_quarantined',
 ]);
 
 /**
@@ -3446,6 +3447,141 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 return acc;
               }, {} as Record<string, Record<string, number>>),
               recent_activity_1h: Object.fromEntries((recentActivity.results || []).map(r => [r.action, r.count])),
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_list_quarantined
+  server.tool(
+    'nexus_list_quarantined',
+    'List all quarantined tasks that need attention. Quarantined tasks are ones that failed execution and need investigation or manual intervention.',
+    {
+      limit: z.number().optional().describe('Maximum number of results to return (default: 50)'),
+      include_context: z.boolean().optional().describe('Include full task context in response (default: false)'),
+    },
+    async ({ limit = 50, include_context = false }): Promise<CallToolResult> => {
+      try {
+        // Get encryption key for decrypting task titles
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
+        // Query quarantined entries with task info
+        const results = await env.DB.prepare(`
+          SELECT
+            eq.id as queue_id,
+            eq.task_id,
+            eq.executor_type,
+            eq.status as queue_status,
+            eq.error,
+            eq.retry_count,
+            eq.context,
+            eq.queued_at,
+            eq.updated_at as quarantined_at,
+            t.title,
+            t.description,
+            t.status as task_status,
+            t.urgency,
+            t.importance,
+            t.project_id,
+            t.source_type,
+            t.source_reference
+          FROM execution_queue eq
+          LEFT JOIN tasks t ON eq.task_id = t.id
+          WHERE eq.tenant_id = ? AND eq.status = 'quarantine'
+          ORDER BY eq.updated_at DESC
+          LIMIT ?
+        `).bind(tenantId, limit).all<{
+          queue_id: string;
+          task_id: string;
+          executor_type: string;
+          queue_status: string;
+          error: string | null;
+          retry_count: number;
+          context: string | null;
+          queued_at: string;
+          quarantined_at: string;
+          title: string | null;
+          description: string | null;
+          task_status: string | null;
+          urgency: number | null;
+          importance: number | null;
+          project_id: string | null;
+          source_type: string | null;
+          source_reference: string | null;
+        }>();
+
+        // Decrypt titles and format results
+        const quarantined = await Promise.all((results.results || []).map(async (row) => {
+          let decryptedTitle = row.title;
+          let decryptedDescription = row.description;
+
+          // Decrypt if we have encrypted content
+          if (row.title && encryptionKey) {
+            try {
+              const decrypted = await decryptFields(
+                { title: row.title, description: row.description },
+                ['title', 'description'],
+                encryptionKey
+              );
+              decryptedTitle = decrypted.title;
+              decryptedDescription = decrypted.description;
+            } catch {
+              // If decryption fails, use original (might be unencrypted)
+            }
+          }
+
+          const item: Record<string, unknown> = {
+            queue_id: row.queue_id,
+            task_id: row.task_id,
+            title: decryptedTitle || '[Task not found]',
+            executor_type: row.executor_type,
+            error: row.error,
+            retry_count: row.retry_count,
+            quarantined_at: row.quarantined_at,
+            queued_at: row.queued_at,
+            task_status: row.task_status,
+            urgency: row.urgency,
+            importance: row.importance,
+          };
+
+          // Include context and description if requested
+          if (include_context) {
+            item.description = decryptedDescription;
+            item.context = row.context ? JSON.parse(row.context) : null;
+            item.project_id = row.project_id;
+            item.source_type = row.source_type;
+            item.source_reference = row.source_reference;
+          }
+
+          return item;
+        }));
+
+        // Get total count
+        const countResult = await env.DB.prepare(`
+          SELECT COUNT(*) as count FROM execution_queue
+          WHERE tenant_id = ? AND status = 'quarantine'
+        `).bind(tenantId).first<{ count: number }>();
+
+        const totalCount = countResult?.count || 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              total_quarantined: totalCount,
+              showing: quarantined.length,
+              quarantined,
+              message: totalCount > 0
+                ? `${totalCount} task(s) in quarantine need attention. Use nexus_reset_quarantine to retry or nexus_complete_task to cancel.`
+                : 'No quarantined tasks - execution queue is healthy.',
             }, null, 2)
           }]
         };
