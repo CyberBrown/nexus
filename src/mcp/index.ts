@@ -384,6 +384,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                     prompt: `${args.title}\n\n${args.description || ''}`,
                     preferred_executor: 'claude', // DE decides the actual model
                     timeout_ms: 300000, // 5 minutes
+                    callback_url: `${env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev'}/workflow-callback`,
                   },
                 }),
               });
