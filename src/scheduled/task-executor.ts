@@ -605,7 +605,7 @@ async function triggerWorkflowForEntry(
       prompt: taskDescription,
       repo_url: repoUrl,
       executor: 'claude', // Prefer Claude, workflow will fallover to Gemini if needed
-      callback_url: `${callbackBaseUrl}/api/workflow-callback`,
+      callback_url: `${callbackBaseUrl}/workflow-callback`,
       metadata: {
         queue_entry_id: entry.id,
         tenant_id: entry.tenant_id,

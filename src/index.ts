@@ -1325,22 +1325,34 @@ async function getOrCreateMcpTenant(env: Env): Promise<{ tenantId: string; userI
 // ========================================
 // Workflow Callback Endpoint (public, no auth)
 // Called by DE CodeExecutionWorkflow when tasks complete/fail
+// NOTE: Path is /workflow-callback (not /api/workflow-callback) to avoid auth middleware
 // ========================================
-app.post('/api/workflow-callback', async (c) => {
+app.post('/workflow-callback', async (c) => {
   try {
     const body = await c.req.json() as {
-      success: boolean;
+      // DE CodeExecutionWorkflow format
+      status?: 'completed' | 'failed' | 'quarantined';
       task_id?: string;
+      executor?: string;
+      output?: string;
+      error?: string;
+      duration_ms?: number;
+      timestamp?: string;
+      // Legacy/alternative format
+      success?: boolean;
       queue_entry_id?: string;
       tenant_id?: string;
       workflow_instance_id?: string;
       result?: string;
-      error?: string;
       logs?: string;
       metadata?: Record<string, unknown>;
     };
 
-    console.log(`Workflow callback received: task_id=${body.task_id}, success=${body.success}`);
+    // Normalize success from status field if not provided
+    const isSuccess = body.success ?? (body.status === 'completed');
+    const resultText = body.result || body.output || body.logs;
+
+    console.log(`Workflow callback received: task_id=${body.task_id}, status=${body.status}, success=${isSuccess}`);
 
     // Validate required fields
     if (!body.queue_entry_id && !body.task_id) {
@@ -1378,9 +1390,9 @@ app.post('/api/workflow-callback', async (c) => {
       return c.json({ success: true, message: 'Already processed' });
     }
 
-    if (body.success) {
+    if (isSuccess) {
       // Mark as completed
-      const result = body.result || body.logs || 'Task completed via workflow';
+      const result = resultText || 'Task completed via workflow';
 
       await c.env.DB.prepare(`
         UPDATE execution_queue
