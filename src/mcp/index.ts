@@ -16,7 +16,8 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { Env } from '../types/index.ts';
 import type { D1Database } from '@cloudflare/workers-types';
 import { getEncryptionKey, encryptField, decryptField, decryptFields } from '../lib/encryption.ts';
-import { executeQueueEntry } from '../scheduled/task-executor.ts';
+import { executeQueueEntry, promoteDependentTasks } from '../scheduled/task-executor.ts';
+import { hasUnmetDependencies } from '../scheduled/task-dispatcher.ts';
 
 // ========================================
 // SAFE DECRYPT HELPER
@@ -86,6 +87,9 @@ const WRITE_TOOLS = new Set([
   'nexus_complete_task',
   'nexus_delete_task',
   'nexus_claim_task',
+  // Dependency tools
+  'nexus_add_dependency',
+  'nexus_remove_dependency',
   // Notes tools
   'nexus_create_note',
   'nexus_update_note',
@@ -2481,6 +2485,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           now
         ).run();
 
+        // Promote dependent tasks that are now unblocked
+        const promotionResult = await promoteDependentTasks(env, task_id, tenantId);
+
         return {
           content: [{
             type: 'text',
@@ -2488,6 +2495,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               success: true,
               task_id,
               message: 'Task marked as completed',
+              dependencies_promoted: promotionResult.promoted,
+              dependencies_dispatched: promotionResult.dispatched,
             }, null, 2)
           }]
         };
@@ -2552,6 +2561,305 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               success: true,
               task_id,
               message: 'Task deleted successfully',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // ========================================
+  // TASK DEPENDENCY TOOLS
+  // ========================================
+
+  // Tool: nexus_add_dependency - Add a blocking dependency between tasks
+  server.tool(
+    'nexus_add_dependency',
+    'Add a dependency between tasks. The dependent task (task_id) will be blocked until the blocking task (depends_on_task_id) completes.',
+    {
+      task_id: z.string().describe('The UUID of the task that depends on another'),
+      depends_on_task_id: z.string().describe('The UUID of the task that must complete first'),
+      dependency_type: z.enum(['blocks', 'suggests', 'related']).optional().default('blocks').describe('Type of dependency: blocks (enforced), suggests (advisory), related (reference)'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_add_dependency', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { task_id, depends_on_task_id, dependency_type = 'blocks' } = args;
+
+      try {
+        // Validate both tasks exist and belong to this tenant
+        const task = await env.DB.prepare(`
+          SELECT id, status FROM tasks WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(task_id, tenantId).first<{ id: string; status: string }>();
+
+        if (!task) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task not found' }) }],
+            isError: true
+          };
+        }
+
+        const dependsOnTask = await env.DB.prepare(`
+          SELECT id, status FROM tasks WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+        `).bind(depends_on_task_id, tenantId).first<{ id: string; status: string }>();
+
+        if (!dependsOnTask) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Depends-on task not found' }) }],
+            isError: true
+          };
+        }
+
+        // Check if task is same as depends_on (self-dependency)
+        if (task_id === depends_on_task_id) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Task cannot depend on itself' }) }],
+            isError: true
+          };
+        }
+
+        // Check for circular dependency (would adding this create a cycle?)
+        // Use BFS to check if depends_on_task_id can reach task_id through existing deps
+        const visited = new Set<string>();
+        const queue = [depends_on_task_id];
+
+        while (queue.length > 0) {
+          const current = queue.shift()!;
+          if (current === task_id) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Would create circular dependency' }) }],
+              isError: true
+            };
+          }
+          if (visited.has(current)) continue;
+          visited.add(current);
+
+          const deps = await env.DB.prepare(`
+            SELECT depends_on_task_id FROM task_dependencies
+            WHERE tenant_id = ? AND task_id = ? AND dependency_type = 'blocks'
+          `).bind(tenantId, current).all<{ depends_on_task_id: string }>();
+
+          for (const d of deps.results || []) {
+            queue.push(d.depends_on_task_id);
+          }
+        }
+
+        // Check if dependency already exists
+        const existing = await env.DB.prepare(`
+          SELECT id FROM task_dependencies
+          WHERE tenant_id = ? AND task_id = ? AND depends_on_task_id = ?
+        `).bind(tenantId, task_id, depends_on_task_id).first();
+
+        if (existing) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Dependency already exists' }) }],
+            isError: true
+          };
+        }
+
+        // Create the dependency
+        const id = crypto.randomUUID();
+        const now = new Date().toISOString();
+
+        await env.DB.prepare(`
+          INSERT INTO task_dependencies (id, tenant_id, task_id, depends_on_task_id, dependency_type, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).bind(id, tenantId, task_id, depends_on_task_id, dependency_type, now).run();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              dependency_id: id,
+              task_id,
+              depends_on_task_id,
+              dependency_type,
+              message: `Task now ${dependency_type === 'blocks' ? 'blocked by' : 'linked to'} the specified task`,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_remove_dependency - Remove a dependency between tasks
+  server.tool(
+    'nexus_remove_dependency',
+    'Remove a dependency between tasks.',
+    {
+      task_id: z.string().describe('The UUID of the dependent task'),
+      depends_on_task_id: z.string().describe('The UUID of the task it depends on'),
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_remove_dependency', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      const { task_id, depends_on_task_id } = args;
+
+      try {
+        const result = await env.DB.prepare(`
+          DELETE FROM task_dependencies
+          WHERE tenant_id = ? AND task_id = ? AND depends_on_task_id = ?
+        `).bind(tenantId, task_id, depends_on_task_id).run();
+
+        if (result.meta.changes === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Dependency not found' }) }],
+            isError: true
+          };
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              task_id,
+              depends_on_task_id,
+              message: 'Dependency removed successfully',
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_get_dependencies - Get tasks that a task depends on
+  server.tool(
+    'nexus_get_dependencies',
+    'Get the list of tasks that a given task depends on (what blocks it).',
+    {
+      task_id: z.string().describe('The UUID of the task to check'),
+    },
+    async (args): Promise<CallToolResult> => {
+      const { task_id } = args;
+
+      try {
+        // Get dependencies with task details
+        const deps = await env.DB.prepare(`
+          SELECT td.id, td.depends_on_task_id, td.dependency_type, td.created_at,
+                 t.title, t.status, t.completed_at
+          FROM task_dependencies td
+          JOIN tasks t ON td.depends_on_task_id = t.id
+          WHERE td.tenant_id = ? AND td.task_id = ? AND t.deleted_at IS NULL
+        `).bind(tenantId, task_id).all<{
+          id: string;
+          depends_on_task_id: string;
+          dependency_type: string;
+          created_at: string;
+          title: string;
+          status: string;
+          completed_at: string | null;
+        }>();
+
+        // Decrypt titles
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const dependencies = await Promise.all((deps.results || []).map(async (d) => ({
+          dependency_id: d.id,
+          task_id: d.depends_on_task_id,
+          title: await safeDecrypt(d.title, encryptionKey),
+          status: d.status,
+          dependency_type: d.dependency_type,
+          is_blocking: d.dependency_type === 'blocks' && d.status !== 'completed',
+          completed_at: d.completed_at,
+        })));
+
+        // Check if task has unmet blocking dependencies
+        const hasUnmet = await hasUnmetDependencies(env.DB, task_id, tenantId);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              task_id,
+              total_dependencies: dependencies.length,
+              blocking_dependencies: dependencies.filter(d => d.is_blocking).length,
+              is_blocked: hasUnmet,
+              dependencies,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_get_dependents - Get tasks that depend on a task
+  server.tool(
+    'nexus_get_dependents',
+    'Get the list of tasks that depend on a given task (what it blocks).',
+    {
+      task_id: z.string().describe('The UUID of the task to check'),
+    },
+    async (args): Promise<CallToolResult> => {
+      const { task_id } = args;
+
+      try {
+        // Get dependents with task details
+        const deps = await env.DB.prepare(`
+          SELECT td.id, td.task_id as dependent_task_id, td.dependency_type, td.created_at,
+                 t.title, t.status
+          FROM task_dependencies td
+          JOIN tasks t ON td.task_id = t.id
+          WHERE td.tenant_id = ? AND td.depends_on_task_id = ? AND t.deleted_at IS NULL
+        `).bind(tenantId, task_id).all<{
+          id: string;
+          dependent_task_id: string;
+          dependency_type: string;
+          created_at: string;
+          title: string;
+          status: string;
+        }>();
+
+        // Decrypt titles
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+        const dependents = await Promise.all((deps.results || []).map(async (d) => ({
+          dependency_id: d.id,
+          task_id: d.dependent_task_id,
+          title: await safeDecrypt(d.title, encryptionKey),
+          status: d.status,
+          dependency_type: d.dependency_type,
+        })));
+
+        // Check if the current task is completed (which would mean dependents are unblocked by this)
+        const task = await env.DB.prepare(`
+          SELECT status FROM tasks WHERE id = ? AND tenant_id = ?
+        `).bind(task_id, tenantId).first<{ status: string }>();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              task_id,
+              task_status: task?.status,
+              total_dependents: dependents.length,
+              would_unblock: task?.status === 'completed' ? 0 : dependents.filter(d => d.dependency_type === 'blocks').length,
+              dependents,
             }, null, 2)
           }]
         };
@@ -3730,6 +4038,23 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
+        // Check for unmet dependencies
+        const hasUnmet = await hasUnmetDependencies(env.DB, taskId, tenantId);
+        if (hasUnmet) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: 'Task has unmet dependencies. Complete blocking tasks first.',
+                task_id: taskId,
+                is_blocked: true,
+              }, null, 2)
+            }],
+            isError: true
+          };
+        }
+
         // Decrypt title to determine executor type
         const decryptedTitle = await safeDecrypt(task.title, encryptionKey);
 
@@ -3964,6 +4289,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           if (existing) {
             skipped.push({ task_id: task.id, reason: 'already_queued' });
+            continue;
+          }
+
+          // Check if task has unmet dependencies
+          if (await hasUnmetDependencies(env.DB, task.id, tenantId)) {
+            skipped.push({ task_id: task.id, reason: 'blocked_by_dependencies' });
             continue;
           }
 

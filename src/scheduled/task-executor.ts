@@ -14,7 +14,12 @@ import { DEClient, createDEClient } from '../lib/de-client.ts';
 import { SandboxClient, createSandboxClient } from '../lib/sandbox-client.ts';
 import { IntakeClient, createIntakeClient } from '../lib/intake-client.ts';
 import { isOAuthError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
-import type { ExecutorType } from './task-dispatcher.ts';
+import {
+  type ExecutorType,
+  hasUnmetDependencies,
+  determineExecutorType,
+  queueTask,
+} from './task-dispatcher.ts';
 
 // ========================================
 // Types
@@ -123,30 +128,30 @@ async function claimEntry(
 }
 
 /**
- * Mark queue entry as completed
+ * Mark queue entry as completed and promote dependent tasks
  */
 async function completeEntry(
-  db: D1Database,
+  env: Env,
   entry: QueueEntry,
   result: string
-): Promise<void> {
+): Promise<{ promoted: number; dispatched: number }> {
   const now = new Date().toISOString();
 
-  await db.prepare(`
+  await env.DB.prepare(`
     UPDATE execution_queue
     SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
     WHERE id = ?
   `).bind(now, result, now, entry.id).run();
 
   // Update the task status to completed
-  await db.prepare(`
+  await env.DB.prepare(`
     UPDATE tasks
     SET status = 'completed', completed_at = ?, updated_at = ?
     WHERE id = ?
   `).bind(now, now, entry.task_id).run();
 
   // Log completion
-  await db.prepare(`
+  await env.DB.prepare(`
     INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
     VALUES (?, ?, ?, ?, ?, 'completed', ?, ?)
   `).bind(
@@ -158,6 +163,14 @@ async function completeEntry(
     JSON.stringify({ result: result.substring(0, 500), source: 'task_executor' }),
     now
   ).run();
+
+  // Promote dependent tasks that are now unblocked
+  const promotionResult = await promoteDependentTasks(env, entry.task_id, entry.tenant_id);
+  if (promotionResult.promoted > 0) {
+    console.log(`Promoted ${promotionResult.promoted} dependent tasks (${promotionResult.dispatched} auto-dispatched)`);
+  }
+
+  return promotionResult;
 }
 
 /**
@@ -318,6 +331,129 @@ async function markEntryAsDispatched(
     JSON.stringify({ workflow_instance_id: workflowInstanceId, source: 'task_executor_parallel' }),
     now
   ).run();
+}
+
+/**
+ * Promote dependent tasks when a task completes
+ * Finds tasks that depend on the completed task and auto-dispatches them if all deps are now met
+ */
+export async function promoteDependentTasks(
+  env: Env,
+  completedTaskId: string,
+  tenantId: string
+): Promise<{ promoted: number; dispatched: number }> {
+  const now = new Date().toISOString();
+  let promoted = 0;
+  let dispatched = 0;
+
+  // Find tasks that depend on the completed task
+  const dependents = await env.DB.prepare(`
+    SELECT DISTINCT td.task_id
+    FROM task_dependencies td
+    JOIN tasks t ON td.task_id = t.id
+    WHERE td.tenant_id = ?
+      AND td.depends_on_task_id = ?
+      AND td.dependency_type = 'blocks'
+      AND t.status = 'next'
+      AND t.deleted_at IS NULL
+  `).bind(tenantId, completedTaskId).all<{ task_id: string }>();
+
+  if (!dependents.results || dependents.results.length === 0) {
+    return { promoted, dispatched };
+  }
+
+  console.log(`Found ${dependents.results.length} tasks depending on completed task ${completedTaskId}`);
+
+  // Get encryption key for decrypting task titles
+  const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+  const intakeClient = createIntakeClient(env);
+  const callbackBaseUrl = env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev';
+
+  for (const dep of dependents.results) {
+    // Check if ALL dependencies are now met
+    const stillBlocked = await hasUnmetDependencies(env.DB, dep.task_id, tenantId);
+    if (stillBlocked) {
+      console.log(`Task ${dep.task_id} still has unmet dependencies, not promoting`);
+      continue;
+    }
+
+    console.log(`Task ${dep.task_id} unblocked by completion of ${completedTaskId}`);
+    promoted++;
+
+    // Get the full task to queue it
+    const task = await env.DB.prepare(`
+      SELECT * FROM tasks WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
+    `).bind(dep.task_id, tenantId).first<Task>();
+
+    if (!task) {
+      console.warn(`Task ${dep.task_id} not found, skipping`);
+      continue;
+    }
+
+    // Decrypt title for executor routing
+    let title = task.title;
+    try {
+      title = await decryptField(task.title, encryptionKey);
+    } catch {
+      // Title might already be decrypted
+    }
+
+    // Determine executor type
+    const executorType = determineExecutorType(title);
+
+    // Queue the task
+    const queueId = await queueTask(env.DB, { ...task, title }, executorType, tenantId);
+    console.log(`Queued unblocked task ${dep.task_id} as ${executorType} (queue_id: ${queueId})`);
+
+    // For 'ai' tasks, trigger workflow immediately
+    if (executorType === 'ai' && intakeClient) {
+      const intakeAvailable = await intakeClient.healthCheck();
+      if (intakeAvailable) {
+        // Get the queue entry we just created
+        const entry = await env.DB.prepare(`
+          SELECT eq.*, t.title, t.description, t.project_id, t.domain,
+                 t.due_date, t.energy_required, t.source_type, t.source_reference
+          FROM execution_queue eq
+          JOIN tasks t ON eq.task_id = t.id
+          WHERE eq.id = ? AND eq.tenant_id = ?
+        `).bind(queueId, tenantId).first<QueueEntry & TaskRow>();
+
+        if (entry) {
+          // Claim and trigger workflow
+          const claimed = await claimEntry(env.DB, entry, `dependency-promotion-${Date.now()}`);
+          if (claimed) {
+            const result = await triggerWorkflowForEntry(intakeClient, entry, encryptionKey, callbackBaseUrl);
+            if (result.success && result.workflowInstanceId) {
+              await markEntryAsDispatched(env.DB, entry, result.workflowInstanceId);
+              dispatched++;
+              console.log(`Auto-dispatched unblocked task ${dep.task_id} (workflow: ${result.workflowInstanceId})`);
+            } else {
+              console.warn(`Failed to dispatch unblocked task ${dep.task_id}: ${result.error}`);
+            }
+          }
+        }
+      }
+    }
+
+    // Log the dependency promotion
+    await env.DB.prepare(`
+      INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+      VALUES (?, ?, ?, ?, ?, 'dependency_promoted', ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      tenantId,
+      queueId,
+      dep.task_id,
+      executorType,
+      JSON.stringify({
+        unblocked_by: completedTaskId,
+        auto_dispatched: dispatched > 0,
+      }),
+      now
+    ).run();
+  }
+
+  return { promoted, dispatched };
 }
 
 /**
@@ -892,7 +1028,7 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
             }
 
             if (result.success && result.result) {
-              await completeEntry(env.DB, entry, result.result);
+              await completeEntry(env, entry, result.result);
               stats.completed++;
               console.log(`Task ${entry.task_id} completed successfully`);
             } else {
@@ -1039,7 +1175,7 @@ export async function executeQueueEntry(
   }
 
   if (result.success && result.result) {
-    await completeEntry(env.DB, entry, result.result);
+    await completeEntry(env, entry, result.result);
     return { success: true, result: result.result };
   } else {
     const error = result.error || 'Unknown execution error';

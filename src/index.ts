@@ -17,7 +17,7 @@ import notesRoutes from './routes/notes.ts';
 import { createNexusMcpHandler } from './mcp/index.ts';
 import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 import { dispatchTasks } from './scheduled/task-dispatcher.ts';
-import { executeTasks } from './scheduled/task-executor.ts';
+import { executeTasks, promoteDependentTasks } from './scheduled/task-executor.ts';
 
 // Re-export Durable Objects
 export { InboxManager } from './durable-objects/InboxManager.ts';
@@ -1568,6 +1568,12 @@ app.post('/workflow-callback', async (c) => {
       ).run();
 
       console.log(`Workflow callback: task ${entry.task_id} completed successfully`);
+
+      // Promote dependent tasks that are now unblocked
+      const promotionResult = await promoteDependentTasks(c.env, entry.task_id, entry.tenant_id);
+      if (promotionResult.promoted > 0) {
+        console.log(`Workflow callback: promoted ${promotionResult.promoted} dependent tasks (${promotionResult.dispatched} auto-dispatched)`);
+      }
     } else {
       // Mark as failed
       const error = body.error || 'Workflow execution failed';

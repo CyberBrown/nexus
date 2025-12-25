@@ -301,6 +301,16 @@ export interface Note extends BaseEntity {
   archived_at: string | null;
 }
 
+// Task Dependency - blocking relationship between tasks
+export interface TaskDependency {
+  id: string;
+  tenant_id: string;
+  task_id: string; // The task that is blocked
+  depends_on_task_id: string; // The task that must complete first
+  dependency_type: 'blocks' | 'suggests' | 'related';
+  created_at: string;
+}
+
 // API response types
 export interface ApiResponse<T> {
   success: boolean;

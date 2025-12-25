@@ -106,9 +106,27 @@ async function isTaskQueued(db: D1Database, taskId: string): Promise<boolean> {
 }
 
 /**
+ * Check if a task has unmet blocking dependencies
+ * Returns true if there are incomplete tasks that this task depends on
+ */
+export async function hasUnmetDependencies(db: D1Database, taskId: string, tenantId: string): Promise<boolean> {
+  const result = await db.prepare(`
+    SELECT COUNT(*) as count FROM task_dependencies td
+    JOIN tasks t ON td.depends_on_task_id = t.id
+    WHERE td.tenant_id = ?
+      AND td.task_id = ?
+      AND td.dependency_type = 'blocks'
+      AND t.status != 'completed'
+      AND t.deleted_at IS NULL
+  `).bind(tenantId, taskId).first<{ count: number }>();
+
+  return (result?.count || 0) > 0;
+}
+
+/**
  * Add a task to the execution queue
  */
-async function queueTask(
+export async function queueTask(
   db: D1Database,
   task: Task,
   executorType: ExecutorType,
@@ -209,6 +227,7 @@ export async function dispatchTasks(env: Env): Promise<{
   processed: number;
   queued: Record<ExecutorType, number>;
   skipped: number;
+  blocked: number;
   errors: number;
 }> {
   console.log('Task dispatcher starting...');
@@ -221,6 +240,7 @@ export async function dispatchTasks(env: Env): Promise<{
       'ai': 0,
     } as Record<ExecutorType, number>,
     skipped: 0,
+    blocked: 0, // Tasks with unmet dependencies
     errors: 0,
   };
 
@@ -259,6 +279,13 @@ export async function dispatchTasks(env: Env): Promise<{
             if (await isTaskQueued(env.DB, task.id)) {
               console.log(`Task ${task.id} already queued, skipping`);
               stats.skipped++;
+              continue;
+            }
+
+            // Check if task has unmet dependencies
+            if (await hasUnmetDependencies(env.DB, task.id, tenantId)) {
+              console.log(`Task ${task.id} has unmet dependencies, blocked`);
+              stats.blocked++;
               continue;
             }
 
