@@ -18,7 +18,7 @@ ENVIRONMENT = "development"
 PRIMARY_TENANT_ID = "f943851e-a7c5-4908-90a2-956367f21460"
 PRIMARY_USER_ID = "9ac3bb45-2c0b-4db4-ae24-41a048b3163d"
 # DE text-gen URL for workflows (workflows can't use service bindings)
-TEXT_GEN_URL = "https://text-gen.solamp.workers.dev"
+TEXT_GEN_URL = "https://de-text-gen.solamp.workers.dev"
 # Sandbox executor URL for code tasks (GitHub integration, deployments)
 SANDBOX_EXECUTOR_URL = "https://sandbox-executor.solamp.workers.dev"
 # Cloudflare Access - set these for production auth
@@ -88,7 +88,7 @@ tag = "v9"
 # Service Bindings - Worker-to-Worker communication
 [[services]]
 binding = "DE"
-service = "text-gen"  # DE's text-gen worker for LLM operations
+service = "de-text-gen"  # DE's text-gen worker for LLM operations
 
 [[services]]
 binding = "SANDBOX_EXECUTOR"
