@@ -39,6 +39,7 @@ interface PlanStep {
   type: 'research' | 'design' | 'implement' | 'test' | 'deploy' | 'document';
   agent_type: 'claude' | 'local' | 'human';
   estimatedMinutes: number;
+  depends_on?: number[]; // Step order numbers this step depends on
 }
 
 // Idea data from database
@@ -308,13 +309,31 @@ Output JSON in this exact format:
       "description": "What to do in this step",
       "type": "research|design|implement|test|deploy|document",
       "agent_type": "claude|local|human",
-      "estimatedMinutes": 30
+      "estimatedMinutes": 30,
+      "depends_on": []
+    },
+    {
+      "order": 2,
+      "title": "Step that depends on step 1",
+      "description": "This step needs step 1 to complete first",
+      "type": "implement",
+      "agent_type": "claude",
+      "estimatedMinutes": 60,
+      "depends_on": [1]
     }
   ],
   "estimatedEffort": "xs|s|m|l|xl",
   "risks": ["Risk 1", "Risk 2"],
-  "dependencies": ["Dependency 1"]
+  "dependencies": ["External dependency 1"]
 }
+
+Step dependencies (depends_on field):
+- Use depends_on to specify which steps must complete BEFORE this step can start
+- List the order numbers of blocking steps, e.g. "depends_on": [1, 2]
+- Steps with empty depends_on: [] can run immediately
+- This enables parallel execution of independent steps
+- Example: If step 3 needs data from step 1, set "depends_on": [1]
+- Example: If step 4 needs both step 2 AND 3, set "depends_on": [2, 3]
 
 agent_type values:
 - "claude": Complex analysis, coding, writing, research that requires AI
@@ -331,9 +350,10 @@ Effort scale:
 Guidelines:
 - Break complex ideas into 3-10 steps
 - Keep steps atomic and independently executable where possible
-- Order steps logically (dependencies should come first)
+- Use depends_on to express step ordering instead of relying on order numbers
 - Be specific about what each step should produce/accomplish
-- Steps marked "human" should be decision points or actions requiring user input`;
+- Steps marked "human" should be decision points or actions requiring user input
+- Maximize parallelism: only add dependencies where truly required`;
   }
 
   private buildPlanningPrompt(idea: IdeaData): string {
@@ -365,8 +385,13 @@ Guidelines:
     const key = await getEncryptionKey(this.env.KV, tenantId);
     const now = new Date().toISOString();
 
+    // Map step order to taskId for dependency creation
+    const orderToTaskId = new Map<number, string>();
+
+    // First pass: create all tasks
     for (const step of plan.steps) {
       const taskId = crypto.randomUUID();
+      orderToTaskId.set(step.order, taskId);
 
       // Encrypt sensitive fields
       const encryptedTitle = await encryptField(step.title, key);
@@ -396,18 +421,24 @@ Guidelines:
         now
       ).run();
 
-      // Also create a regular task for visibility
+      // Determine initial task status based on dependencies
+      // Tasks with no dependencies start as 'next', others as 'inbox'
+      const hasDependencies = step.depends_on && step.depends_on.length > 0;
+      const initialStatus = hasDependencies ? 'inbox' : 'next';
+
+      // Also create a regular task for visibility and execution
       await this.env.DB.prepare(`
         INSERT INTO tasks (
           id, tenant_id, user_id, title, description, status,
           source_type, source_reference, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'inbox', 'idea_execution', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'idea_execution', ?, ?, ?)
       `).bind(
         taskId,
         tenantId,
         userId,
         encryptedTitle,
         encryptedDescription,
+        initialStatus,
         executionId,
         now,
         now
@@ -418,6 +449,31 @@ Guidelines:
         title: step.title,
         status: 'pending',
       });
+    }
+
+    // Second pass: create task dependencies
+    for (const step of plan.steps) {
+      if (step.depends_on && step.depends_on.length > 0) {
+        const taskId = orderToTaskId.get(step.order);
+        if (!taskId) continue;
+
+        for (const dependsOnOrder of step.depends_on) {
+          const dependsOnTaskId = orderToTaskId.get(dependsOnOrder);
+          if (!dependsOnTaskId) {
+            console.warn(`Step ${step.order} depends on non-existent step ${dependsOnOrder}`);
+            continue;
+          }
+
+          // Create dependency: taskId is blocked by dependsOnTaskId
+          const depId = crypto.randomUUID();
+          await this.env.DB.prepare(`
+            INSERT INTO task_dependencies (id, tenant_id, task_id, depends_on_task_id, dependency_type, created_at)
+            VALUES (?, ?, ?, ?, 'blocks', ?)
+          `).bind(depId, tenantId, taskId, dependsOnTaskId, now).run();
+
+          console.log(`Created dependency: Task ${step.order} blocked by task ${dependsOnOrder}`);
+        }
+      }
     }
 
     return tasks;
