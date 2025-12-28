@@ -15,7 +15,7 @@ interface PlannedTask {
   order: number;
   title: string;
   description: string;
-  agent_type: 'claude' | 'local' | 'human';
+  agent_type: 'ai' | 'human' | 'human-ai';
   estimated_effort: 'xs' | 's' | 'm' | 'l' | 'xl';
   depends_on?: number[]; // Step order numbers this task depends on
 }
@@ -261,9 +261,9 @@ For each task, determine:
 2. title: A clear, actionable title (imperative mood, e.g., "Research X", "Implement Y")
 3. description: Detailed description of what needs to be done
 4. agent_type: Who/what should execute this task:
-   - "claude": Complex analysis, coding, writing, research that requires AI
-   - "local": Quick tasks that could run on a local model (future capability)
-   - "human": Requires human judgment, approval, or physical action
+   - "ai": Can be executed by AI (coding, writing, research, analysis)
+   - "human": Requires human action, judgment, approval, or physical action
+   - "human-ai": Collaborative task requiring both human and AI input
 5. estimated_effort: T-shirt size estimate:
    - "xs": < 15 minutes
    - "s": 15-60 minutes
@@ -294,7 +294,7 @@ Return ONLY valid JSON with this structure:
       "order": 1,
       "title": "First task (no dependencies)",
       "description": "string",
-      "agent_type": "claude",
+      "agent_type": "ai",
       "estimated_effort": "s",
       "depends_on": []
     },
@@ -302,7 +302,7 @@ Return ONLY valid JSON with this structure:
       "order": 2,
       "title": "Task that needs task 1",
       "description": "string",
-      "agent_type": "claude",
+      "agent_type": "ai",
       "estimated_effort": "m",
       "depends_on": [1]
     }

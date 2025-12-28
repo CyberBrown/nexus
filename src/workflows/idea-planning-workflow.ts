@@ -37,7 +37,7 @@ interface PlanStep {
   title: string;
   description: string;
   type: 'research' | 'design' | 'implement' | 'test' | 'deploy' | 'document';
-  agent_type: 'claude' | 'local' | 'human';
+  agent_type: 'ai' | 'human' | 'human-ai';
   estimatedMinutes: number;
   depends_on?: number[]; // Step order numbers this step depends on
 }
@@ -308,7 +308,7 @@ Output JSON in this exact format:
       "title": "Short action title",
       "description": "What to do in this step",
       "type": "research|design|implement|test|deploy|document",
-      "agent_type": "claude|local|human",
+      "agent_type": "ai|human|human-ai",
       "estimatedMinutes": 30,
       "depends_on": []
     },
@@ -317,7 +317,7 @@ Output JSON in this exact format:
       "title": "Step that depends on step 1",
       "description": "This step needs step 1 to complete first",
       "type": "implement",
-      "agent_type": "claude",
+      "agent_type": "ai",
       "estimatedMinutes": 60,
       "depends_on": [1]
     }
@@ -336,9 +336,9 @@ Step dependencies (depends_on field):
 - Example: If step 4 needs both step 2 AND 3, set "depends_on": [2, 3]
 
 agent_type values:
-- "claude": Complex analysis, coding, writing, research that requires AI
-- "local": Quick tasks that could run on a local model (future capability)
-- "human": Requires human judgment, approval, or physical action
+- "ai": Can be executed by AI (coding, writing, research, analysis)
+- "human": Requires human action, judgment, approval, or physical action
+- "human-ai": Collaborative task requiring both human and AI input
 
 Effort scale:
 - xs: < 1 hour

@@ -17,7 +17,7 @@ interface IdeaTask {
   idea_id: string;
   title: string;
   description: string | null;
-  agent_type: 'claude' | 'local' | 'human';
+  agent_type: 'ai' | 'human' | 'human-ai';
   estimated_effort: string;
   status: string;
   retry_count: number;

@@ -81,7 +81,7 @@ export interface IdeaTask {
   idea_id: string;
   title: string;
   description?: string;
-  agent_type: 'claude' | 'local' | 'human';
+  agent_type: 'ai' | 'human' | 'human-ai';
   estimated_effort?: 'xs' | 's' | 'm' | 'l' | 'xl';
   sequence_order: number;
   status: 'pending' | 'ready' | 'in_progress' | 'completed' | 'failed' | 'blocked';

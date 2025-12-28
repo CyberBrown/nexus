@@ -223,7 +223,7 @@ export interface IdeaTask extends BaseEntity {
   idea_id: string;
   title: string; // encrypted
   description: string | null; // encrypted
-  agent_type: 'claude' | 'local' | 'human';
+  agent_type: 'ai' | 'human' | 'human-ai';
   estimated_effort: 'xs' | 's' | 'm' | 'l' | 'xl' | null;
   sequence_order: number;
   status: 'pending' | 'ready' | 'in_progress' | 'completed' | 'failed' | 'blocked';
