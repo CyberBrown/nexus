@@ -22,6 +22,40 @@ import {
 } from './task-dispatcher.ts';
 
 // ========================================
+// Code Task Detection
+// ========================================
+
+/**
+ * Patterns that indicate a task requires code execution (not just text generation)
+ * These tasks should route to CodeExecutionWorkflow, not text-gen
+ */
+const CODE_TASK_PATTERNS = [
+  /^\[implement\]/i,
+  /^\[deploy\]/i,
+  /^\[fix\]/i,
+  /^\[refactor\]/i,
+  /^\[test\]/i,
+  /^\[debug\]/i,
+  /^\[code\]/i,
+  /^\[CC\]/i,
+  /^\[claude-code\]/i,
+  /^\[bugfix\]/i,
+];
+
+/**
+ * Check if a task title indicates it's a code task that needs code execution
+ * (not just text generation)
+ */
+function isCodeTask(title: string): boolean {
+  for (const pattern of CODE_TASK_PATTERNS) {
+    if (pattern.test(title)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ========================================
 // Types
 // ========================================
 
@@ -556,6 +590,123 @@ async function executeTaskViaDE(
 }
 
 /**
+ * Execute a CODE task via DE Workflows HTTP endpoint.
+ * This is the fallback path when sandbox-executor is unavailable but the task
+ * is a code task that needs actual code execution (not just text generation).
+ *
+ * Calls POST /workflows/code-execution on de-workflows worker.
+ */
+async function executeCodeTaskViaWorkflow(
+  env: Env,
+  entry: QueueEntry,
+  task: TaskRow,
+  encryptionKey: CryptoKey | null,
+  overrideOptions?: ExecuteOverrideOptions
+): Promise<{ success: boolean; result?: string; error?: string }> {
+  const workflowsUrl = env.DE_WORKFLOWS_URL;
+  if (!workflowsUrl) {
+    return {
+      success: false,
+      error: 'DE_WORKFLOWS_URL not configured - cannot execute code task via workflow',
+    };
+  }
+
+  try {
+    // Decrypt task fields
+    const title = await safeDecrypt(task.title, encryptionKey);
+    const description = await safeDecrypt(task.description, encryptionKey);
+
+    // Parse context for repo info
+    let context: Record<string, unknown> | null = null;
+    if (entry.context) {
+      try {
+        context = JSON.parse(entry.context);
+      } catch {
+        const decryptedContext = await safeDecrypt(entry.context, encryptionKey);
+        if (decryptedContext) {
+          try {
+            context = JSON.parse(decryptedContext);
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+
+    // Build task prompt
+    let taskPrompt = `## Task: ${title}`;
+    if (description) {
+      taskPrompt += `\n\n## Description\n${description}`;
+    }
+    if (context) {
+      if (context.domain) {
+        taskPrompt += `\n\n## Domain: ${context.domain}`;
+      }
+      if (context.source_reference) {
+        taskPrompt += `\n## Reference: ${context.source_reference}`;
+      }
+    }
+
+    // Extract repo from override options or context
+    const repo = overrideOptions?.repo || (context?.repo as string | undefined);
+    const repoUrl = repo ? `https://github.com/${repo}` : undefined;
+
+    console.log(`Executing code task via DE workflows: task_id=${entry.task_id}, repo=${repo}`);
+
+    // Call DE workflows endpoint
+    const response = await fetch(`${workflowsUrl}/workflows/code-execution`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Passphrase': env.WRITE_PASSPHRASE || '',
+      },
+      body: JSON.stringify({
+        id: entry.task_id,
+        params: {
+          task_id: entry.task_id,
+          prompt: taskPrompt,
+          repo_url: repoUrl,
+          preferred_executor: 'claude',
+          timeout_ms: 600000, // 10 minutes
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'Unknown error');
+      console.error(`DE workflows error: ${response.status} - ${errorText}`);
+      return {
+        success: false,
+        error: `DE workflows error (${response.status}): ${errorText}`,
+      };
+    }
+
+    const result = await response.json() as {
+      success: boolean;
+      workflow_id?: string;
+      error?: string;
+    };
+
+    if (result.success) {
+      return {
+        success: true,
+        result: `Code execution workflow triggered: ${result.workflow_id}. Task will complete asynchronously via callback.`,
+      };
+    } else {
+      return {
+        success: false,
+        error: result.error || 'Unknown workflow error',
+      };
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
  * Execute a claude-ai task via sandbox-executor container path
  * Routes through /execute endpoint to use OAuth credentials instead of API credits
  */
@@ -1014,10 +1165,19 @@ export async function executeTasks(env: Env): Promise<ExecutionStats> {
             let result: { success: boolean; result?: string; error?: string };
 
             if (entry.executor_type === 'ai') {
-              // Try sandbox first (uses OAuth), fallback to DE service binding
+              // Decrypt title to check if it's a code task
+              const decryptedTitle = await safeDecrypt(entry.title, encryptionKey);
+              const taskIsCode = isCodeTask(decryptedTitle);
+
+              // Try sandbox first (uses OAuth)
               if (sandboxClient) {
                 result = await executeTaskViaSandboxSdk(sandboxClient, entry, entry, encryptionKey);
+              } else if (taskIsCode) {
+                // Code task without sandbox - route to DE workflows instead of text-gen
+                console.log(`Code task without sandbox, routing to DE workflows: ${entry.task_id}`);
+                result = await executeCodeTaskViaWorkflow(env, entry, entry, encryptionKey);
               } else if (deClient) {
+                // Non-code task (research/analysis) - use text-gen
                 result = await executeTaskViaDE(deClient, entry, entry, encryptionKey);
               } else {
                 result = { success: false, error: 'No execution service available for ai task' };
@@ -1155,8 +1315,12 @@ export async function executeQueueEntry(
   // Get encryption key
   const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
-  // Execute 'ai' task - prefer sandbox (OAuth), fallback to DE
+  // Execute 'ai' task - prefer sandbox (OAuth), fallback based on task type
   let result: { success: boolean; result?: string; error?: string };
+
+  // Decrypt title to check if it's a code task
+  const decryptedTitle = await safeDecrypt(entry.title, encryptionKey);
+  const taskIsCode = isCodeTask(decryptedTitle);
 
   if (useSandbox && sandboxClient) {
     // Use sandbox with override options for repo/branch/commit_message if provided
@@ -1167,8 +1331,12 @@ export async function executeQueueEntry(
       // No repo context, use SDK path
       result = await executeTaskViaSandboxSdk(sandboxClient, entry, entry, encryptionKey);
     }
+  } else if (taskIsCode) {
+    // Code task without sandbox - route to DE workflows instead of text-gen
+    console.log(`Code task without sandbox, routing to DE workflows: ${entry.task_id}`);
+    result = await executeCodeTaskViaWorkflow(env, entry, entry, encryptionKey, overrideOptions);
   } else if (deClient) {
-    // Fallback to DE service binding
+    // Non-code task (research/analysis) - use text-gen
     result = await executeTaskViaDE(deClient, entry, entry, encryptionKey);
   } else {
     result = { success: false, error: 'No execution service available' };
