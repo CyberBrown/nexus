@@ -367,13 +367,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             workflow_error: undefined as string | undefined,
           };
 
-          // Trigger CodeExecutionWorkflow for 'ai' tasks via HTTP
+          // Trigger workflow for 'ai' tasks via DE /execute entry point (PrimeWorkflow)
           // The workflow handles execution via sandbox-executor and reports back
           // Note: Cross-worker workflow bindings are NOT supported by CF Workflows,
           // so we trigger via HTTP to the de-workflows worker instead
           if (executorType === 'ai' && env.DE_WORKFLOWS_URL) {
             try {
-              const workflowUrl = `${env.DE_WORKFLOWS_URL}/workflows/code-execution`;
+              const workflowUrl = `${env.DE_WORKFLOWS_URL}/execute`;
 
               const workflowResponse = await fetch(workflowUrl, {
                 method: 'POST',
@@ -382,13 +382,19 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                   'X-Passphrase': env.WRITE_PASSPHRASE || '',
                 },
                 body: JSON.stringify({
-                  id: taskId, // Use task_id as workflow instance ID to prevent duplicates
                   params: {
                     task_id: taskId,
-                    prompt: `${args.title}\n\n${args.description || ''}`,
-                    preferred_executor: 'claude', // DE decides the actual model
-                    timeout_ms: 300000, // 5 minutes
+                    title: args.title,
+                    description: args.description || '',
+                    context: {
+                      repo: args.project_id ? undefined : undefined, // TODO: resolve project to repo
+                    },
+                    hints: {
+                      workflow: 'code-execution',
+                      provider: 'claude',
+                    },
                     callback_url: `${env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev'}/workflow-callback`,
+                    timeout_ms: 300000, // 5 minutes
                   },
                 }),
               });
@@ -407,7 +413,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 `).bind(now, taskId).run();
 
                 dispatchResult.workflow_triggered = true;
-                console.log(`[nexus_create_task] CodeExecutionWorkflow triggered for task ${taskId}`);
+                console.log(`[nexus_create_task] PrimeWorkflow triggered for task ${taskId}`);
               } else {
                 // Handle duplicate workflow gracefully
                 if (workflowResult.code === 'DUPLICATE_WORKFLOW') {

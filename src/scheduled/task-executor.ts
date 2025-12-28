@@ -590,11 +590,11 @@ async function executeTaskViaDE(
 }
 
 /**
- * Execute a CODE task via DE Workflows HTTP endpoint.
+ * Execute a CODE task via DE /execute entry point (PrimeWorkflow).
  * This is the fallback path when sandbox-executor is unavailable but the task
  * is a code task that needs actual code execution (not just text generation).
  *
- * Calls POST /workflows/code-execution on de-workflows worker.
+ * Calls POST /execute on de-workflows worker, which routes through PrimeWorkflow.
  */
 async function executeCodeTaskViaWorkflow(
   env: Env,
@@ -651,22 +651,31 @@ async function executeCodeTaskViaWorkflow(
     const repo = overrideOptions?.repo || (context?.repo as string | undefined);
     const repoUrl = repo ? `https://github.com/${repo}` : undefined;
 
-    console.log(`Executing code task via DE workflows: task_id=${entry.task_id}, repo=${repo}`);
+    console.log(`Executing code task via DE /execute: task_id=${entry.task_id}, repo=${repo}`);
 
-    // Call DE workflows endpoint
-    const response = await fetch(`${workflowsUrl}/workflows/code-execution`, {
+    // Extract branch from context if available
+    const branch = context?.branch as string | undefined;
+
+    // Call DE /execute entry point (PrimeWorkflow)
+    const response = await fetch(`${workflowsUrl}/execute`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Passphrase': env.WRITE_PASSPHRASE || '',
       },
       body: JSON.stringify({
-        id: entry.task_id,
         params: {
           task_id: entry.task_id,
-          prompt: taskPrompt,
-          repo_url: repoUrl,
-          preferred_executor: 'claude',
+          title: title,
+          description: description || taskPrompt,
+          context: {
+            repo: repoUrl,
+            branch: branch,
+          },
+          hints: {
+            workflow: 'code-execution',
+            provider: 'claude',
+          },
           timeout_ms: 600000, // 10 minutes
         },
       }),
