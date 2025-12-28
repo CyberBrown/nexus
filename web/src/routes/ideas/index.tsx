@@ -24,9 +24,9 @@ const taskStatusColors: Record<string, string> = {
 
 // Agent type badges
 const agentTypeLabels: Record<string, { label: string; color: string }> = {
-  claude: { label: 'AI', color: 'bg-purple-100 text-purple-800' },
-  local: { label: 'Local', color: 'bg-gray-100 text-gray-800' },
+  ai: { label: 'AI', color: 'bg-purple-100 text-purple-800' },
   human: { label: 'Human', color: 'bg-amber-100 text-amber-800' },
+  'human-ai': { label: 'Human+AI', color: 'bg-blue-100 text-blue-800' },
 };
 
 export default component$(() => {
