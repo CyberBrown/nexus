@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS idea_tasks (
     title TEXT NOT NULL,           -- ENCRYPTED
     description TEXT,              -- ENCRYPTED
 
-    agent_type TEXT NOT NULL DEFAULT 'claude',  -- claude, local, human
+    agent_type TEXT NOT NULL DEFAULT 'ai',  -- ai, human, human-ai
     estimated_effort TEXT,         -- xs, s, m, l, xl
 
     sequence_order INTEGER NOT NULL DEFAULT 0,

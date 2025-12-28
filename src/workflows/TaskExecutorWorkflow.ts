@@ -177,11 +177,8 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
     } else if (isCodeTask) {
       // Code task - route to sandbox-executor
       result = await this.executeWithSandbox(step, task, ideaContext);
-    } else if (task.agent_type === 'local') {
-      // Local model execution (future - for now, fall back to Claude)
-      result = await this.executeWithClaude(step, task, ideaContext);
     } else {
-      // Claude execution
+      // AI execution via DE text-gen
       result = await this.executeWithClaude(step, task, ideaContext);
     }
 
