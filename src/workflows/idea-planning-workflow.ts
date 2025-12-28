@@ -232,6 +232,8 @@ export class IdeaPlanningWorkflow extends WorkflowEntrypoint<Env, IdeaPlanningPa
         prompt,
         max_tokens: 2048,
         temperature: 0.7,
+        expect_json: true,  // Enable JSON validation with retry loop
+        json_max_retries: 2,
       }),
     });
 
