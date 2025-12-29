@@ -17,7 +17,7 @@ import type { Env } from '../types/index.ts';
 import type { D1Database } from '@cloudflare/workers-types';
 import { getEncryptionKey, encryptField, decryptField, decryptFields } from '../lib/encryption.ts';
 import { executeQueueEntry, promoteDependentTasks } from '../scheduled/task-executor.ts';
-import { hasUnmetDependencies } from '../scheduled/task-dispatcher.ts';
+import { hasUnmetDependencies, determineExecutorType } from '../scheduled/task-dispatcher.ts';
 import { archiveQueueEntry, archiveQueueEntriesByTask } from '../lib/queue-archive.ts';
 
 // ========================================
@@ -2367,13 +2367,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       urgency: z.number().min(1).max(5).optional().describe('Urgency level (1-5)'),
       importance: z.number().min(1).max(5).optional().describe('Importance level (1-5)'),
       due_date: z.string().optional().describe('Due date in ISO format (YYYY-MM-DD)'),
+      executor_type: z.enum(['human', 'human-ai', 'ai']).optional().describe('Override executor type for queued entries. If not provided and title changes, auto-detects from title tag.'),
       passphrase: passphraseSchema,
     },
     async (args): Promise<CallToolResult> => {
       const authError = validatePassphrase('nexus_update_task', args, env.WRITE_PASSPHRASE);
       if (authError) return authError;
 
-      const { task_id, title, description, status, urgency, importance, due_date } = args;
+      const { task_id, title, description, status, urgency, importance, due_date, executor_type } = args;
 
       try {
         const existing = await env.DB.prepare(`
@@ -2428,6 +2429,29 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           UPDATE tasks SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?
         `).bind(...bindings).run();
 
+        // Update executor_type in execution_queue if:
+        // 1. Explicit executor_type provided, OR
+        // 2. Title changed (auto-detect from new title tag)
+        let queueExecutorUpdated = 0;
+        let newExecutorType: string | null = null;
+
+        if (executor_type) {
+          // Explicit override
+          newExecutorType = executor_type;
+        } else if (title) {
+          // Auto-detect from new title
+          newExecutorType = determineExecutorType(title);
+        }
+
+        if (newExecutorType) {
+          const queueUpdateResult = await env.DB.prepare(`
+            UPDATE execution_queue
+            SET executor_type = ?, updated_at = ?
+            WHERE task_id = ? AND tenant_id = ? AND status = 'queued'
+          `).bind(newExecutorType, now, task_id, tenantId).run();
+          queueExecutorUpdated = queueUpdateResult.meta.changes || 0;
+        }
+
         // Sync queue entries if status changed to completed or cancelled
         let queueEntriesSynced = 0;
         if (status === 'completed' || status === 'cancelled') {
@@ -2460,6 +2484,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               success: true,
               task_id,
               message: 'Task updated successfully',
+              queue_executor_updated: queueExecutorUpdated,
+              new_executor_type: newExecutorType,
               queue_entries_synced: queueEntriesSynced,
             }, null, 2)
           }]
