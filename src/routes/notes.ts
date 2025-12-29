@@ -51,14 +51,33 @@ notes.get('/', async (c) => {
   );
 
   // Search filter (after decryption)
+  // Supports multi-word search with AND logic and quoted phrases
   let filteredItems = decryptedItems;
   if (search) {
-    const searchLower = search.toLowerCase();
-    filteredItems = decryptedItems.filter(
-      (item) =>
-        (item.title && item.title.toLowerCase().includes(searchLower)) ||
-        (item.content && item.content.toLowerCase().includes(searchLower))
-    );
+    // Parse search query: extract quoted phrases and individual words
+    const searchTerms: string[] = [];
+    const quotedRegex = /"([^"]+)"/g;
+    let match: RegExpExecArray | null;
+    let queryWithoutQuotes = search;
+
+    // Extract quoted phrases
+    while ((match = quotedRegex.exec(search)) !== null) {
+      searchTerms.push(match[1]!.toLowerCase());
+    }
+    queryWithoutQuotes = search.replace(quotedRegex, '').trim();
+
+    // Extract individual words (non-quoted)
+    const words = queryWithoutQuotes.split(/\s+/).filter((w: string) => w.length > 0);
+    for (const word of words) {
+      searchTerms.push(word.toLowerCase());
+    }
+
+    if (searchTerms.length > 0) {
+      filteredItems = decryptedItems.filter((item) => {
+        const searchableText = `${item.title || ''} ${item.content || ''}`.toLowerCase();
+        return searchTerms.every((term) => searchableText.includes(term));
+      });
+    }
   }
 
   return c.json({ success: true, data: filteredItems });

@@ -3354,9 +3354,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_search_notes - Search notes by content
   server.tool(
     'nexus_search_notes',
-    'Search notes by title or content',
+    'Search notes by title or content. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
     {
-      query: z.string().describe('Search query'),
+      query: z.string().describe('Search query. Multiple words are ANDed together. Use quotes for exact phrases, e.g. "MCP validation" or MCP validation'),
       limit: z.number().optional().default(20).describe('Maximum results'),
     },
     async ({ query, limit }): Promise<CallToolResult> => {
@@ -3370,17 +3370,53 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         `).bind(tenantId, userId).all();
 
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-        const searchLower = query.toLowerCase();
+
+        // Parse search query: extract quoted phrases and individual words
+        // e.g., 'MCP "validation error" test' -> ['MCP', 'validation error', 'test']
+        const searchTerms: string[] = [];
+        const quotedRegex = /"([^"]+)"/g;
+        let match: RegExpExecArray | null;
+        let queryWithoutQuotes = query;
+
+        // Extract quoted phrases
+        while ((match = quotedRegex.exec(query)) !== null) {
+          searchTerms.push(match[1]!.toLowerCase());
+        }
+        queryWithoutQuotes = query.replace(quotedRegex, '').trim();
+
+        // Extract individual words (non-quoted)
+        const words = queryWithoutQuotes.split(/\s+/).filter(w => w.length > 0);
+        for (const word of words) {
+          searchTerms.push(word.toLowerCase());
+        }
+
+        // If no valid search terms, return empty results
+        if (searchTerms.length === 0) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                query: query,
+                count: 0,
+                notes: [],
+              }, null, 2)
+            }]
+          };
+        }
 
         const matchingNotes = [];
         for (const note of notes.results) {
           const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
           const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
 
-          if (
-            decryptedTitle.toLowerCase().includes(searchLower) ||
-            decryptedContent.toLowerCase().includes(searchLower)
-          ) {
+          // Combine title and content for searching
+          const searchableText = `${decryptedTitle} ${decryptedContent}`.toLowerCase();
+
+          // All search terms must be found (AND logic)
+          const allTermsMatch = searchTerms.every(term => searchableText.includes(term));
+
+          if (allTermsMatch) {
             matchingNotes.push({
               id: note.id,
               title: decryptedTitle,
@@ -3401,6 +3437,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             text: JSON.stringify({
               success: true,
               query: query,
+              search_terms: searchTerms,
               count: matchingNotes.length,
               notes: matchingNotes,
             }, null, 2)
