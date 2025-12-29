@@ -94,6 +94,10 @@ service = "de-text-gen"  # DE's text-gen worker for LLM operations
 binding = "SANDBOX_EXECUTOR"
 service = "sandbox-executor"  # For code task execution
 
+[[services]]
+binding = "INTAKE"
+service = "intake"  # DE intake for workflow-based execution (parallel, durable)
+
 # Cloudflare Workflows - Durable execution for long-running tasks
 [[workflows]]
 name = "idea-execution-workflow"
