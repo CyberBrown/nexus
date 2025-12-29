@@ -2427,6 +2427,18 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           UPDATE tasks SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?
         `).bind(...bindings).run();
 
+        // Sync queue entries if status changed to completed or cancelled
+        let queueEntriesSynced = 0;
+        if (status === 'completed' || status === 'cancelled') {
+          const queueStatus = status === 'completed' ? 'completed' : 'cancelled';
+          const queueSyncResult = await env.DB.prepare(`
+            UPDATE execution_queue
+            SET status = ?, completed_at = ?, result = ?, updated_at = ?
+            WHERE task_id = ? AND tenant_id = ? AND status IN ('queued', 'claimed', 'dispatched')
+          `).bind(queueStatus, now, JSON.stringify({ completed_via: 'nexus_update_task', status }), now, task_id, tenantId).run();
+          queueEntriesSynced = queueSyncResult.meta.changes || 0;
+        }
+
         return {
           content: [{
             type: 'text',
@@ -2434,6 +2446,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               success: true,
               task_id,
               message: 'Task updated successfully',
+              queue_entries_synced: queueEntriesSynced,
             }, null, 2)
           }]
         };
@@ -2491,6 +2504,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           now
         ).run();
 
+        // Sync queue entries - mark any queued/claimed entries as completed
+        const queueSyncResult = await env.DB.prepare(`
+          UPDATE execution_queue
+          SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
+          WHERE task_id = ? AND tenant_id = ? AND status IN ('queued', 'claimed', 'dispatched')
+        `).bind(now, JSON.stringify({ completed_via: 'nexus_complete_task', notes: notes || null }), now, task_id, tenantId).run();
+
+        const queueEntriesSynced = queueSyncResult.meta.changes || 0;
+
         // Promote dependent tasks that are now unblocked
         const promotionResult = await promoteDependentTasks(env, task_id, tenantId);
 
@@ -2501,6 +2523,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               success: true,
               task_id,
               message: 'Task marked as completed',
+              queue_entries_synced: queueEntriesSynced,
               dependencies_promoted: promotionResult.promoted,
               dependencies_dispatched: promotionResult.dispatched,
             }, null, 2)
@@ -4656,8 +4679,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'nexus_cleanup_queue',
     'Clean up duplicate and stale entries from execution_queue. Removes quarantine entries where the task already has an active entry, and optionally clears old completed/failed/cancelled entries.',
     {
-      mode: z.enum(['duplicates', 'stale', 'all']).default('duplicates')
-        .describe('Cleanup mode: "duplicates" removes quarantine entries with active task entries, "stale" removes old completed/failed/cancelled entries (>7 days), "all" does both'),
+      mode: z.enum(['duplicates', 'stale', 'sync', 'all']).default('duplicates')
+        .describe('Cleanup mode: "duplicates" removes quarantine entries with active task entries, "stale" removes old completed/failed/cancelled entries (>7 days), "sync" updates queue entries where the linked task is already completed, "all" does all three'),
       dry_run: z.boolean().default(false)
         .describe('If true, only report what would be deleted without actually deleting'),
       passphrase: passphraseSchema,
@@ -4667,10 +4690,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const authError = validatePassphrase('nexus_cleanup_queue', { passphrase }, env.WRITE_PASSPHRASE);
         if (authError) return authError;
 
-        const tenantId = 'default';
-        const results: { duplicates_removed: number; stale_removed: number; details: string[] } = {
+        // Use the tenantId from the outer scope (passed to createNexusMcpServer)
+        const now = new Date().toISOString();
+        const results: { duplicates_removed: number; stale_removed: number; sync_completed: number; details: string[] } = {
           duplicates_removed: 0,
           stale_removed: 0,
+          sync_completed: 0,
           details: [],
         };
 
@@ -4733,6 +4758,45 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
         }
 
+        // Sync queue entries where the linked task is already completed
+        if (mode === 'sync' || mode === 'all') {
+          // Find queue entries where task is completed but queue entry isn't
+          const outOfSync = await env.DB.prepare(`
+            SELECT eq.id, eq.task_id, eq.status as queue_status, t.status as task_status
+            FROM execution_queue eq
+            INNER JOIN tasks t ON eq.task_id = t.id
+            WHERE eq.tenant_id = ?
+              AND eq.status IN ('queued', 'claimed', 'dispatched')
+              AND t.status IN ('completed', 'cancelled')
+          `).bind(tenantId).all<{ id: string; task_id: string; queue_status: string; task_status: string }>();
+
+          if (outOfSync.results && outOfSync.results.length > 0) {
+            results.details.push(`Found ${outOfSync.results.length} queue entries out of sync with task status`);
+
+            if (!dry_run) {
+              // Update each queue entry to match task status
+              for (const entry of outOfSync.results) {
+                const newQueueStatus = entry.task_status === 'completed' ? 'completed' : 'cancelled';
+                await env.DB.prepare(`
+                  UPDATE execution_queue
+                  SET status = ?, completed_at = ?, result = ?, updated_at = ?
+                  WHERE id = ? AND tenant_id = ?
+                `).bind(
+                  newQueueStatus,
+                  now,
+                  JSON.stringify({ synced_via: 'nexus_cleanup_queue', task_status: entry.task_status }),
+                  now,
+                  entry.id,
+                  tenantId
+                ).run();
+              }
+              results.sync_completed = outOfSync.results.length;
+            } else {
+              results.sync_completed = outOfSync.results.length;
+            }
+          }
+        }
+
         return {
           content: [{
             type: 'text',
@@ -4742,8 +4806,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               mode,
               ...results,
               message: dry_run
-                ? `Dry run complete. Would remove ${results.duplicates_removed} duplicates and ${results.stale_removed} stale entries.`
-                : `Cleanup complete. Removed ${results.duplicates_removed} duplicates and ${results.stale_removed} stale entries.`,
+                ? `Dry run complete. Would remove ${results.duplicates_removed} duplicates, ${results.stale_removed} stale entries, and sync ${results.sync_completed} entries.`
+                : `Cleanup complete. Removed ${results.duplicates_removed} duplicates, ${results.stale_removed} stale entries, and synced ${results.sync_completed} entries.`,
             }, null, 2)
           }]
         };

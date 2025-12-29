@@ -10,7 +10,7 @@
 
 import type { Env, Task } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
-import { createIntakeClient } from '../lib/intake-client.ts';
+import { createIntakeClient, IntakeClient } from '../lib/intake-client.ts';
 import { isOAuthError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
 import {
   type ExecutorType,
