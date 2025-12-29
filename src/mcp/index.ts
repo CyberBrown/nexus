@@ -4732,12 +4732,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_cleanup_queue
   server.tool(
     'nexus_cleanup_queue',
-    'Clean up duplicate and stale entries from execution_queue. Removes quarantine entries where the task already has an active entry, and optionally clears old completed/failed/cancelled entries.',
+    'Clean up duplicate, stale, and orphaned entries from execution_queue. Handles quarantine duplicates, old terminal entries, out-of-sync entries, and orphaned entries whose parent task no longer exists.',
     {
-      mode: z.enum(['duplicates', 'stale', 'sync', 'all']).default('duplicates')
-        .describe('Cleanup mode: "duplicates" removes quarantine entries with active task entries, "stale" removes old completed/failed/cancelled entries (>7 days), "sync" updates queue entries where the linked task is already completed, "all" does all three'),
+      mode: z.enum(['duplicates', 'stale', 'sync', 'orphans', 'all']).default('duplicates')
+        .describe('Cleanup mode: "duplicates" removes quarantine entries with active task entries, "stale" removes old completed/failed/cancelled entries (>7 days), "sync" updates queue entries where the linked task is already completed, "orphans" archives queue entries whose parent task no longer exists, "all" does all four'),
       dry_run: z.boolean().default(false)
-        .describe('If true, only report what would be deleted without actually deleting'),
+        .describe('If true, only report what would be cleaned without actually cleaning'),
       passphrase: passphraseSchema,
     },
     async ({ mode, dry_run, passphrase }) => {
@@ -4747,10 +4747,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Use the tenantId from the outer scope (passed to createNexusMcpServer)
         const now = new Date().toISOString();
-        const results: { duplicates_removed: number; stale_removed: number; sync_completed: number; details: string[] } = {
+        const results: { duplicates_removed: number; stale_removed: number; sync_completed: number; orphans_archived: number; details: string[] } = {
           duplicates_removed: 0,
           stale_removed: 0,
           sync_completed: 0,
+          orphans_archived: 0,
           details: [],
         };
 
@@ -4855,6 +4856,45 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
         }
 
+        // Archive orphan entries where the parent task no longer exists
+        if (mode === 'orphans' || mode === 'all') {
+          // Find queue entries where task_id doesn't exist in tasks table
+          const orphans = await env.DB.prepare(`
+            SELECT eq.id, eq.task_id, eq.status, eq.executor_type
+            FROM execution_queue eq
+            LEFT JOIN tasks t ON eq.task_id = t.id
+            WHERE eq.tenant_id = ?
+              AND t.id IS NULL
+          `).bind(tenantId).all<{ id: string; task_id: string; status: string; executor_type: string }>();
+
+          if (orphans.results && orphans.results.length > 0) {
+            results.details.push(`Found ${orphans.results.length} orphan queue entries (task no longer exists)`);
+
+            if (!dry_run) {
+              // Archive each orphan entry with a note about why it was archived
+              for (const entry of orphans.results) {
+                // First update to cancelled status with orphan reason
+                await env.DB.prepare(`
+                  UPDATE execution_queue
+                  SET status = 'cancelled', completed_at = ?, error = ?, updated_at = ?
+                  WHERE id = ? AND tenant_id = ?
+                `).bind(
+                  now,
+                  JSON.stringify({ reason: 'orphan_cleanup', original_task_id: entry.task_id, original_status: entry.status }),
+                  now,
+                  entry.id,
+                  tenantId
+                ).run();
+                // Then archive and delete
+                await archiveQueueEntry(env.DB, entry.id, tenantId);
+              }
+              results.orphans_archived = orphans.results.length;
+            } else {
+              results.orphans_archived = orphans.results.length;
+            }
+          }
+        }
+
         return {
           content: [{
             type: 'text',
@@ -4864,8 +4904,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               mode,
               ...results,
               message: dry_run
-                ? `Dry run complete. Would remove ${results.duplicates_removed} duplicates, ${results.stale_removed} stale entries, and sync ${results.sync_completed} entries.`
-                : `Cleanup complete. Removed ${results.duplicates_removed} duplicates, ${results.stale_removed} stale entries, and synced ${results.sync_completed} entries.`,
+                ? `Dry run complete. Would remove ${results.duplicates_removed} duplicates, ${results.stale_removed} stale entries, sync ${results.sync_completed} entries, and archive ${results.orphans_archived} orphans.`
+                : `Cleanup complete. Removed ${results.duplicates_removed} duplicates, ${results.stale_removed} stale entries, synced ${results.sync_completed} entries, and archived ${results.orphans_archived} orphans.`,
             }, null, 2)
           }]
         };
