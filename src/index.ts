@@ -18,6 +18,7 @@ import { createNexusMcpHandler } from './mcp/index.ts';
 import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 import { dispatchTasks } from './scheduled/task-dispatcher.ts';
 import { executeTasks, promoteDependentTasks } from './scheduled/task-executor.ts';
+import { archiveQueueEntry, archiveQueueEntriesByTask } from './lib/queue-archive.ts';
 
 // Re-export Durable Objects
 export { InboxManager } from './durable-objects/InboxManager.ts';
@@ -1361,12 +1362,20 @@ app.post('/api/tasks/:id/complete', async (c) => {
       UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?
     `).bind(now, now, taskId).run();
 
-    // Update any execution queue entries
-    await c.env.DB.prepare(`
-      UPDATE execution_queue
-      SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
-      WHERE task_id = ? AND status IN ('dispatched', 'claimed', 'queued')
-    `).bind(now, body.notes || body.output || 'Completed', now, taskId).run();
+    // Update any execution queue entries and archive them
+    const entriesToArchive = await c.env.DB.prepare(`
+      SELECT id FROM execution_queue
+      WHERE task_id = ? AND tenant_id = ? AND status IN ('dispatched', 'claimed', 'queued')
+    `).bind(taskId, task.tenant_id).all<{ id: string }>();
+
+    for (const entry of entriesToArchive.results || []) {
+      await c.env.DB.prepare(`
+        UPDATE execution_queue
+        SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
+        WHERE id = ?
+      `).bind(now, body.notes || body.output || 'Completed', now, entry.id).run();
+      await archiveQueueEntry(c.env.DB, entry.id, task.tenant_id);
+    }
 
     // Log completion
     await c.env.DB.prepare(`
@@ -1567,6 +1576,9 @@ app.post('/workflow-callback', async (c) => {
         now
       ).run();
 
+      // Archive the completed queue entry
+      await archiveQueueEntry(c.env.DB, entry.id, entry.tenant_id);
+
       console.log(`Workflow callback: task ${entry.task_id} completed successfully`);
 
       // Promote dependent tasks that are now unblocked
@@ -1600,6 +1612,9 @@ app.post('/workflow-callback', async (c) => {
         }),
         now
       ).run();
+
+      // Archive the failed queue entry
+      await archiveQueueEntry(c.env.DB, entry.id, entry.tenant_id);
 
       console.log(`Workflow callback: task ${entry.task_id} failed: ${error}`);
     }

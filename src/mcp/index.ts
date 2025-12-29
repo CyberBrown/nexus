@@ -18,6 +18,7 @@ import type { D1Database } from '@cloudflare/workers-types';
 import { getEncryptionKey, encryptField, decryptField, decryptFields } from '../lib/encryption.ts';
 import { executeQueueEntry, promoteDependentTasks } from '../scheduled/task-executor.ts';
 import { hasUnmetDependencies } from '../scheduled/task-dispatcher.ts';
+import { archiveQueueEntry, archiveQueueEntriesByTask } from '../lib/queue-archive.ts';
 
 // ========================================
 // SAFE DECRYPT HELPER
@@ -2431,12 +2432,25 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let queueEntriesSynced = 0;
         if (status === 'completed' || status === 'cancelled') {
           const queueStatus = status === 'completed' ? 'completed' : 'cancelled';
-          const queueSyncResult = await env.DB.prepare(`
-            UPDATE execution_queue
-            SET status = ?, completed_at = ?, result = ?, updated_at = ?
+          // First get the entries to sync
+          const entriesToSync = await env.DB.prepare(`
+            SELECT id FROM execution_queue
             WHERE task_id = ? AND tenant_id = ? AND status IN ('queued', 'claimed', 'dispatched')
-          `).bind(queueStatus, now, JSON.stringify({ completed_via: 'nexus_update_task', status }), now, task_id, tenantId).run();
-          queueEntriesSynced = queueSyncResult.meta.changes || 0;
+          `).bind(task_id, tenantId).all<{ id: string }>();
+
+          if (entriesToSync.results && entriesToSync.results.length > 0) {
+            for (const entry of entriesToSync.results) {
+              // Update to terminal status
+              await env.DB.prepare(`
+                UPDATE execution_queue
+                SET status = ?, completed_at = ?, result = ?, updated_at = ?
+                WHERE id = ? AND tenant_id = ?
+              `).bind(queueStatus, now, JSON.stringify({ completed_via: 'nexus_update_task', status }), now, entry.id, tenantId).run();
+              // Archive and delete
+              await archiveQueueEntry(env.DB, entry.id, tenantId);
+            }
+            queueEntriesSynced = entriesToSync.results.length;
+          }
         }
 
         return {
@@ -2504,14 +2518,26 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           now
         ).run();
 
-        // Sync queue entries - mark any queued/claimed entries as completed
-        const queueSyncResult = await env.DB.prepare(`
-          UPDATE execution_queue
-          SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
+        // Sync queue entries - mark any queued/claimed entries as completed and archive
+        const entriesToSync = await env.DB.prepare(`
+          SELECT id FROM execution_queue
           WHERE task_id = ? AND tenant_id = ? AND status IN ('queued', 'claimed', 'dispatched')
-        `).bind(now, JSON.stringify({ completed_via: 'nexus_complete_task', notes: notes || null }), now, task_id, tenantId).run();
+        `).bind(task_id, tenantId).all<{ id: string }>();
 
-        const queueEntriesSynced = queueSyncResult.meta.changes || 0;
+        let queueEntriesSynced = 0;
+        if (entriesToSync.results && entriesToSync.results.length > 0) {
+          for (const entry of entriesToSync.results) {
+            // Update to completed status
+            await env.DB.prepare(`
+              UPDATE execution_queue
+              SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
+              WHERE id = ? AND tenant_id = ?
+            `).bind(now, JSON.stringify({ completed_via: 'nexus_complete_task', notes: notes || null }), now, entry.id, tenantId).run();
+            // Archive and delete
+            await archiveQueueEntry(env.DB, entry.id, tenantId);
+          }
+          queueEntriesSynced = entriesToSync.results.length;
+        }
 
         // Promote dependent tasks that are now unblocked
         const promotionResult = await promoteDependentTasks(env, task_id, tenantId);
@@ -3620,6 +3646,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           now,
           queueId
         ).run();
+
+        // Archive and delete from execution_queue
+        await archiveQueueEntry(env.DB, queueId, tenantId);
 
         // ========================================
         // CHECK FOR MORE WORK
@@ -4774,9 +4803,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             results.details.push(`Found ${outOfSync.results.length} queue entries out of sync with task status`);
 
             if (!dry_run) {
-              // Update each queue entry to match task status
+              // Update each queue entry to match task status, then archive
               for (const entry of outOfSync.results) {
                 const newQueueStatus = entry.task_status === 'completed' ? 'completed' : 'cancelled';
+                // First update to terminal status
                 await env.DB.prepare(`
                   UPDATE execution_queue
                   SET status = ?, completed_at = ?, result = ?, updated_at = ?
@@ -4789,6 +4819,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                   entry.id,
                   tenantId
                 ).run();
+                // Then archive and delete
+                await archiveQueueEntry(env.DB, entry.id, tenantId);
               }
               results.sync_completed = outOfSync.results.length;
             } else {
@@ -4808,6 +4840,104 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               message: dry_run
                 ? `Dry run complete. Would remove ${results.duplicates_removed} duplicates, ${results.stale_removed} stale entries, and sync ${results.sync_completed} entries.`
                 : `Cleanup complete. Removed ${results.duplicates_removed} duplicates, ${results.stale_removed} stale entries, and synced ${results.sync_completed} entries.`,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_search_archive
+  server.tool(
+    'nexus_search_archive',
+    'Search the execution archive for historical queue entries. Query by task_id, status, executor_type, or date range.',
+    {
+      task_id: z.string().uuid().optional().describe('Filter by task ID'),
+      status: z.enum(['completed', 'failed', 'cancelled']).optional().describe('Filter by status'),
+      executor_type: z.enum(['human', 'human-ai', 'ai']).optional().describe('Filter by executor type'),
+      from_date: z.string().optional().describe('Start date (ISO format, e.g., 2025-01-01)'),
+      to_date: z.string().optional().describe('End date (ISO format, e.g., 2025-01-31)'),
+      limit: z.number().min(1).max(100).default(50).optional().describe('Maximum results (default: 50, max: 100)'),
+    },
+    async (args): Promise<CallToolResult> => {
+      try {
+        const conditions: string[] = ['tenant_id = ?'];
+        const bindings: unknown[] = [tenantId];
+
+        if (args.task_id) {
+          conditions.push('task_id = ?');
+          bindings.push(args.task_id);
+        }
+        if (args.status) {
+          conditions.push('status = ?');
+          bindings.push(args.status);
+        }
+        if (args.executor_type) {
+          conditions.push('executor_type = ?');
+          bindings.push(args.executor_type);
+        }
+        if (args.from_date) {
+          conditions.push('archived_at >= ?');
+          bindings.push(args.from_date);
+        }
+        if (args.to_date) {
+          conditions.push('archived_at <= ?');
+          bindings.push(args.to_date + 'T23:59:59.999Z');
+        }
+
+        const limit = args.limit || 50;
+        bindings.push(limit);
+
+        const results = await env.DB.prepare(`
+          SELECT id, task_id, executor_type, status, priority,
+                 queued_at, claimed_at, completed_at, archived_at,
+                 claimed_by, result, error, retry_count
+          FROM execution_archive
+          WHERE ${conditions.join(' AND ')}
+          ORDER BY archived_at DESC
+          LIMIT ?
+        `).bind(...bindings).all<{
+          id: string;
+          task_id: string;
+          executor_type: string;
+          status: string;
+          priority: number;
+          queued_at: string;
+          claimed_at: string | null;
+          completed_at: string | null;
+          archived_at: string;
+          claimed_by: string | null;
+          result: string | null;
+          error: string | null;
+          retry_count: number;
+        }>();
+
+        // Get counts by status
+        const countResult = await env.DB.prepare(`
+          SELECT status, COUNT(*) as count
+          FROM execution_archive
+          WHERE tenant_id = ?
+          GROUP BY status
+        `).bind(tenantId).all<{ status: string; count: number }>();
+
+        const statusCounts: Record<string, number> = {};
+        for (const row of countResult.results || []) {
+          statusCounts[row.status] = row.count;
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              total_in_archive: statusCounts,
+              results_count: results.results?.length || 0,
+              entries: results.results || [],
             }, null, 2)
           }]
         };
