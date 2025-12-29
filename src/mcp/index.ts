@@ -3351,47 +3351,41 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_search_notes - Search notes by content
+  // Tool: nexus_search_notes - Search notes by content using FTS5
   server.tool(
     'nexus_search_notes',
-    'Search notes by title or content. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
+    'Search notes by title or content using full-text search. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
     {
       query: z.string().describe('Search query. Multiple words are ANDed together. Use quotes for exact phrases, e.g. "MCP validation" or MCP validation'),
       limit: z.number().optional().default(20).describe('Maximum results'),
     },
     async ({ query, limit }): Promise<CallToolResult> => {
       try {
-        // Get all notes and search in decrypted content
-        const notes = await env.DB.prepare(`
-          SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at
-          FROM notes
-          WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL AND archived_at IS NULL
-          ORDER BY created_at DESC
-        `).bind(tenantId, userId).all();
-
-        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-
         // Parse search query: extract quoted phrases and individual words
-        // e.g., 'MCP "validation error" test' -> ['MCP', 'validation error', 'test']
-        const searchTerms: string[] = [];
+        // e.g., 'MCP "validation error" test' -> ['MCP', '"validation error"', 'test']
+        const ftsTerms: string[] = [];
         const quotedRegex = /"([^"]+)"/g;
         let match: RegExpExecArray | null;
         let queryWithoutQuotes = query;
 
-        // Extract quoted phrases
+        // Extract quoted phrases (keep quotes for FTS5 phrase matching)
         while ((match = quotedRegex.exec(query)) !== null) {
-          searchTerms.push(match[1]!.toLowerCase());
+          ftsTerms.push(`"${match[1]}"`);
         }
         queryWithoutQuotes = query.replace(quotedRegex, '').trim();
 
         // Extract individual words (non-quoted)
         const words = queryWithoutQuotes.split(/\s+/).filter(w => w.length > 0);
         for (const word of words) {
-          searchTerms.push(word.toLowerCase());
+          // Escape special FTS5 characters and add wildcard for prefix matching
+          const escapedWord = word.replace(/[*^"]/g, '');
+          if (escapedWord.length > 0) {
+            ftsTerms.push(escapedWord + '*');
+          }
         }
 
         // If no valid search terms, return empty results
-        if (searchTerms.length === 0) {
+        if (ftsTerms.length === 0) {
           return {
             content: [{
               type: 'text',
@@ -3405,30 +3399,41 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
+        // Build FTS5 query with AND logic (all terms must match)
+        const ftsQuery = ftsTerms.join(' AND ');
+
+        // Use FTS5 for efficient full-text search
+        // Join with notes table to filter by tenant/user and get all fields
+        const notes = await env.DB.prepare(`
+          SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at,
+                 bm25(notes_fts) as rank
+          FROM notes_fts fts
+          JOIN notes n ON n.rowid = fts.rowid
+          WHERE notes_fts MATCH ?
+            AND n.tenant_id = ?
+            AND n.user_id = ?
+            AND n.deleted_at IS NULL
+            AND n.archived_at IS NULL
+          ORDER BY rank
+          LIMIT ?
+        `).bind(ftsQuery, tenantId, userId, limit || 20).all();
+
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
         const matchingNotes = [];
         for (const note of notes.results) {
-          const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-          const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+          const decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
+          const decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
 
-          // Combine title and content for searching
-          const searchableText = `${decryptedTitle} ${decryptedContent}`.toLowerCase();
-
-          // All search terms must be found (AND logic)
-          const allTermsMatch = searchTerms.every(term => searchableText.includes(term));
-
-          if (allTermsMatch) {
-            matchingNotes.push({
-              id: note.id,
-              title: decryptedTitle,
-              content_preview: decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : ''),
-              category: note.category,
-              tags: note.tags,
-              pinned: note.pinned === 1,
-              created_at: note.created_at,
-            });
-
-            if (matchingNotes.length >= (limit || 20)) break;
-          }
+          matchingNotes.push({
+            id: note.id,
+            title: decryptedTitle,
+            content_preview: decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : ''),
+            category: note.category,
+            tags: note.tags,
+            pinned: note.pinned === 1,
+            created_at: note.created_at,
+          });
         }
 
         return {
@@ -3437,7 +3442,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             text: JSON.stringify({
               success: true,
               query: query,
-              search_terms: searchTerms,
+              fts_query: ftsQuery,
               count: matchingNotes.length,
               notes: matchingNotes,
             }, null, 2)
