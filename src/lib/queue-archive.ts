@@ -37,6 +37,11 @@ export async function archiveQueueEntry(
 
   // Delete from active queue
   if (archiveResult.meta.changes > 0) {
+    // Nullify dispatch_log references first (FK constraint)
+    await db.prepare(`
+      UPDATE dispatch_log SET queue_entry_id = NULL WHERE queue_entry_id = ?
+    `).bind(queueId).run();
+
     await db.prepare(`
       DELETE FROM execution_queue WHERE id = ? AND tenant_id = ?
     `).bind(queueId, tenantId).run();
@@ -83,6 +88,15 @@ export async function archiveQueueEntriesByTask(
 
   // Delete from active queue
   if (archiveResult.meta.changes > 0) {
+    // Nullify dispatch_log references first (FK constraint)
+    await db.prepare(`
+      UPDATE dispatch_log SET queue_entry_id = NULL
+      WHERE queue_entry_id IN (
+        SELECT id FROM execution_queue
+        WHERE task_id = ? AND tenant_id = ? AND status IN (${statusList})
+      )
+    `).bind(taskId, tenantId, ...statuses).run();
+
     await db.prepare(`
       DELETE FROM execution_queue
       WHERE task_id = ? AND tenant_id = ? AND status IN (${statusList})
@@ -130,6 +144,18 @@ export async function archiveAllTerminalEntries(
 
   // Delete from active queue
   if (archiveResult.meta.changes > 0) {
+    // Nullify dispatch_log references first (FK constraint)
+    const nullifyWhereClause = tenantId
+      ? 'WHERE status IN (\'completed\', \'failed\', \'cancelled\') AND tenant_id = ?'
+      : 'WHERE status IN (\'completed\', \'failed\', \'cancelled\')';
+    const nullifyBindings = tenantId ? [tenantId] : [];
+    await db.prepare(`
+      UPDATE dispatch_log SET queue_entry_id = NULL
+      WHERE queue_entry_id IN (
+        SELECT id FROM execution_queue ${nullifyWhereClause}
+      )
+    `).bind(...nullifyBindings).run();
+
     const deleteBindings = tenantId ? [tenantId] : [];
     await db.prepare(`
       DELETE FROM execution_queue ${whereClause.replace('?', tenantId ? '?' : '')}
