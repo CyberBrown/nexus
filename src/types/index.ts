@@ -375,3 +375,128 @@ export interface ConflictInfo {
   resolution: 'last_write_wins' | 'manual_required';
   winning_change?: ChangeLogEntry;
 }
+
+// ============================================
+// MEMORY ITEMS - AI Agent Persistent Memory
+// ============================================
+
+// Memory type classification
+export type MemoryType = 'fact' | 'preference' | 'decision' | 'context' | 'learning' | 'correction';
+
+// Memory scope - determines visibility and retrieval context
+export type MemoryScope = 'global' | 'project' | 'task' | 'conversation' | 'session';
+
+// Source of the memory
+export type MemorySourceType = 'user_input' | 'ai_inference' | 'conversation' | 'correction' | 'external';
+
+// Agent that created the memory
+export type MemorySourceAgent = 'claude-code' | 'claude-ai' | 'nexus' | 'user' | string;
+
+// Environment identifiers
+export type MemoryEnvironment = 'development' | 'production' | 'local' | 'spark' | 'staging' | string;
+
+// Memory Item - core entity for AI persistent memory
+export interface MemoryItem extends BaseEntity {
+  user_id: string;
+
+  // Core content (encrypted)
+  content: string; // The actual memory content
+  summary: string | null; // Short summary for quick retrieval
+
+  // Memory type and classification
+  memory_type: MemoryType;
+  importance: number; // 1-5 scale
+  confidence: number; // 0-1
+
+  // Scoping
+  scope: MemoryScope;
+  scope_reference_id: string | null;
+  scope_reference_type: string | null;
+
+  // Environment targeting
+  environments: string | null; // JSON array
+
+  // Tagging and categorization
+  tags: string | null; // JSON array
+  categories: string | null; // JSON array of category paths
+
+  // Source attribution
+  source_type: MemorySourceType | null;
+  source_agent: MemorySourceAgent | null;
+  source_reference: string | null;
+  source_context: string | null;
+
+  // Relationships
+  related_memory_ids: string | null; // JSON array
+  supersedes_id: string | null;
+  superseded_by_id: string | null;
+
+  // Temporal aspects
+  valid_from: string | null;
+  valid_until: string | null;
+  last_accessed_at: string | null;
+  access_count: number;
+
+  // Verification and review
+  verified: number; // 0 or 1
+  verified_at: string | null;
+  needs_review: number; // 0 or 1
+  review_reason: string | null;
+
+  // Status
+  is_active: number; // 0 or 1
+  archived_at: string | null;
+  archive_reason: string | null;
+
+  // Embedding metadata
+  embedding_model: string | null;
+  embedding_version: string | null;
+}
+
+// Memory Item Tag - normalized tag storage
+export interface MemoryItemTag {
+  id: string;
+  tenant_id: string;
+  memory_item_id: string;
+  tag: string;
+  created_at: string;
+}
+
+// Memory Item Environment - normalized environment storage
+export interface MemoryItemEnvironment {
+  id: string;
+  tenant_id: string;
+  memory_item_id: string;
+  environment: MemoryEnvironment;
+  created_at: string;
+}
+
+// Create/Update DTOs for MemoryItem
+export type CreateMemoryItemInput = Omit<
+  MemoryItem,
+  'id' | 'tenant_id' | 'created_at' | 'updated_at' | 'deleted_at' | 'access_count' | 'last_accessed_at'
+>;
+export type UpdateMemoryItemInput = Partial<CreateMemoryItemInput>;
+
+// Query parameters for retrieving memories
+export interface MemoryQueryParams {
+  scope?: MemoryScope;
+  scope_reference_id?: string;
+  environments?: MemoryEnvironment[];
+  tags?: string[];
+  memory_types?: MemoryType[];
+  min_importance?: number;
+  include_archived?: boolean;
+  include_unverified?: boolean;
+  valid_at?: string; // ISO date - filter by validity period
+  limit?: number;
+  offset?: number;
+}
+
+// Response with parsed JSON fields
+export interface MemoryItemParsed extends Omit<MemoryItem, 'environments' | 'tags' | 'categories' | 'related_memory_ids'> {
+  environments: MemoryEnvironment[];
+  tags: string[];
+  categories: string[];
+  related_memory_ids: string[];
+}
