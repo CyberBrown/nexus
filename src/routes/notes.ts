@@ -19,71 +19,154 @@ notes.get('/', async (c) => {
   const search = c.req.query('search');
   const source_type = c.req.query('source_type');
 
-  let items = await findAll<Note>(c.env.DB, 'notes', {
-    tenantId,
-    orderBy: 'pinned DESC, created_at DESC',
-  });
+  let items: Note[];
 
-  // Filter by user
-  items = items.filter((item) => item.user_id === userId);
+  // If search query is provided, use FTS5
+  if (search && search.trim()) {
+    try {
+      // Convert search query to FTS5 format
+      const ftsQuery = search
+        .trim()
+        .split(/\s+/)
+        .filter((term: string) => term.length > 0)
+        .map((term: string) => {
+          if (term.startsWith('"') || term.endsWith('"')) {
+            return term;
+          }
+          const escaped = term.replace(/[*^]/g, '');
+          return escaped.length > 0 ? `"${escaped}"*` : '';
+        })
+        .filter((term: string) => term.length > 0)
+        .join(' ');
 
-  // Optional filters
-  if (category) {
-    items = items.filter((item) => item.category === category);
-  }
-  if (archived === 'true') {
-    items = items.filter((item) => item.archived_at !== null);
-  } else if (archived === 'false' || !archived) {
-    // Default: exclude archived
-    items = items.filter((item) => item.archived_at === null);
-  }
-  if (pinned === 'true') {
-    items = items.filter((item) => item.pinned === 1);
-  }
-  if (source_type) {
-    items = items.filter((item) => item.source_type === source_type);
+      if (ftsQuery) {
+        // Build conditions
+        const conditions: string[] = [];
+        const bindings: (string | number)[] = [ftsQuery, tenantId, userId];
+
+        if (category) {
+          conditions.push('n.category = ?');
+          bindings.push(category);
+        }
+        if (archived === 'true') {
+          conditions.push('n.archived_at IS NOT NULL');
+        } else if (archived === 'false' || !archived) {
+          conditions.push('n.archived_at IS NULL');
+        }
+        if (pinned === 'true') {
+          conditions.push('n.pinned = 1');
+        }
+        if (source_type) {
+          conditions.push('n.source_type = ?');
+          bindings.push(source_type);
+        }
+
+        const whereClause = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
+
+        const result = await c.env.DB.prepare(`
+          SELECT n.*
+          FROM notes n
+          INNER JOIN notes_fts fts ON n.rowid = fts.rowid
+          WHERE fts.notes_fts MATCH ?
+            AND n.tenant_id = ?
+            AND n.user_id = ?
+            AND n.deleted_at IS NULL
+            ${whereClause}
+          ORDER BY n.pinned DESC, bm25(notes_fts) ASC, n.created_at DESC
+        `).bind(...bindings).all<Note>();
+
+        items = result.results;
+      } else {
+        items = [];
+      }
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      // Fallback to in-memory search if FTS5 not available
+      if (errorMessage.includes('no such table') || errorMessage.includes('notes_fts')) {
+        items = await findAll<Note>(c.env.DB, 'notes', {
+          tenantId,
+          orderBy: 'pinned DESC, created_at DESC',
+        });
+        items = items.filter((item) => item.user_id === userId);
+
+        // Apply filters
+        if (category) {
+          items = items.filter((item) => item.category === category);
+        }
+        if (archived === 'true') {
+          items = items.filter((item) => item.archived_at !== null);
+        } else if (archived === 'false' || !archived) {
+          items = items.filter((item) => item.archived_at === null);
+        }
+        if (pinned === 'true') {
+          items = items.filter((item) => item.pinned === 1);
+        }
+        if (source_type) {
+          items = items.filter((item) => item.source_type === source_type);
+        }
+
+        // In-memory search
+        const searchTerms: string[] = [];
+        const quotedRegex = /"([^"]+)"/g;
+        let match: RegExpExecArray | null;
+        let queryWithoutQuotes = search;
+
+        while ((match = quotedRegex.exec(search)) !== null) {
+          searchTerms.push(match[1]!.toLowerCase().trim());
+        }
+        queryWithoutQuotes = search.replace(quotedRegex, '').trim();
+
+        const words = queryWithoutQuotes.split(/\s+/).filter((w: string) => w.length > 0);
+        for (const word of words) {
+          searchTerms.push(word.toLowerCase().trim());
+        }
+
+        if (searchTerms.length > 0) {
+          items = items.filter((item) => {
+            const tagsText = item.tags ? String(item.tags).toLowerCase() : '';
+            const searchableText = `${item.title || ''} ${item.content || ''} ${tagsText}`.toLowerCase();
+            return searchTerms.every((term) => searchableText.includes(term));
+          });
+        }
+      } else {
+        throw error;
+      }
+    }
+  } else {
+    // No search query - fetch all with filters
+    items = await findAll<Note>(c.env.DB, 'notes', {
+      tenantId,
+      orderBy: 'pinned DESC, created_at DESC',
+    });
+
+    // Filter by user
+    items = items.filter((item) => item.user_id === userId);
+
+    // Optional filters
+    if (category) {
+      items = items.filter((item) => item.category === category);
+    }
+    if (archived === 'true') {
+      items = items.filter((item) => item.archived_at !== null);
+    } else if (archived === 'false' || !archived) {
+      // Default: exclude archived
+      items = items.filter((item) => item.archived_at === null);
+    }
+    if (pinned === 'true') {
+      items = items.filter((item) => item.pinned === 1);
+    }
+    if (source_type) {
+      items = items.filter((item) => item.source_type === source_type);
+    }
   }
 
-  // Decrypt sensitive fields
+  // Decrypt sensitive fields (pass-through when encryption is disabled)
   const key = await getEncryptionKey(c.env.KV, tenantId);
   const decryptedItems = await Promise.all(
     items.map((item) => decryptFields(item, ENCRYPTED_FIELDS, key))
   );
 
-  // Search filter (after decryption)
-  // Supports multi-word search with AND logic and quoted phrases
-  // Searches across title, content, and tags
-  let filteredItems = decryptedItems;
-  if (search) {
-    // Parse search query: extract quoted phrases and individual words
-    const searchTerms: string[] = [];
-    const quotedRegex = /"([^"]+)"/g;
-    let match: RegExpExecArray | null;
-    let queryWithoutQuotes = search;
-
-    // Extract quoted phrases
-    while ((match = quotedRegex.exec(search)) !== null) {
-      searchTerms.push(match[1]!.toLowerCase().trim());
-    }
-    queryWithoutQuotes = search.replace(quotedRegex, '').trim();
-
-    // Extract individual words (non-quoted)
-    const words = queryWithoutQuotes.split(/\s+/).filter((w: string) => w.length > 0);
-    for (const word of words) {
-      searchTerms.push(word.toLowerCase().trim());
-    }
-
-    if (searchTerms.length > 0) {
-      filteredItems = decryptedItems.filter((item) => {
-        // Build searchable text from title, content, and tags
-        const tagsText = item.tags ? String(item.tags).toLowerCase() : '';
-        const searchableText = `${item.title || ''} ${item.content || ''} ${tagsText}`.toLowerCase();
-        return searchTerms.every((term) => searchableText.includes(term));
-      });
-    }
-  }
-
-  return c.json({ success: true, data: filteredItems });
+  return c.json({ success: true, data: decryptedItems });
 });
 
 // Get single note
