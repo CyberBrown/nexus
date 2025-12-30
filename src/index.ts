@@ -1717,6 +1717,16 @@ app.post('/workflow-callback', async (c) => {
 
         console.log(`Workflow callback: idea_task ${ideaTask.id} ${isSuccess ? 'completed' : 'failed'}`);
         return c.json({ success: true, type: 'idea_task' });
+      } else {
+        // Check if the task exists but with an unexpected status (helps debug race conditions)
+        const anyStatusTask = await c.env.DB.prepare(`
+          SELECT id, status FROM idea_tasks WHERE id = ? AND deleted_at IS NULL
+        `).bind(body.task_id).first<{ id: string; status: string }>();
+
+        if (anyStatusTask) {
+          console.warn(`Workflow callback: idea_task ${body.task_id} exists but has unexpected status '${anyStatusTask.status}' (expected 'dispatched' or 'in_progress')`);
+          console.warn(`Workflow callback: This may indicate a race condition or duplicate callback. isSuccess=${isSuccess}, output_preview=${resultText.substring(0, 200)}`);
+        }
       }
     }
 
