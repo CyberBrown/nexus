@@ -147,6 +147,52 @@ notes.get('/', async (c) => {
             }
           }
         }
+
+        // Handle notes that ARE in FTS (with stale/encrypted data) but have no search_text
+        // This catches cases where migration 0017 indexed encrypted content but 0018's search_text column wasn't populated
+        const notesInFtsWithoutSearchText = await c.env.DB.prepare(`
+          SELECT n.id, n.title, n.content, n.tags FROM notes n
+          INNER JOIN notes_fts f ON n.id = f.note_id
+          WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+            AND (n.search_text IS NULL OR n.search_text = '')
+          LIMIT 50
+        `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
+
+        if (notesInFtsWithoutSearchText.results && notesInFtsWithoutSearchText.results.length > 0) {
+          for (const note of notesInFtsWithoutSearchText.results) {
+            try {
+              // Try to decrypt - if it fails, use raw value (for non-encrypted notes)
+              let decryptedTitle = '';
+              let decryptedContent = '';
+              try {
+                const { decryptField } = await import('../lib/encryption.ts');
+                decryptedTitle = note.title ? await decryptField(note.title, encryptionKey) : '';
+                decryptedContent = note.content ? await decryptField(note.content, encryptionKey) : '';
+              } catch {
+                // Decryption failed - use raw values
+                decryptedTitle = note.title || '';
+                decryptedContent = note.content || '';
+              }
+              const tagsText = note.tags ? String(note.tags) : '';
+
+              // Build search_text (lowercase for FTS case sensitivity)
+              const searchText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.trim().toLowerCase();
+
+              if (searchText) {
+                // Update notes table with search_text
+                await c.env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                  .bind(searchText, note.id).run();
+
+                // Delete old FTS entry and insert correct one
+                await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                  .bind(note.id, searchText).run();
+              }
+            } catch {
+              // Ignore errors for individual notes
+            }
+          }
+        }
       } catch {
         // Table check/creation failed, will fall back to in-memory search
       }
