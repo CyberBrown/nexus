@@ -255,12 +255,13 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query for multi-word search
-      // Use simple space-separated terms for implicit AND behavior
-      // FTS5 treats space-separated terms as implicit AND (all must match)
-      // Only quoted phrases (already in ftsTerms) need the quotes preserved
-      // Example: "mcp validation" -> matches docs with both "mcp" AND "validation"
+      // IMPORTANT: FTS5 uses OR by default for space-separated terms, NOT AND!
+      // We must use explicit AND operators: "term1 AND term2" (unquoted terms)
+      // For quoted phrases (exact match), keep the quotes: "exact phrase"
+      // Example: "mcp AND validation" matches docs with BOTH terms
+      // Example: '"exact phrase" AND term' matches exact phrase AND term
       const ftsQuery = ftsTerms.length > 0
-        ? ftsTerms.join(' ')
+        ? ftsTerms.join(' AND ')
         : '';
 
       if (ftsQuery) {

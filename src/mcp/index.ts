@@ -3598,12 +3598,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // Use simple space-separated terms for implicit AND behavior
-        // FTS5 treats space-separated terms as implicit AND (all must match)
-        // Only quoted phrases (already in ftsTerms) need the quotes preserved
-        // Example: "mcp validation" -> matches docs with both "mcp" AND "validation"
+        // IMPORTANT: FTS5 uses OR by default for space-separated terms, NOT AND!
+        // We must use explicit AND operators: "term1 AND term2" (unquoted terms)
+        // For quoted phrases (exact match), keep the quotes: "exact phrase"
+        // Example: "mcp AND validation" matches docs with BOTH terms
+        // Example: '"exact phrase" AND term' matches exact phrase AND term
         const ftsQuery = ftsTerms.length > 0
-          ? ftsTerms.join(' ')
+          ? ftsTerms.join(' AND ')
           : '';
 
         // Helper to check if all search terms match in a text
@@ -3851,8 +3852,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 if (matchingNotes.length >= maxLimit) break;
               }
             }
-          } catch (err) {
+          } catch (err: any) {
             console.error('FTS5 search failed:', err);
+            // Capture FTS5 error for diagnostics
+            searchMethod = `fts5_error: ${err.message || String(err)}`;
           }
         }
 
@@ -4062,8 +4065,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // We don't rely on triggers because D1 trigger execution can be unreliable
         // Instead, we directly manage both notes.search_text and notes_fts
 
-        // First, clear the FTS index for a clean rebuild
-        await env.DB.prepare(`DELETE FROM notes_fts`).run();
+        // First, clear the FTS index for this user's notes only (multi-tenant safety)
+        // Don't delete ALL entries - only entries for notes owned by this tenant/user
+        await env.DB.prepare(`
+          DELETE FROM notes_fts WHERE note_id IN (
+            SELECT id FROM notes WHERE tenant_id = ? AND user_id = ?
+          )
+        `).bind(tenantId, userId).run();
 
         let indexed = 0;
         let errors = 0;
