@@ -66,7 +66,7 @@ interface SandboxExecutorResponse {
   error_code?: string;
 }
 
-// Code task detection patterns
+// Code task detection patterns - match at start of title
 const CODE_TASK_PATTERNS = [
   /^\[implement\]/i,
   /^\[deploy\]/i,
@@ -76,6 +76,31 @@ const CODE_TASK_PATTERNS = [
   /^\[debug\]/i,
   /^\[code\]/i,
   /^\[CC\]/i,
+  /^\[setup\]/i,
+  /^\[create\]/i,
+  /^\[build\]/i,
+  /^\[init\]/i,
+];
+
+// Additional patterns that indicate code tasks - match anywhere in title or description
+const CODE_TASK_KEYWORDS = [
+  // Infrastructure keywords
+  /\b(cloudflare|worker|d1|kv|r2|durable object|pages)\b/i,
+  /\b(github|repo|repository)\b/i,
+  /\b(deploy|deployment|deployments)\b/i,
+  /\b(api|endpoint|endpoints)\b/i,
+  // Project setup keywords
+  /\bproject setup\b/i,
+  /\barchitecture design\b/i,
+  /\bsetup.*project\b/i,
+  /\bcreate.*worker\b/i,
+  /\bcreate.*database\b/i,
+  /\binitialize\b/i,
+  /\bscaffold\b/i,
+  // Code-specific keywords
+  /\b(typescript|javascript|python|rust|go)\b/i,
+  /\b(npm|pnpm|bun|yarn)\b/i,
+  /\bwrangler\b/i,
 ];
 
 // Failure indicators in AI responses that indicate the task wasn't actually completed
@@ -515,29 +540,45 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
   }
 
   /**
-   * Check if a task is a code task based on title patterns or repo field
+   * Check if a task is a code task based on title patterns, keywords, or repo field
+   *
+   * Code tasks are routed to sandbox-executor (Claude Code runner)
+   * Non-code tasks are routed to text-gen (Claude text generation)
    */
   private isCodeTask(task: IdeaTask): boolean {
     // If repo field is set, it's definitely a code task
     if (task.repo) {
+      console.log(`[TaskExecutor] Task ${task.id} is code task: repo field set (${task.repo})`);
       return true;
     }
 
-    // Check title patterns
+    // Check title for [bracket] patterns
     for (const pattern of CODE_TASK_PATTERNS) {
       if (pattern.test(task.title)) {
+        console.log(`[TaskExecutor] Task ${task.id} is code task: title matches pattern ${pattern}`);
         return true;
       }
     }
 
-    // Check description for repo info
+    // Check title and description for code-related keywords
+    const textToCheck = `${task.title} ${task.description || ''}`;
+    for (const pattern of CODE_TASK_KEYWORDS) {
+      if (pattern.test(textToCheck)) {
+        console.log(`[TaskExecutor] Task ${task.id} is code task: matches keyword pattern ${pattern}`);
+        return true;
+      }
+    }
+
+    // Check description for explicit repo references
     if (task.description) {
       const repoPattern = /(?:repo(?:sitory)?|github)[:\s]+([a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+)/i;
       if (repoPattern.test(task.description)) {
+        console.log(`[TaskExecutor] Task ${task.id} is code task: description contains repo reference`);
         return true;
       }
     }
 
+    console.log(`[TaskExecutor] Task ${task.id} is NOT a code task (routing to text-gen)`);
     return false;
   }
 
