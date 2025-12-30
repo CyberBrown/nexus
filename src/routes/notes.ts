@@ -533,30 +533,22 @@ notes.patch('/:id', async (c) => {
     // MUST lowercase because D1's FTS5 is case-sensitive and query terms are lowercased
     const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim().toLowerCase();
     updates.search_text = searchText;
-
-    // Explicitly update FTS index after the note update (don't rely on triggers)
-    if (Object.keys(updates).length > 0) {
-      const encrypted = await encryptFields(updates, ENCRYPTED_FIELDS, key);
-      await update(c.env.DB, 'notes', id, encrypted, { tenantId });
-    }
-
-    // Update FTS index
-    if (searchText) {
-      try {
-        await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
-        await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-          .bind(id, searchText).run();
-      } catch {
-        // FTS update failed, search will use fallback
-      }
-    }
-
-    return c.json({ success: true, data: { id } });
   }
 
   if (Object.keys(updates).length > 0) {
     const encrypted = await encryptFields(updates, ENCRYPTED_FIELDS, key);
     await update(c.env.DB, 'notes', id, encrypted, { tenantId });
+
+    // Explicitly update FTS index if search_text changed (don't rely on triggers)
+    if (updates.search_text) {
+      try {
+        await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
+        await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+          .bind(id, updates.search_text).run();
+      } catch {
+        // FTS update failed, search will use fallback
+      }
+    }
   }
 
   return c.json({ success: true, data: { id } });
