@@ -3545,10 +3545,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query - AND all terms together using explicit AND operator
-        // D1's FTS5 implementation may not reliably handle implicit AND with space-separated terms
-        // Using explicit AND ensures all terms must match
-        // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
+        // Build FTS5 query - use space-separated terms (implicit AND is the default in FTS5)
+        // Note: Explicit "AND" operator also works but implicit is simpler and equally reliable
+        // For phrases, we keep them quoted
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match exactly in sequence
@@ -3557,9 +3556,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             // Single word - let FTS5 porter stemmer handle matching
             return term;
           }
-        }).join(' AND ');
-        // FTS5 query with explicit AND operator for reliable multi-word search
-        const ftsQuery = terms;
+        });
+        // FTS5 query - space-separated terms are implicitly ANDed
+        // Using spaces instead of explicit AND for better compatibility across FTS5 implementations
+        const ftsQuery = terms.join(' ');
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {
@@ -3748,6 +3748,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Try FTS5 search first
+        let ftsError: Error | null = null;
         try {
           // First, count how many notes are in the FTS index for this user
           try {
@@ -3760,24 +3761,26 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             // FTS table might not exist
           }
 
-          // Use subquery with MATCH for FTS5 query
-          // This approach is more compatible with D1's FTS5 implementation
-          // than the table-valued function syntax which can have issues with AND operator
-          const ftsResults = await env.DB.prepare(`
-            SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
-            FROM notes n
-            WHERE n.id IN (
-              SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
-            )
-              AND n.tenant_id = ?
-              AND n.user_id = ?
-              AND n.deleted_at IS NULL
-              ${archivedCondition}
-            ORDER BY n.pinned DESC, n.created_at DESC
-            LIMIT ?
-          `).bind(ftsQuery, tenantId, userId, maxLimit).all();
+          // Only try FTS if index is populated
+          if (ftsIndexCount > 0) {
+            // Use subquery with MATCH for FTS5 query
+            // In FTS5, MATCH must be against the table name (not a column name)
+            // The syntax is: WHERE table_name MATCH 'query'
+            const ftsResults = await env.DB.prepare(`
+              SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
+              FROM notes n
+              WHERE n.id IN (
+                SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
+              )
+                AND n.tenant_id = ?
+                AND n.user_id = ?
+                AND n.deleted_at IS NULL
+                ${archivedCondition}
+              ORDER BY n.pinned DESC, n.created_at DESC
+              LIMIT ?
+            `).bind(ftsQuery, tenantId, userId, maxLimit).all();
 
-          usedFts = true;
+            usedFts = true;
 
           for (const note of ftsResults.results || []) {
             const decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
@@ -3798,33 +3801,94 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             });
             ftsMatchCount++;
           }
-        } catch (ftsError) {
+          }
+        } catch (err) {
           // FTS5 query failed - might be malformed query or table doesn't exist
-          console.error('FTS5 search failed, falling back to scan:', ftsError);
+          ftsError = err as Error;
+          console.error('FTS5 search failed, falling back to scan:', err);
         }
 
         // If FTS returned no results or failed, fall back to scanning notes directly
         if (matchingNotes.length === 0) {
-          // Query notes - try with search_text column first, fall back without it
-          let allNotes: { results: unknown[] | null };
+          // Try SQL-based search using LIKE on search_text column first (most efficient fallback)
+          // This uses the search_text column which stores plaintext for searching
+          let sqlSearchWorked = false;
+
           try {
-            allNotes = await env.DB.prepare(`
+            // Build LIKE conditions for all search terms - all must match
+            const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
+            const likeBindings = searchTerms.map(({ term }) => `%${term}%`);
+
+            const sqlSearchResults = await env.DB.prepare(`
               SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
               FROM notes
-              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                ${include_archived ? '' : 'AND archived_at IS NULL'}
+                AND search_text IS NOT NULL AND search_text != ''
+                AND ${likeConditions}
               ORDER BY pinned DESC, created_at DESC
-            `).bind(tenantId, userId).all();
+              LIMIT ?
+            `).bind(tenantId, userId, ...likeBindings, maxLimit).all();
+
+            if (sqlSearchResults.results && sqlSearchResults.results.length > 0) {
+              sqlSearchWorked = true;
+              for (const note of sqlSearchResults.results as Array<{
+                id: string;
+                title: string | null;
+                content: string | null;
+                category: string;
+                tags: string | null;
+                source_type: string | null;
+                pinned: number;
+                archived_at: string | null;
+                created_at: string;
+                search_text: string | null;
+              }>) {
+                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+
+                matchingNotes.push({
+                  id: note.id,
+                  title: decryptedTitle,
+                  content_preview: decryptedContent
+                    ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                    : '',
+                  category: note.category as string,
+                  tags: note.tags as string | null,
+                  source_type: note.source_type as string | null,
+                  pinned: note.pinned === 1,
+                  archived: !!note.archived_at,
+                  created_at: note.created_at as string,
+                });
+                fallbackMatchCount++;
+              }
+            }
           } catch {
-            // search_text column might not exist, query without it
-            allNotes = await env.DB.prepare(`
-              SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, NULL as search_text
-              FROM notes
-              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
-              ORDER BY pinned DESC, created_at DESC
-            `).bind(tenantId, userId).all();
+            // SQL search failed, continue to full scan fallback
           }
 
-          totalNotesScanned = allNotes.results?.length || 0;
+          // If SQL-based search didn't find results, do full scan (handles notes without search_text)
+          if (!sqlSearchWorked) {
+            // Query notes - try with search_text column first, fall back without it
+            let allNotes: { results: unknown[] | null };
+            try {
+              allNotes = await env.DB.prepare(`
+                SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
+                FROM notes
+                WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
+                ORDER BY pinned DESC, created_at DESC
+              `).bind(tenantId, userId).all();
+            } catch {
+              // search_text column might not exist, query without it
+              allNotes = await env.DB.prepare(`
+                SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, NULL as search_text
+                FROM notes
+                WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
+                ORDER BY pinned DESC, created_at DESC
+              `).bind(tenantId, userId).all();
+            }
+
+            totalNotesScanned = allNotes.results?.length || 0;
 
           for (const note of (allNotes.results || []) as Array<{
             id: string;
@@ -3901,6 +3965,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             if (matchingNotes.length >= maxLimit) {
               break;
             }
+          }
           }
         }
 
