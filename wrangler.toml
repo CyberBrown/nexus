@@ -156,6 +156,7 @@ bucket_name = "nexus-ai-search"
 # AI Search has its own built-in vector index
 # This is for manual embedding operations if needed
 # Create with: npx wrangler vectorize create nexus-ai-search --dimensions=384 --metric=cosine
-[[vectorize]]
-binding = "VECTORIZE"
-index_name = "nexus-ai-search"
+# DISABLED: API token lacks Vectorize permissions
+# [[vectorize]]
+# binding = "VECTORIZE"
+# index_name = "nexus-ai-search"
