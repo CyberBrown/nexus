@@ -544,3 +544,68 @@ CREATE TABLE IF NOT EXISTS memory_item_environments (
 CREATE INDEX IF NOT EXISTS idx_memory_env_lookup ON memory_item_environments(tenant_id, environment);
 CREATE INDEX IF NOT EXISTS idx_memory_env_item ON memory_item_environments(memory_item_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_env_unique ON memory_item_environments(memory_item_id, environment);
+
+
+-- ============================================
+-- NOTES (Persistent Knowledge Storage)
+-- ============================================
+-- Stores notes with encrypted content and FTS5 full-text search support
+
+CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+
+    -- Core content (encrypted)
+    title TEXT NOT NULL, -- encrypted
+    content TEXT, -- encrypted
+
+    -- Categorization
+    category TEXT DEFAULT 'general', -- general, meeting, research, reference, idea, log
+    tags TEXT, -- JSON array of tags
+
+    -- Source tracking - where did this note originate?
+    source_type TEXT, -- claude_conversation, idea_execution, task, manual, capture
+    source_reference TEXT, -- ID or URL of the source
+    source_context TEXT, -- Additional context about the source (e.g., conversation snippet)
+
+    -- Organization
+    pinned INTEGER DEFAULT 0, -- 1 = pinned to top
+    archived_at TEXT, -- When archived, NULL if active
+
+    -- Full-text search support
+    -- Plaintext concatenation of title + content + tags for FTS indexing
+    -- This allows FTS to work with encrypted notes
+    search_text TEXT,
+
+    -- Timestamps
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    deleted_at TEXT -- Soft delete
+);
+
+-- Indexes for efficient querying
+CREATE INDEX IF NOT EXISTS idx_notes_tenant ON notes(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(tenant_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_notes_category ON notes(tenant_id, user_id, category);
+CREATE INDEX IF NOT EXISTS idx_notes_source ON notes(tenant_id, source_type, source_reference);
+CREATE INDEX IF NOT EXISTS idx_notes_pinned ON notes(tenant_id, user_id, pinned);
+CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(tenant_id, user_id, created_at DESC);
+
+
+-- ============================================
+-- NOTES FTS5 (Full-Text Search Index)
+-- ============================================
+-- FTS5 virtual table for efficient full-text search on notes
+-- Uses standalone table with note_id reference since content is encrypted
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+    note_id UNINDEXED,
+    search_text,
+    tokenize='porter unicode61'
+);
+
+-- Note: FTS index must be manually maintained by the application
+-- since triggers cannot handle application-level encryption.
+-- The application inserts/updates/deletes from notes_fts when
+-- creating/updating/deleting notes.
