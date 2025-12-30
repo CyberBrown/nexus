@@ -3676,23 +3676,28 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // PRIMARY SEARCH: FTS5 MATCH query for efficient multi-word search
         // Uses the notes_fts virtual table with porter stemming for word matching
-        // FTS5 default is OR for space-separated terms, so we use explicit AND
+        // FTS5 interprets space-separated terms with implicit AND when quoted together
         try {
-          // Build FTS5 query: escape special chars and join with AND for multi-term matching
-          // FTS5 uses OR by default, so we need explicit AND between terms
+          // Build FTS5 query: each term with prefix wildcard for partial matching
+          // Join with AND for multi-term matching (all terms must be present)
           const ftsQuery = searchTerms
-            .map(term => term.replace(/["']/g, '')) // Remove quotes
+            .map(term => {
+              const cleaned = term.replace(/["']/g, '');
+              // Add prefix wildcard for partial matching (e.g., "valid" matches "validation")
+              return `${cleaned}*`;
+            })
             .join(' AND ');
 
           console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}"`);
 
-          // Query FTS5 index and join with notes table to get full data
+          // Query FTS5 index using subquery approach (more reliable in D1)
           // Filter by tenant_id and user_id for security
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
-            FROM notes_fts fts
-            JOIN notes n ON n.id = fts.note_id
-            WHERE notes_fts MATCH ?
+            FROM notes n
+            WHERE n.id IN (
+              SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
+            )
               AND n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
               ${archivedCondition}
             ORDER BY n.pinned DESC, n.created_at DESC
