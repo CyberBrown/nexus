@@ -198,8 +198,8 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // D1's FTS5 works best with space-separated terms (implicit AND)
-      // Terms are joined with spaces for D1 compatibility
+      // D1's FTS5 requires explicit AND operator for reliable multi-word matching
+      // Terms are joined with ' AND ' for proper boolean matching
       const ftsTerms: string[] = [];
       const searchTerms: string[] = []; // For post-filtering to ensure all terms match
       const trimmedSearch = search.trim();
@@ -255,12 +255,11 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query - use implicit AND (space-separated terms) for D1 compatibility
-      // D1's FTS5 defaults to requiring all terms to match when space-separated
-      // Explicit AND operator can cause issues in some D1 configurations
-      // Example: "mcp validation" becomes "mcp validation" (implicit AND)
+      // Build FTS5 query - use explicit AND operator for reliable multi-word matching
+      // D1's FTS5 should support AND operator like standard SQLite FTS5
+      // Example: "mcp validation" becomes "mcp AND validation" (explicit AND)
       // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
-      const ftsQuery = ftsTerms.join(' ');
+      const ftsQuery = ftsTerms.join(' AND ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)

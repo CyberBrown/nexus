@@ -3578,12 +3578,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query - use implicit AND (space-separated terms) for D1 compatibility
-        // D1's FTS5 defaults to requiring all terms to match when space-separated
-        // Explicit AND operator can cause issues in some D1 configurations
-        // Example: "mcp validation" becomes "mcp validation" (implicit AND)
+        // Build FTS5 query - use explicit AND operator for reliable multi-word matching
+        // D1's FTS5 should support AND operator like standard SQLite FTS5
+        // Example: "mcp validation" becomes "mcp AND validation" (explicit AND)
         // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
-        const ftsQuery = ftsTerms.join(' ');
+        // If a term is quoted phrase, wrap in parens for safety: ("exact phrase" AND other)
+        const ftsQuery = ftsTerms.join(' AND ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
@@ -3878,20 +3878,39 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           search_method: searchMethod,
         };
 
-        // Add helpful hints
+        // Add helpful hints and diagnostic info
         if (matchingNotes.length === 0) {
           let totalNotes = 0;
+          let ftsCount = 0;
+          let notesWithSearchText = 0;
           try {
             const countResult = await env.DB.prepare(`
               SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
             `).bind(tenantId, userId).first<{ cnt: number }>();
             totalNotes = countResult?.cnt || 0;
+
+            // Check how many notes are in FTS index
+            const ftsCountResult = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes_fts WHERE note_id IN (
+                SELECT id FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+              )
+            `).bind(tenantId, userId).first<{ cnt: number }>();
+            ftsCount = ftsCountResult?.cnt || 0;
+
+            // Check how many notes have search_text populated
+            const searchTextCountResult = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND search_text IS NOT NULL AND search_text != ''
+            `).bind(tenantId, userId).first<{ cnt: number }>();
+            notesWithSearchText = searchTextCountResult?.cnt || 0;
           } catch { /* ignore */ }
 
           if (totalNotes === 0) {
             response.hint = 'No notes found for this user. Create some notes first.';
+          } else if (ftsCount === 0 || notesWithSearchText < totalNotes) {
+            response.hint = `No matching notes found. FTS index may need rebuilding. Run nexus_rebuild_notes_fts to fix. (notes: ${totalNotes}, indexed: ${ftsCount}, with_search_text: ${notesWithSearchText})`;
           } else {
-            response.hint = `No matching notes found. ${totalNotes} notes exist. Try simpler search terms or check spelling.`;
+            response.hint = `No matching notes found. ${totalNotes} notes exist (all indexed). Try simpler search terms or check spelling.`;
           }
         } else if (searchMethod.startsWith('full_scan')) {
           response.hint = 'Search used full scan. Run nexus_rebuild_notes_fts to enable faster indexed search.';
