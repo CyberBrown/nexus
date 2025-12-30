@@ -388,6 +388,17 @@ export const FAILURE_INDICATORS = [
   "doesn't have a corresponding", "does not have a corresponding",
   "no corresponding file", "no corresponding project",
   "missing reference", "invalid reference",
+  // Additional patterns for edge cases (added 2024-12)
+  "i can find", // catches "file I can find" negation patterns
+  "no repo", "no repository", "no project",
+  "couldn't access", "could not access", "can't access", "cannot access",
+  "no idea file", "idea file not", "idea reference not",
+  "there is no", "there are no", "there isn't", "there aren't",
+  "without a", "missing a", "lack of", "lacking",
+  "haven't been created", "hasn't been created", "has not been created",
+  "wasn't created", "were not created", "weren't created",
+  "no github", "no cloudflare", "no d1", "no worker",
+  "the task cannot", "the task could not", "this task cannot",
 ] as const;
 
 /**

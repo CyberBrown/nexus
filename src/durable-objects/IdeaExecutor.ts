@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types/index.ts';
 import { DEClient } from '../lib/de-client.ts';
+import { findFailureIndicator } from '../lib/validation.ts';
 
 /**
  * IdeaExecutor Durable Object
@@ -264,11 +265,26 @@ export class IdeaExecutor extends DurableObject<Env> {
     const body = await request.json() as {
       taskId: string;
       status: 'pending' | 'in_progress' | 'completed' | 'failed';
+      result?: string; // Optional: task result/output for validation
     };
 
     const task = this.state.tasks.find(t => t.taskId === body.taskId);
     if (task) {
-      task.status = body.status;
+      // Validate completion - check for failure indicators in the result
+      // This prevents marking tasks as complete when the AI said "I couldn't find..."
+      if (body.status === 'completed' && body.result) {
+        const failureIndicator = findFailureIndicator(body.result);
+        if (failureIndicator) {
+          console.log(`[IdeaExecutor] Task ${body.taskId} reported complete but result contains failure indicator: "${failureIndicator}"`);
+          console.log(`[IdeaExecutor] Result preview: ${body.result.substring(0, 200)}`);
+          // Mark as failed instead of completed
+          task.status = 'failed';
+        } else {
+          task.status = body.status;
+        }
+      } else {
+        task.status = body.status;
+      }
     }
 
     // Check if all tasks are complete
