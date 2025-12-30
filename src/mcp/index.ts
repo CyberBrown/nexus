@@ -3760,16 +3760,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             // FTS table might not exist
           }
 
-          // Use subquery approach for D1 FTS5 compatibility
-          // D1's FTS5 MATCH works more reliably when the FTS table is queried directly
-          // First get matching note IDs from FTS, then fetch full notes
+          // Use table-valued function syntax for FTS5 query
+          // This is the most reliable way to query FTS5 in D1/SQLite
+          // The query returns note_ids that match, which we join with notes table
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
             FROM notes n
-            WHERE n.id IN (
-              SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
-            )
-              AND n.tenant_id = ?
+            INNER JOIN notes_fts(?) fts ON n.id = fts.note_id
+            WHERE n.tenant_id = ?
               AND n.user_id = ?
               AND n.deleted_at IS NULL
               ${archivedCondition}
