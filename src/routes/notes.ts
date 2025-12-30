@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import type { AppType, Note } from '../types/index.ts';
 import { getAuth } from '../lib/auth.ts';
 import { findAll, findById, insert, update, softDelete } from '../lib/db.ts';
-import { getEncryptionKey, encryptFields, decryptFields } from '../lib/encryption.ts';
+import { getEncryptionKey, encryptFields, decryptFields, decryptField } from '../lib/encryption.ts';
 import { validate, createNoteSchema, updateNoteSchema } from '../lib/validation.ts';
 import { NotFoundError } from '../lib/errors.ts';
 
@@ -71,6 +71,19 @@ notes.get('/', async (c) => {
 
         // Rebuild FTS if needed
         if (ftsNeedsRebuild) {
+          // Get encryption key for decrypting notes during rebuild
+          const rebuildKey = await getEncryptionKey(c.env.KV, tenantId);
+
+          // Helper to safely decrypt a field
+          const safeDecrypt = async (value: string | null): Promise<string> => {
+            if (!value || !rebuildKey) return '';
+            try {
+              return await decryptField(value, rebuildKey);
+            } catch {
+              return value; // Return as-is if decryption fails (might be plaintext)
+            }
+          };
+
           // First, populate search_text for notes that don't have it
           const notesWithoutSearchText = await c.env.DB.prepare(`
             SELECT id, title, content, tags FROM notes
@@ -80,9 +93,12 @@ notes.get('/', async (c) => {
           `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
 
           for (const note of notesWithoutSearchText.results || []) {
+            // IMPORTANT: Decrypt encrypted fields before building search_text
+            const decryptedTitle = await safeDecrypt(note.title);
+            const decryptedContent = await safeDecrypt(note.content);
             const searchText = [
-              note.title || '',
-              note.content || '',
+              decryptedTitle,
+              decryptedContent,
               note.tags || ''
             ].join(' ').trim().toLowerCase();
 
