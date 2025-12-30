@@ -198,9 +198,10 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // D1's FTS5 works best with explicit AND operator for multi-word matching
-      // Terms are joined with AND for reliable matching
+      // D1's FTS5 works best with space-separated terms (implicit AND)
+      // Terms are joined with spaces for D1 compatibility
       const ftsTerms: string[] = [];
+      const searchTerms: string[] = []; // For post-filtering to ensure all terms match
       const trimmedSearch = search.trim();
 
       // Extract quoted phrases first, then handle remaining words
@@ -218,6 +219,7 @@ notes.get('/', async (c) => {
             if (escaped.length > 0) {
               // No column prefix needed - notes_fts only has one searchable column
               ftsTerms.push(escaped);
+              searchTerms.push(escaped);
             }
           }
         }
@@ -228,6 +230,7 @@ notes.get('/', async (c) => {
           const escapedPhrase = phrase.replace(/"/g, '').toLowerCase();
           // Quoted phrase for exact sequence matching
           ftsTerms.push(`"${escapedPhrase}"`);
+          searchTerms.push(escapedPhrase);
         }
         lastIndex = match.index + match[0].length;
       }
@@ -241,16 +244,23 @@ notes.get('/', async (c) => {
           if (escaped.length > 0) {
             // No column prefix needed - notes_fts only has one searchable column
             ftsTerms.push(escaped);
+            searchTerms.push(escaped);
           }
         }
       }
 
-      // Build FTS5 query - use explicit AND operator for reliable multi-word matching in D1
-      // D1's FTS5 can be inconsistent with implicit AND (space-separated terms)
-      // Using explicit AND ensures all terms must match
-      // Example: "mcp validation" becomes "mcp AND validation"
+      // Helper to check if all search terms match in a text
+      const matchesAllTerms = (text: string): boolean => {
+        const lowerText = text.toLowerCase();
+        return searchTerms.every(term => lowerText.includes(term));
+      };
+
+      // Build FTS5 query - use implicit AND (space-separated terms) for D1 compatibility
+      // D1's FTS5 defaults to requiring all terms to match when space-separated
+      // Explicit AND operator can cause issues in some D1 configurations
+      // Example: "mcp validation" becomes "mcp validation" (implicit AND)
       // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
-      const ftsQuery = ftsTerms.join(' AND ');
+      const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
@@ -300,6 +310,7 @@ notes.get('/', async (c) => {
         // Use subquery with MATCH for FTS5 query
         // This approach is more compatible with D1's FTS5 implementation
         // than the table-valued function syntax which can have issues with AND operator
+        // Fetch more than needed since we'll post-filter to ensure all terms match
         const result = await c.env.DB.prepare(`
           SELECT n.*
           FROM notes n
@@ -311,9 +322,22 @@ notes.get('/', async (c) => {
             AND n.deleted_at IS NULL
             ${whereClause}
           ORDER BY n.pinned DESC, n.created_at DESC
+          LIMIT 200
         `).bind(...bindings).all<Note>();
 
-        items = result.results;
+        // Post-filter FTS5 results to ensure ALL search terms match
+        // D1's FTS5 may use OR instead of AND for space-separated terms
+        const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
+        const filteredResults: Note[] = [];
+        for (const note of result.results) {
+          // Decrypt title and content for matching
+          const decrypted = await decryptFields(note, ENCRYPTED_FIELDS, encryptionKey);
+          const combinedText = `${decrypted.title || ''} ${decrypted.content || ''} ${note.tags || ''}`;
+          if (matchesAllTerms(combinedText)) {
+            filteredResults.push(note);
+          }
+        }
+        items = filteredResults;
       } else {
         items = [];
       }

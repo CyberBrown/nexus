@@ -3578,12 +3578,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query - use explicit AND operator for reliable multi-word matching in D1
-        // D1's FTS5 can be inconsistent with implicit AND (space-separated terms)
-        // Using explicit AND ensures all terms must match
-        // Example: "mcp validation" becomes "mcp AND validation"
+        // Build FTS5 query - use implicit AND (space-separated terms) for D1 compatibility
+        // D1's FTS5 defaults to requiring all terms to match when space-separated
+        // Explicit AND operator can cause issues in some D1 configurations
+        // Example: "mcp validation" becomes "mcp validation" (implicit AND)
         // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
-        const ftsQuery = ftsTerms.join(' AND ');
+        const ftsQuery = ftsTerms.join(' ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
@@ -3720,6 +3720,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }
 
             // Use FTS5 MATCH with subquery for reliable multi-word search
+            // Fetch more results than requested since we'll post-filter
+            // FTS5 may return partial matches that don't contain all search terms
+            const ftsLimit = Math.max(maxLimit * 3, 50);
             const ftsSearchResults = await env.DB.prepare(`
               SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
               FROM notes n
@@ -3730,7 +3733,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 ${archivedCondition}
               ORDER BY n.pinned DESC, n.created_at DESC
               LIMIT ?
-            `).bind(ftsQuery, tenantId, userId, maxLimit).all();
+            `).bind(ftsQuery, tenantId, userId, ftsLimit).all();
 
             if (ftsSearchResults.results && ftsSearchResults.results.length > 0) {
               searchMethod = 'fts5';
@@ -3747,6 +3750,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               }>) {
                 const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
                 const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                const tagsText = note.tags ? String(note.tags) : '';
+
+                // Post-filter FTS5 results to ensure ALL search terms match
+                // D1's FTS5 may use OR instead of AND for space-separated terms
+                const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
+                if (!matchesAllTerms(combinedText)) {
+                  continue; // Skip notes that don't match all terms
+                }
 
                 matchingNotes.push({
                   id: note.id,
@@ -3761,6 +3772,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                   archived: !!note.archived_at,
                   created_at: note.created_at,
                 });
+
+                // Stop after reaching the requested limit
+                if (matchingNotes.length >= maxLimit) break;
               }
             }
           } catch (err) {
