@@ -1896,6 +1896,150 @@ app.post('/workflow-callback', async (c) => {
   }
 });
 
+// ========================================
+// Public Admin Endpoints (passphrase auth)
+// ========================================
+
+// POST /rebuild-fts - Rebuild FTS5 index for all notes
+// Requires X-Passphrase header matching WRITE_PASSPHRASE
+app.post('/rebuild-fts', async (c) => {
+  try {
+    const passphrase = c.req.header('X-Passphrase');
+
+    // Validate passphrase
+    if (c.env.WRITE_PASSPHRASE && passphrase !== c.env.WRITE_PASSPHRASE) {
+      return c.json({ success: false, error: 'Invalid passphrase' }, 401);
+    }
+
+    // Use primary tenant
+    const mcpTenant = await getOrCreateMcpTenant(c.env);
+    const tenantId = mcpTenant.tenantId;
+    const userId = mcpTenant.userId;
+
+    const { getEncryptionKey, decryptField } = await import('./lib/encryption.ts');
+    const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
+
+    // Ensure search_text column exists
+    try {
+      const searchTextCol = await c.env.DB.prepare(
+        `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
+      ).first<{ name: string } | null>();
+
+      if (!searchTextCol) {
+        await c.env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
+      }
+    } catch {
+      // Column check failed, continue
+    }
+
+    // Ensure FTS5 table exists with correct schema
+    try {
+      const tableInfo = await c.env.DB.prepare(
+        `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
+      ).first<{ name: string } | null>();
+
+      if (!tableInfo) {
+        await c.env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+        await c.env.DB.prepare(`
+          CREATE VIRTUAL TABLE notes_fts USING fts5(
+            note_id UNINDEXED,
+            search_text,
+            tokenize='porter unicode61'
+          )
+        `).run();
+      }
+    } catch {
+      // Schema check failed
+    }
+
+    // Get all non-deleted notes for this user
+    const allNotes = await c.env.DB.prepare(`
+      SELECT id, title, content, tags
+      FROM notes
+      WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+    `).bind(tenantId, userId).all<{
+      id: string;
+      title: string | null;
+      content: string | null;
+      tags: string | null;
+    }>();
+
+    // Clear FTS index for this user's notes
+    await c.env.DB.prepare(`
+      DELETE FROM notes_fts WHERE note_id IN (
+        SELECT id FROM notes WHERE tenant_id = ? AND user_id = ?
+      )
+    `).bind(tenantId, userId).run();
+
+    let indexed = 0;
+    let errors = 0;
+
+    for (const note of allNotes.results || []) {
+      try {
+        // Decrypt fields - handle both encrypted and plaintext
+        let decryptedTitle = '';
+        let decryptedContent = '';
+
+        if (note.title) {
+          try {
+            decryptedTitle = await decryptField(note.title, encryptionKey);
+          } catch {
+            decryptedTitle = note.title; // Already plaintext
+          }
+        }
+
+        if (note.content) {
+          try {
+            decryptedContent = await decryptField(note.content, encryptionKey);
+          } catch {
+            decryptedContent = note.content; // Already plaintext
+          }
+        }
+
+        const tags = note.tags || '';
+
+        // Build search text - MUST lowercase for D1's case-sensitive FTS5
+        const searchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
+
+        if (searchText) {
+          // Update notes table search_text column
+          await c.env.DB.prepare(`
+            UPDATE notes SET search_text = ? WHERE id = ?
+          `).bind(searchText, note.id).run();
+
+          // Insert into FTS index
+          await c.env.DB.prepare(`
+            INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
+          `).bind(note.id, searchText).run();
+
+          indexed++;
+        }
+      } catch (e) {
+        console.error(`Failed to index note ${note.id}:`, e);
+        errors++;
+      }
+    }
+
+    console.log(`FTS rebuild complete: ${indexed} notes indexed, ${errors} errors`);
+
+    return c.json({
+      success: true,
+      data: {
+        tenant_id: tenantId,
+        user_id: userId,
+        total: allNotes.results?.length || 0,
+        indexed,
+        errors,
+        message: `Rebuilt FTS index for ${indexed} notes`,
+      },
+    });
+  } catch (error: unknown) {
+    console.error('FTS rebuild error:', error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return c.json({ success: false, error: `FTS rebuild failed: ${errorMessage}` }, 500);
+  }
+});
+
 // 404 handler
 app.notFound((c) => {
   return c.json({ success: false, error: 'Not found' }, 404);
