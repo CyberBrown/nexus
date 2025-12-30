@@ -56,22 +56,24 @@ notes.get('/', async (c) => {
           }
         }
 
-        // Auto-populate FTS index if empty but notes with search_text exist
-        if (ftsTableCreatedEmpty) {
-          const notesWithSearchText = await c.env.DB.prepare(`
-            SELECT id, search_text FROM notes
-            WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL AND search_text IS NOT NULL AND search_text != ''
-          `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
+        // Auto-populate FTS index - always check for missing entries, not just when empty
+        // This handles the case where some notes exist in FTS but others are missing
+        const notesWithSearchText = await c.env.DB.prepare(`
+          SELECT n.id, n.search_text FROM notes n
+          LEFT JOIN notes_fts f ON n.id = f.note_id
+          WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+            AND n.search_text IS NOT NULL AND n.search_text != ''
+            AND f.note_id IS NULL
+        `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
 
-          if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
-            // Batch populate FTS index
-            for (const note of notesWithSearchText.results) {
-              try {
-                await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                  .bind(note.id, note.search_text).run();
-              } catch {
-                // Ignore duplicates
-              }
+        if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
+          // Batch populate FTS index for missing entries
+          for (const note of notesWithSearchText.results) {
+            try {
+              await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                .bind(note.id, note.search_text).run();
+            } catch {
+              // Ignore duplicates
             }
           }
         }
