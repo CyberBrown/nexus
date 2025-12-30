@@ -3544,26 +3544,45 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           `).bind(tenantId, userId).all();
 
           for (const note of fallbackNotes.results) {
-            const searchableText = (note.search_text as string || '').toLowerCase();
-            if (searchTerms.every(term => searchableText.includes(term))) {
-              const decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
-              const decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
+            // Use search_text if available, otherwise decrypt title/content on-the-fly
+            let searchableText: string;
+            let decryptedTitle: string;
+            let decryptedContent: string;
 
-              matchingNotes.push({
-                id: note.id,
-                title: decryptedTitle,
-                content_preview: decryptedContent
-                  ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
-                  : '',
-                category: note.category,
-                tags: note.tags,
-                source_type: note.source_type,
-                pinned: note.pinned === 1,
-                archived: !!note.archived_at,
-                created_at: note.created_at,
-              });
-              if (matchingNotes.length >= (limit || 20)) break;
+            if (note.search_text) {
+              searchableText = (note.search_text as string).toLowerCase();
+              // Only decrypt if we match (optimization for when search_text exists)
+              if (!searchTerms.every(term => searchableText.includes(term))) {
+                continue;
+              }
+              decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
+              decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
+            } else {
+              // search_text is NULL - decrypt and search against actual content
+              decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
+              decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
+              const tagsText = note.tags ? String(note.tags).toLowerCase() : '';
+              searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
+              if (!searchTerms.every(term => searchableText.includes(term))) {
+                continue;
+              }
             }
+
+            // Match found - add to results
+            matchingNotes.push({
+              id: note.id,
+              title: decryptedTitle,
+              content_preview: decryptedContent
+                ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                : '',
+              category: note.category,
+              tags: note.tags,
+              source_type: note.source_type,
+              pinned: note.pinned === 1,
+              archived: !!note.archived_at,
+              created_at: note.created_at,
+            });
+            if (matchingNotes.length >= (limit || 20)) break;
           }
 
           if (matchingNotes.length > 0) {
@@ -3641,27 +3660,45 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           const matchingNotes = [];
           for (const note of notes.results) {
-            // Use search_text for matching (plaintext)
-            const searchableText = (note.search_text as string || '').toLowerCase();
-            if (searchTerms.every(term => searchableText.includes(term))) {
-              const decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
-              const decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
+            // Use search_text if available, otherwise decrypt title/content on-the-fly
+            let searchableText: string;
+            let decryptedTitle: string;
+            let decryptedContent: string;
 
-              matchingNotes.push({
-                id: note.id,
-                title: decryptedTitle,
-                content_preview: decryptedContent
-                  ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
-                  : '',
-                category: note.category,
-                tags: note.tags,
-                source_type: note.source_type,
-                pinned: note.pinned === 1,
-                archived: !!note.archived_at,
-                created_at: note.created_at,
-              });
-              if (matchingNotes.length >= (limit || 20)) break;
+            if (note.search_text) {
+              searchableText = (note.search_text as string).toLowerCase();
+              // Only decrypt if we match (optimization for when search_text exists)
+              if (!searchTerms.every(term => searchableText.includes(term))) {
+                continue;
+              }
+              decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
+              decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
+            } else {
+              // search_text is NULL - decrypt and search against actual content
+              decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
+              decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
+              const tagsText = note.tags ? String(note.tags).toLowerCase() : '';
+              searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
+              if (!searchTerms.every(term => searchableText.includes(term))) {
+                continue;
+              }
             }
+
+            // Match found - add to results
+            matchingNotes.push({
+              id: note.id,
+              title: decryptedTitle,
+              content_preview: decryptedContent
+                ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                : '',
+              category: note.category,
+              tags: note.tags,
+              source_type: note.source_type,
+              pinned: note.pinned === 1,
+              archived: !!note.archived_at,
+              created_at: note.created_at,
+            });
+            if (matchingNotes.length >= (limit || 20)) break;
           }
 
           return {

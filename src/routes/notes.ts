@@ -39,16 +39,20 @@ notes.get('/', async (c) => {
         const before = trimmedSearch.slice(lastIndex, match.index).trim();
         if (before) {
           for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
-            const escaped = word.replace(/[*^"]/g, '');
+            // Escape special FTS5 characters and use prefix matching
+            // FTS5 prefix syntax: word* (no quotes for prefix search)
+            const escaped = word.replace(/[*^"():]/g, '');
             if (escaped.length > 0) {
-              ftsTerms.push(`"${escaped}"*`);
+              ftsTerms.push(`${escaped}*`);
             }
           }
         }
         // Add the quoted phrase (exact match, no prefix)
         const phrase = match[1]!.trim();
         if (phrase.length > 0) {
-          ftsTerms.push(`"${phrase}"`);
+          // Escape any quotes within the phrase
+          const escapedPhrase = phrase.replace(/"/g, '');
+          ftsTerms.push(`"${escapedPhrase}"`);
         }
         lastIndex = match.index + match[0].length;
       }
@@ -57,9 +61,11 @@ notes.get('/', async (c) => {
       const remaining = trimmedSearch.slice(lastIndex).trim();
       if (remaining) {
         for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
-          const escaped = word.replace(/[*^"]/g, '');
+          // Escape special FTS5 characters and use prefix matching
+          // FTS5 prefix syntax: word* (no quotes for prefix search)
+          const escaped = word.replace(/[*^"():]/g, '');
           if (escaped.length > 0) {
-            ftsTerms.push(`"${escaped}"*`);
+            ftsTerms.push(`${escaped}*`);
           }
         }
       }
@@ -150,11 +156,29 @@ notes.get('/', async (c) => {
         }
 
         if (searchTerms.length > 0) {
-          items = items.filter((item) => {
-            const tagsText = item.tags ? String(item.tags).toLowerCase() : '';
-            const searchableText = `${item.title || ''} ${item.content || ''} ${tagsText}`.toLowerCase();
-            return searchTerms.every((term) => searchableText.includes(term));
-          });
+          // Get encryption key for decrypting content when search_text is NULL
+          const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
+
+          // Filter items - need to handle both search_text column and encrypted content
+          const filteredItems: Note[] = [];
+          for (const item of items) {
+            let searchableText: string;
+
+            if ((item as any).search_text) {
+              // Use plaintext search_text column
+              searchableText = String((item as any).search_text).toLowerCase();
+            } else {
+              // search_text is NULL - decrypt and search
+              const decrypted = await decryptFields(item, ENCRYPTED_FIELDS, encryptionKey);
+              const tagsText = decrypted.tags ? String(decrypted.tags).toLowerCase() : '';
+              searchableText = `${decrypted.title || ''} ${decrypted.content || ''} ${tagsText}`.toLowerCase();
+            }
+
+            if (searchTerms.every((term) => searchableText.includes(term))) {
+              filteredItems.push(item);
+            }
+          }
+          items = filteredItems;
         }
       } else {
         throw error;
