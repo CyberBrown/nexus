@@ -3545,9 +3545,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query - use space-separated terms (implicit AND is the default in FTS5)
-        // Note: Explicit "AND" operator also works but implicit is simpler and equally reliable
-        // For phrases, we keep them quoted
+        // Build FTS5 query with explicit AND operator for multi-word search
+        // D1's FTS5 implementation requires explicit AND for reliable multi-term matching
+        // Space-separated terms (implicit AND) does not work reliably in D1
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match exactly in sequence
@@ -3557,9 +3557,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             return term;
           }
         });
-        // FTS5 query - space-separated terms are implicitly ANDed
-        // Using spaces instead of explicit AND for better compatibility across FTS5 implementations
-        const ftsQuery = terms.join(' ');
+        // Use explicit AND operator between terms for D1 FTS5 compatibility
+        const ftsQuery = terms.join(' AND ');
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {
@@ -3830,6 +3829,76 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               LIMIT ?
             `).bind(tenantId, userId, ...likeBindings, maxLimit).all();
 
+            // Also try searching directly on title/content if search_text didn't find results
+            // This handles notes where search_text might be encrypted or malformed
+            if (!sqlSearchResults.results || sqlSearchResults.results.length === 0) {
+              // Build LIKE conditions for title and content - more forgiving search
+              const titleContentConditions = searchTerms.map(() => '(LOWER(title) LIKE ? OR LOWER(content) LIKE ?)').join(' AND ');
+              const titleContentBindings = searchTerms.flatMap(({ term }) => [`%${term}%`, `%${term}%`]);
+
+              const directSearchResults = await env.DB.prepare(`
+                SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
+                FROM notes
+                WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                  ${include_archived ? '' : 'AND archived_at IS NULL'}
+                  AND ${titleContentConditions}
+                ORDER BY pinned DESC, created_at DESC
+                LIMIT ?
+              `).bind(tenantId, userId, ...titleContentBindings, maxLimit).all();
+
+              if (directSearchResults.results && directSearchResults.results.length > 0) {
+                sqlSearchWorked = true;
+                for (const note of directSearchResults.results as Array<{
+                  id: string;
+                  title: string | null;
+                  content: string | null;
+                  category: string;
+                  tags: string | null;
+                  source_type: string | null;
+                  pinned: number;
+                  archived_at: string | null;
+                  created_at: string;
+                  search_text: string | null;
+                }>) {
+                  const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                  const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+
+                  matchingNotes.push({
+                    id: note.id,
+                    title: decryptedTitle,
+                    content_preview: decryptedContent
+                      ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                      : '',
+                    category: note.category as string,
+                    tags: note.tags as string | null,
+                    source_type: note.source_type as string | null,
+                    pinned: note.pinned === 1,
+                    archived: !!note.archived_at,
+                    created_at: note.created_at as string,
+                  });
+                  fallbackMatchCount++;
+
+                  // Auto-repair: populate search_text for future faster searches
+                  const searchTextValue = `${decryptedTitle} ${decryptedContent} ${note.tags || ''}`.trim().toLowerCase();
+                  if (searchTextValue) {
+                    try {
+                      await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                        .bind(searchTextValue, note.id).run();
+                      try {
+                        await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                        await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                          .bind(note.id, searchTextValue).run();
+                      } catch {
+                        // FTS might not exist
+                      }
+                    } catch {
+                      // Repair failed, continue anyway
+                    }
+                  }
+                }
+              }
+            }
+
             if (sqlSearchResults.results && sqlSearchResults.results.length > 0) {
               sqlSearchWorked = true;
               for (const note of sqlSearchResults.results as Array<{
@@ -3990,20 +4059,30 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             response.hint = 'Run nexus_rebuild_notes_fts to enable faster FTS5 search.';
           }
         } else if (matchingNotes.length === 0) {
-          // No results - provide diagnostic info
+          // No results - provide diagnostic info with total note count
+          let totalNotes = 0;
+          try {
+            const countResult = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+            `).bind(tenantId, userId).first<{ cnt: number }>();
+            totalNotes = countResult?.cnt || 0;
+          } catch { /* ignore count error */ }
+
           response.search_method = usedFts ? 'fts5_empty' : 'fallback_empty';
           response.debug = {
             fts_attempted: usedFts,
             fts_schema_fixed: ftsSchemaFixed,
             fts_index_count: ftsIndexCount,
             total_notes_scanned: totalNotesScanned,
+            total_notes_in_db: totalNotes,
+            fts_error: ftsError ? ftsError.message : null,
           };
-          if (ftsIndexCount === 0 && totalNotesScanned > 0) {
-            response.hint = 'FTS index is empty but notes exist. Run nexus_rebuild_notes_fts to rebuild the search index.';
-          } else if (totalNotesScanned === 0) {
-            response.hint = 'No notes found for this user.';
+          if (totalNotes === 0) {
+            response.hint = 'No notes found for this user. Create some notes first.';
+          } else if (ftsIndexCount === 0) {
+            response.hint = `FTS index is empty but ${totalNotes} notes exist. Run nexus_rebuild_notes_fts to rebuild the search index.`;
           } else {
-            response.hint = 'No matching notes found. Search terms may not appear in any notes, or try running nexus_rebuild_notes_fts.';
+            response.hint = 'No matching notes found. The search terms may not appear together in any notes. Try simpler search terms.';
           }
         }
 
