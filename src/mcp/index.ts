@@ -3403,8 +3403,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
         // Convert search query to FTS5 format
-        // FTS5 uses AND by default for multiple terms
-        // Properly handle quoted phrases vs individual words
+        // FTS5 uses implicit AND for multiple terms when properly formatted
+        // Use prefix matching (word*) for individual terms, exact phrases for quoted strings
         const ftsTerms: string[] = [];
         const trimmedQuery = query.trim();
 
@@ -3418,16 +3418,20 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           const before = trimmedQuery.slice(lastIndex, match.index).trim();
           if (before) {
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
-              const escaped = word.replace(/[*^"]/g, '');
+              // Escape special FTS5 characters and use prefix matching
+              // FTS5 prefix syntax is: word* (no quotes around the word)
+              const escaped = word.replace(/[*^"():]/g, '');
               if (escaped.length > 0) {
-                ftsTerms.push(`"${escaped}"*`);
+                ftsTerms.push(`${escaped}*`);
               }
             }
           }
           // Add the quoted phrase (exact match, no prefix)
           const phrase = match[1]!.trim();
           if (phrase.length > 0) {
-            ftsTerms.push(`"${phrase}"`);
+            // Escape any quotes within the phrase
+            const escapedPhrase = phrase.replace(/"/g, '');
+            ftsTerms.push(`"${escapedPhrase}"`);
           }
           lastIndex = match.index + match[0].length;
         }
@@ -3436,14 +3440,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const remaining = trimmedQuery.slice(lastIndex).trim();
         if (remaining) {
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
-            const escaped = word.replace(/[*^"]/g, '');
+            // Escape special FTS5 characters and use prefix matching
+            const escaped = word.replace(/[*^"():]/g, '');
             if (escaped.length > 0) {
-              ftsTerms.push(`"${escaped}"*`);
+              ftsTerms.push(`${escaped}*`);
             }
           }
         }
 
-        const ftsQuery = ftsTerms.join(' ');
+        // Join with AND for explicit boolean query
+        const ftsQuery = ftsTerms.join(' AND ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
