@@ -3549,11 +3549,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
               const lowerWord = word.toLowerCase();
               searchTerms.push(lowerWord);
-              // Escape special FTS5 characters and add search_text: column prefix
-              // D1's FTS5 requires column prefix for reliable multi-word AND queries
+              // Escape special FTS5 characters for D1 FTS5
+              // Use simple terms without column prefix - D1 FTS5 works better with plain terms
               const escaped = lowerWord.replace(/[*^"():'"]/g, '');
               if (escaped.length > 0) {
-                ftsTerms.push(`search_text:${escaped}`);
+                ftsTerms.push(escaped);
               }
             }
           }
@@ -3561,9 +3561,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           const phrase = match[1]!.trim().toLowerCase();
           if (phrase.length > 0) {
             searchTerms.push(phrase);
-            // Quoted phrase for exact sequence matching in FTS5 with column prefix
+            // Quoted phrase for exact sequence matching in FTS5
             const escapedPhrase = phrase.replace(/"/g, '');
-            ftsTerms.push(`search_text:"${escapedPhrase}"`);
+            ftsTerms.push(`"${escapedPhrase}"`);
           }
           lastIndex = match.index + match[0].length;
         }
@@ -3574,10 +3574,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
             const lowerWord = word.toLowerCase();
             searchTerms.push(lowerWord);
-            // Escape special FTS5 characters and add search_text: column prefix
+            // Escape special FTS5 characters for D1 FTS5
             const escaped = lowerWord.replace(/[*^"():'"]/g, '');
             if (escaped.length > 0) {
-              ftsTerms.push(`search_text:${escaped}`);
+              ftsTerms.push(escaped);
             }
           }
         }
@@ -3598,10 +3598,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // Uses search_text: column prefix AND explicit AND operators for D1 FTS5
-        // The column prefix ensures terms target the correct column
-        // Example: "search_text:mcp AND search_text:validation" matches docs with BOTH terms
-        // Example: 'search_text:"exact phrase" AND search_text:term' matches phrase AND term
+        // Uses explicit AND operators for D1 FTS5 to match ALL terms
+        // D1 FTS5 works best with simple terms without column prefixes
+        // Example: "mcp AND validation" matches docs with BOTH terms
+        // Example: '"exact phrase" AND term' matches phrase AND term
         const ftsQuery = ftsTerms.length > 0
           ? ftsTerms.join(' AND ')
           : '';
@@ -3797,6 +3797,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             // Fetch more results than requested since we'll post-filter
             // FTS5 may return partial matches that don't contain all search terms
             const ftsLimit = Math.max(maxLimit * 3, 50);
+            console.log(`[nexus_search_notes] FTS5 query: "${ftsQuery}", searchTerms: [${searchTerms.join(', ')}]`);
             const ftsSearchResults = await env.DB.prepare(`
               SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
               FROM notes n
