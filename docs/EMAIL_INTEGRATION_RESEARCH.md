@@ -52,16 +52,57 @@ https://mail.google.com/ - Full access (required for IMAP)
 
 | Operation | Units Consumed |
 |-----------|---------------|
+| **Messages** | |
 | messages.list | 5 |
-| messages.get (metadata) | 5 |
-| messages.get (full) | 5 |
+| messages.get | 5 |
 | messages.send | 100 |
+| messages.delete | 10 |
+| messages.modify | 5 |
+| messages.import | 25 |
+| messages.insert | 25 |
+| messages.batchDelete | 50 |
+| messages.batchModify | 50 |
+| messages.trash | 5 |
+| messages.untrash | 5 |
+| messages.attachments.get | 5 |
+| **History & Watch** | |
 | history.list | 2 |
-| users.watch | 100 |
-| Batch request | Sum of individual requests |
+| watch | 100 |
+| stop | 50 |
+| **Drafts** | |
+| drafts.create | 10 |
+| drafts.delete | 10 |
+| drafts.get | 5 |
+| drafts.list | 5 |
+| drafts.send | 100 |
+| drafts.update | 15 |
+| **Threads** | |
+| threads.get | 10 |
+| threads.list | 10 |
+| threads.modify | 10 |
+| threads.delete | 20 |
+| threads.trash | 10 |
+| threads.untrash | 10 |
+| **Labels** | |
+| labels.create | 5 |
+| labels.delete | 5 |
+| labels.get | 1 |
+| labels.list | 1 |
+| labels.update | 5 |
+| **Profile** | |
+| getProfile | 1 |
+| **Settings** | |
+| settings.*.get | 1 |
+| settings.*.list | 1 |
+| settings.*.create (delegates, forwardingAddresses, sendAs) | 100 |
+| settings.*.delete | 5 |
+| settings.*.update | 5-100 (varies) |
+| **Batch Request** | Sum of individual requests |
 
 **Per-User Limits:**
+- **15,000 quota units per user per minute** (more accurate current limit)
 - **250 quota units per user per second** (moving average, allows bursts)
+- **1,200,000 quota units per project per minute** (project-wide limit)
 - Concurrent request limit per user
 - Upload/download bandwidth limits (shared with IMAP)
 
@@ -118,7 +159,7 @@ interface GmailIntegration {
 
 ### 2.1 Authentication Requirements
 
-**As of May 1, 2025, OAuth2 is required** - basic username/password authentication is disabled for Gmail.
+**As of March 14, 2025, OAuth2 is mandatory** - basic username/password authentication (Less Secure Apps) is permanently disabled for Gmail. Google resumed final rollout on January 27, 2025.
 
 | Requirement | Details |
 |-------------|---------|
@@ -137,9 +178,17 @@ IMAP shares bandwidth limits with Gmail API:
 - No explicit quota units (bandwidth-based)
 
 **IMAP-Specific Limits:**
-- Max concurrent connections: 15 per account
+- Max concurrent connections: **15 per account** (shared across all clients/devices)
 - Max connections per 10 minutes: 10 new connections
 - Session timeout: 24 hours (1 hour with OAuth)
+
+**Connection Limit Errors:**
+If connections exceed 15, Gmail returns "Too many simultaneous connections" error. Common causes:
+- Multiple email clients across devices
+- Third-party apps maintaining persistent connections
+- Background sync processes
+
+**Note:** As of January 2025, the "Enable IMAP" toggle is no longer available in Gmail settings - IMAP access is always enabled.
 
 ### 2.3 Integration Complexity
 
@@ -159,7 +208,26 @@ IMAP shares bandwidth limits with Gmail API:
 - IDLE command requires long-lived connections
 - Token refresh during active sessions
 
-### 2.4 Serverless Compatibility
+### 2.4 Node.js IMAP Libraries
+
+If IMAP is required, here are the available Node.js libraries:
+
+| Library | API Style | Recommended For | Status |
+|---------|-----------|-----------------|--------|
+| **[ImapFlow](https://imapflow.com/)** | Promise/async-await | Modern projects, production use | ✅ Active, recommended |
+| **[node-imap](https://github.com/mscdex/node-imap)** | Callbacks | Full control, legacy projects | ⚠️ Maintenance mode |
+| **[imap-simple](https://www.npmjs.com/package/imap-simple)** | Promise wrapper | Quick prototypes | ⚠️ Limited functionality |
+| **[EmailEngine](https://emailengine.app/)** | REST API | Enterprise, self-hosted | ✅ Active |
+
+**ImapFlow Features:**
+- TypeScript definitions included
+- Automatic handling of IMAP extensions (X-GM-EXT-1 for Gmail labels)
+- SASL PLAIN with authorization identity (authzid) for admin impersonation
+- Battle-tested as foundation for EmailEngine
+
+**Note:** For Cloudflare Workers, IMAP is not recommended due to persistent connection requirements.
+
+### 2.5 Serverless Compatibility
 
 **Problem:** IMAP IDLE (push) requires persistent TCP connections, which Cloudflare Workers don't support.
 
@@ -269,24 +337,56 @@ Gmail Inbox → Cloud Pub/Sub → HTTPS Push → Nexus Worker
 
 ---
 
-## 4. Comparison Matrix
+## 4. Microsoft Graph API (Outlook Alternative)
 
-| Aspect | Gmail API (Push) | Gmail API (Poll) | IMAP | Email Forwarding |
-|--------|------------------|------------------|------|------------------|
-| **Latency** | < 5 sec | Polling interval | Connection-dependent | < 30 sec |
-| **Setup Complexity** | High | Medium | High | Low |
-| **Maintenance** | Watch renewal | Cron management | Connection management | None |
-| **Serverless Fit** | Excellent | Good | Poor | Excellent |
-| **Multi-Provider** | Gmail only | Gmail only | Any IMAP server | Any email |
-| **Quota Usage** | Efficient | Higher | N/A | None |
-| **Real-time** | Yes | No | Yes (IDLE) | Near |
-| **Dependencies** | Pub/Sub, OAuth | OAuth only | OAuth, IMAP client | None |
+For users with Outlook/Microsoft 365 accounts, Microsoft Graph API provides similar functionality.
+
+### 4.1 Comparison with Gmail API
+
+| Aspect | Gmail API | Microsoft Graph API |
+|--------|-----------|---------------------|
+| **Authentication** | OAuth 2.0 | OAuth 2.0 |
+| **Push Notifications** | Via Pub/Sub | Native webhooks (change notifications) |
+| **Webhook Expiration** | 7 days | 4,230 minutes (~3 days) |
+| **Rate Limits** | Quota units per method | Per-app and per-user throttling |
+| **Integration** | Google Cloud ecosystem | Microsoft 365 ecosystem |
+| **Best For** | Gmail/Google Workspace users | Outlook/Microsoft 365 users |
+
+### 4.2 Key Differences
+
+**Simpler Webhooks:** Microsoft Graph has native webhook support without requiring a separate Pub/Sub service.
+
+**Subscription Limits:** Outlook subscriptions expire after ~3 days vs 7 days for Gmail.
+
+**API Design:** Graph API uses a unified REST design across all Microsoft 365 services.
+
+### 4.3 Unified Email Solutions
+
+For multi-provider support, consider:
+- **[EmailEngine](https://emailengine.app/)** - Self-hosted, REST API for IMAP/SMTP + Gmail API + Graph API
+- **[Nylas](https://www.nylas.com/)** - Managed email/calendar API platform
+- **[Unipile](https://www.unipile.com/)** - Unified messaging APIs
 
 ---
 
-## 5. Recommendations for Nexus
+## 5. Comparison Matrix
 
-### 5.1 Primary Approach: Gmail API + Pub/Sub
+| Aspect | Gmail API (Push) | Gmail API (Poll) | MS Graph API | IMAP | Email Forwarding |
+|--------|------------------|------------------|--------------|------|------------------|
+| **Latency** | < 5 sec | Polling interval | < 5 sec | Connection-dependent | < 30 sec |
+| **Setup Complexity** | High | Medium | Medium-High | High | Low |
+| **Maintenance** | Watch renewal (7d) | Cron management | Sub renewal (3d) | Connection management | None |
+| **Serverless Fit** | Excellent | Good | Excellent | Poor | Excellent |
+| **Provider Support** | Gmail only | Gmail only | Outlook only | Any IMAP | Any email |
+| **Quota Usage** | Efficient | Higher | Throttled | N/A | None |
+| **Real-time** | Yes | No | Yes | Yes (IDLE) | Near |
+| **Dependencies** | Pub/Sub, OAuth | OAuth only | OAuth only | OAuth, IMAP client | None |
+
+---
+
+## 6. Recommendations for Nexus
+
+### 6.1 Primary Approach: Gmail API + Pub/Sub
 
 **Justification:**
 - Best latency for AI processing
@@ -300,7 +400,7 @@ Gmail Inbox → Cloud Pub/Sub → HTTPS Push → Nexus Worker
 3. History sync logic
 4. Message parsing and storage
 
-### 5.2 Fallback: Gmail API Polling
+### 6.2 Fallback: Gmail API Polling
 
 **Use Cases:**
 - Development and testing
@@ -317,14 +417,14 @@ export default {
 };
 ```
 
-### 5.3 Future: Email Forwarding Webhook
+### 6.3 Future: Email Forwarding Webhook
 
 **For Users Without OAuth:**
 - Generate unique forwarding address per user
 - Parse incoming email via Cloudflare Email Workers
 - Lower friction but less metadata access
 
-### 5.4 Not Recommended: Direct IMAP
+### 6.4 Not Recommended: Direct IMAP
 
 **Reason:** Poor fit for Cloudflare Workers architecture. If multi-provider support is required, consider:
 - Managed email services (Nylas, EmailEngine)
@@ -332,7 +432,7 @@ export default {
 
 ---
 
-## 6. Implementation Roadmap
+## 7. Implementation Roadmap
 
 ### Phase 1: Core OAuth & Push (Week 1-2)
 - [ ] OAuth consent screen setup
@@ -361,30 +461,67 @@ export default {
 
 ---
 
-## 7. Security Considerations
+## 8. Security Considerations
 
-### 7.1 Token Storage
+### 8.1 Token Storage
 - Encrypt refresh tokens at rest
 - Use per-user encryption keys derived from user secrets
 - Never log tokens
 
-### 7.2 Pub/Sub Verification
+### 8.2 Pub/Sub Verification
 - Validate Pub/Sub message signatures
 - Verify `emailAddress` matches expected user
 - Rate limit push endpoint
 
-### 7.3 Scope Minimization
+### 8.3 Scope Minimization
 - Request only necessary scopes
 - Consider `gmail.readonly` for ingestion-only use case
 
-### 7.4 App Verification
+### 8.4 App Verification
 - Required for > 100 users
 - Privacy policy and terms of service required
 - Security assessment may be required for sensitive scopes
 
 ---
 
-## 8. Sources
+## 9. Personal Gmail vs Google Workspace
+
+### 9.1 Key Differences
+
+| Aspect | Personal Gmail (@gmail.com) | Google Workspace |
+|--------|----------------------------|------------------|
+| **Service Account Access** | Not supported | Supported via domain-wide delegation |
+| **Domain-Wide Delegation** | N/A | Available for admins |
+| **Authentication** | User OAuth consent required | Can impersonate users via service account |
+| **Unverified App Limit** | 100 users per project (lifetime) | Same per external domain |
+| **Admin Controls** | None | Full control over API access |
+
+### 9.2 Implications for Nexus
+
+**Personal Gmail accounts** (most likely target):
+- Each user must complete OAuth consent flow
+- Tokens must be securely stored and refreshed
+- No server-to-server authentication option
+- Must go through Google app verification for production
+
+**Google Workspace accounts** (optional enterprise support):
+- Could use service account with domain-wide delegation
+- Admin grants access for all domain users
+- More suitable for organizational deployments
+- Requires Workspace admin configuration
+
+### 9.3 Recommended Approach
+
+For Nexus targeting personal Gmail:
+1. Implement standard OAuth 2.0 flow with user consent
+2. Store encrypted refresh tokens per user
+3. Handle token refresh transparently
+4. Plan for Google app verification process
+5. Consider separate Workspace integration path for enterprise users
+
+---
+
+## 10. Sources
 
 ### Gmail API
 - [Gmail API Quotas and Limits](https://developers.google.com/workspace/gmail/api/reference/quota)
@@ -403,6 +540,17 @@ export default {
 - [Push Subscriptions](https://docs.cloud.google.com/pubsub/docs/push)
 - [Configuring Pub/Sub for Gmail Webhooks](https://docs.aurinko.io/unified-apis/webhooks-api/configuring-pub-sub-for-gmail-api-webhooks)
 
+### IMAP Libraries
+- [ImapFlow Documentation](https://imapflow.com/)
+- [node-imap GitHub](https://github.com/mscdex/node-imap)
+- [imap-simple npm](https://www.npmjs.com/package/imap-simple)
+- [EmailEngine Email API](https://emailengine.app/)
+
+### Microsoft Graph API
+- [Outlook Mail API Overview](https://learn.microsoft.com/en-us/graph/api/resources/mail-api-overview?view=graph-rest-1.0)
+- [Unipile Outlook API Integration](https://www.unipile.com/integrate-and-retrieve-emails-from-outlook-api/)
+
 ### Comparisons
 - [Gmail API vs IMAP](https://www.gmass.co/blog/gmail-api-vs-imap/)
 - [Moving to the Gmail API (Mixmax)](https://www.mixmax.com/engineering/moving-to-the-gmail-api)
+- [Best Nylas Alternatives for Email APIs 2025](https://klamp.ai/blog/best-nylas-alternatives-for-email-calendar-and-contact-apis)
