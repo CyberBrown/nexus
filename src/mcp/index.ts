@@ -3757,6 +3757,81 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
         }
 
+        // FINAL FALLBACK: Full scan with decryption if FTS5 and LIKE both failed
+        // This handles cases where search_text is not populated for some notes
+        if (matchingNotes.length === 0 && searchTerms.length > 0) {
+          try {
+            console.log(`[nexus_search_notes] Full-scan fallback: scanning all notes`);
+            const allNotes = await env.DB.prepare(`
+              SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
+              FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+              ${archivedCondition}
+              ORDER BY pinned DESC, created_at DESC
+            `).bind(tenantId, userId).all();
+
+            if (allNotes.results && allNotes.results.length > 0) {
+              searchMethod = 'full_scan';
+              const foundIds = new Set<string>();
+
+              for (const note of allNotes.results as Array<{
+                id: string;
+                title: string | null;
+                content: string | null;
+                category: string;
+                tags: string | null;
+                source_type: string | null;
+                pinned: number;
+                archived_at: string | null;
+                created_at: string;
+                search_text: string | null;
+              }>) {
+                if (foundIds.has(note.id)) continue;
+
+                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                const tagsText = note.tags ? String(note.tags) : '';
+
+                const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
+                if (!matchesAllTerms(combinedText)) continue;
+
+                matchingNotes.push({
+                  id: note.id,
+                  title: decryptedTitle,
+                  content_preview: decryptedContent
+                    ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                    : '',
+                  category: note.category,
+                  tags: note.tags,
+                  source_type: note.source_type,
+                  pinned: note.pinned === 1,
+                  archived: !!note.archived_at,
+                  created_at: note.created_at,
+                });
+                foundIds.add(note.id);
+
+                // Auto-repair: populate search_text and FTS index for this note
+                const searchText = combinedText.toLowerCase();
+                if (!note.search_text || note.search_text !== searchText) {
+                  try {
+                    await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                      .bind(searchText, note.id).run();
+                    await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                    await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                      .bind(note.id, searchText).run();
+                  } catch { /* ignore auto-repair errors */ }
+                }
+
+                if (matchingNotes.length >= maxLimit) break;
+              }
+              console.log(`[nexus_search_notes] Full-scan found ${matchingNotes.length} results`);
+            }
+          } catch (err: any) {
+            console.error('[nexus_search_notes] Full-scan fallback failed:', err);
+            searchMethod = `${searchMethod}+scan_error`;
+          }
+        }
+
         // Build response
         const response: Record<string, unknown> = {
           success: true,
