@@ -197,34 +197,39 @@ notes.get('/', async (c) => {
 
         const whereClause = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
 
-        // FTS5 search
-        const result = await c.env.DB.prepare(`
-          SELECT n.*
-          FROM notes n
-          WHERE n.id IN (
-            SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
-          )
-            AND n.tenant_id = ?
-            AND n.user_id = ?
-            AND n.deleted_at IS NULL
-            ${whereClause}
-          ORDER BY n.pinned DESC, n.created_at DESC
-          LIMIT 200
-        `).bind(...bindings).all<Note>();
+        // FTS5 search with try-catch to gracefully fall back to LIKE
+        try {
+          const result = await c.env.DB.prepare(`
+            SELECT n.*
+            FROM notes n
+            WHERE n.id IN (
+              SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
+            )
+              AND n.tenant_id = ?
+              AND n.user_id = ?
+              AND n.deleted_at IS NULL
+              ${whereClause}
+            ORDER BY n.pinned DESC, n.created_at DESC
+            LIMIT 200
+          `).bind(...bindings).all<Note>();
 
-        // Post-filter for exact term matching
-        const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
-        const filteredResults: Note[] = [];
-        for (const note of result.results) {
-          const decrypted = await decryptFields(note, ENCRYPTED_FIELDS, encryptionKey);
-          const combinedText = `${decrypted.title || ''} ${decrypted.content || ''} ${note.tags || ''}`;
-          if (matchesAllTerms(combinedText)) {
-            filteredResults.push(note);
+          // Post-filter for exact term matching
+          const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
+          const filteredResults: Note[] = [];
+          for (const note of result.results) {
+            const decrypted = await decryptFields(note, ENCRYPTED_FIELDS, encryptionKey);
+            const combinedText = `${decrypted.title || ''} ${decrypted.content || ''} ${note.tags || ''}`;
+            if (matchesAllTerms(combinedText)) {
+              filteredResults.push(note);
+            }
           }
+          items = filteredResults;
+        } catch (ftsError) {
+          console.error('[notes] FTS5 search failed, will fall back to LIKE:', ftsError);
+          items = []; // Ensure LIKE fallback runs
         }
-        items = filteredResults;
 
-        // LIKE fallback if FTS5 returns no results
+        // LIKE fallback if FTS5 returns no results or fails
         if (items.length === 0 && searchTerms.length > 0) {
           try {
             const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
