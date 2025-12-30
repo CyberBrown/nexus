@@ -3598,13 +3598,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // CRITICAL: Use OR to get broad results, then post-filter for AND semantics
-        // D1's FTS5 implementation has INCONSISTENT behavior with implicit AND
-        // (space-separated terms). Some queries work, others silently return 0 results.
-        // By using OR, we reliably get all notes containing ANY term, then filter in code.
-        // This is the ONLY reliable approach for multi-word search in D1's FTS5.
+        // Use explicit AND operator for D1's FTS5 to require all terms match
+        // FTS5 standard says space-separated = implicit AND, but D1 works better with explicit AND
         const ftsQuery = ftsTerms.length > 0
-          ? ftsTerms.join(' OR ')
+          ? ftsTerms.join(' AND ')
           : '';
 
         // Helper to check if all search terms match in a text
@@ -3822,9 +3819,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
                 const tagsText = note.tags ? String(note.tags) : '';
 
-                // Post-filter FTS5 results to enforce AND semantics
-                // FTS5 query uses OR for broad matching; this ensures ALL search terms match.
-                // Also handles porter stemming (e.g., "validation" matches "valid") by doing exact substring checks.
+                // Post-filter FTS5 results as safety check
+                // FTS5 uses AND, but post-filter handles porter stemming edge cases
+                // (e.g., "validation" might stem to "valid") by doing exact substring checks.
                 const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
                 if (!matchesAllTerms(combinedText)) {
                   continue; // Skip notes that don't contain ALL search terms
