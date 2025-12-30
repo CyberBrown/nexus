@@ -3564,6 +3564,125 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           // Schema check failed, continue anyway - search will use fallbacks
         }
 
+        // PROACTIVE FTS INDEX POPULATION
+        // Before searching, ensure notes are indexed. This handles:
+        // 1. Notes created before search_text column was added
+        // 2. Notes missing from FTS index (stale/corrupted)
+        // 3. Notes with encrypted garbage in search_text (old migration 0017 bug)
+        try {
+          // Find notes missing from FTS index
+          const notesNeedingIndex = await env.DB.prepare(`
+            SELECT n.id, n.title, n.content, n.tags, n.search_text
+            FROM notes n
+            LEFT JOIN notes_fts f ON n.id = f.note_id
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND f.note_id IS NULL
+            LIMIT 50
+          `).bind(tenantId, userId).all<{
+            id: string;
+            title: string | null;
+            content: string | null;
+            tags: string | null;
+            search_text: string | null;
+          }>();
+
+          if (notesNeedingIndex.results && notesNeedingIndex.results.length > 0) {
+            for (const note of notesNeedingIndex.results) {
+              try {
+                // Decrypt and build search_text if missing or empty
+                let searchText = note.search_text;
+                if (!searchText || searchText.trim() === '') {
+                  const decTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                  const decContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                  const tagsText = note.tags ? String(note.tags) : '';
+                  searchText = `${decTitle} ${decContent} ${tagsText}`.trim().toLowerCase();
+
+                  // Update notes table with search_text
+                  if (searchText) {
+                    await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                      .bind(searchText, note.id).run();
+                  }
+                }
+
+                // Insert into FTS index
+                if (searchText) {
+                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                    .bind(note.id, searchText.toLowerCase()).run();
+                }
+              } catch {
+                // Ignore errors for individual notes
+              }
+            }
+          }
+
+          // Also fix notes with stale FTS entries (search_text mismatch)
+          const notesWithMismatch = await env.DB.prepare(`
+            SELECT n.id, n.search_text, f.search_text as fts_text
+            FROM notes n
+            INNER JOIN notes_fts f ON n.id = f.note_id
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND n.search_text IS NOT NULL AND n.search_text != ''
+              AND f.search_text != n.search_text
+            LIMIT 50
+          `).bind(tenantId, userId).all<{
+            id: string;
+            search_text: string;
+            fts_text: string;
+          }>();
+
+          if (notesWithMismatch.results && notesWithMismatch.results.length > 0) {
+            for (const note of notesWithMismatch.results) {
+              try {
+                await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                  .bind(note.id, note.search_text).run();
+              } catch {
+                // Ignore errors
+              }
+            }
+          }
+
+          // Fix notes without search_text but in FTS (potentially with encrypted garbage)
+          const notesNeedingSearchText = await env.DB.prepare(`
+            SELECT n.id, n.title, n.content, n.tags
+            FROM notes n
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND (n.search_text IS NULL OR n.search_text = '')
+            LIMIT 50
+          `).bind(tenantId, userId).all<{
+            id: string;
+            title: string | null;
+            content: string | null;
+            tags: string | null;
+          }>();
+
+          if (notesNeedingSearchText.results && notesNeedingSearchText.results.length > 0) {
+            for (const note of notesNeedingSearchText.results) {
+              try {
+                const decTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                const decContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                const tagsText = note.tags ? String(note.tags) : '';
+                const searchText = `${decTitle} ${decContent} ${tagsText}`.trim().toLowerCase();
+
+                if (searchText) {
+                  // Update notes table
+                  await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                    .bind(searchText, note.id).run();
+
+                  // Update FTS index
+                  await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                    .bind(note.id, searchText).run();
+                }
+              } catch {
+                // Ignore errors for individual notes
+              }
+            }
+          }
+        } catch {
+          // Index population failed, continue with search - fallbacks will handle it
+        }
+
         // Parse search terms - handle quoted phrases and individual words
         // Build both: searchTerms (for matching) and ftsTerms (for FTS5 query)
         const searchTerms: string[] = [];
