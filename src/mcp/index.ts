@@ -2984,7 +2984,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const encryptedContent = content ? await encryptField(content, encryptionKey) : null;
 
         // Build plaintext search_text for FTS indexing (title + content + tags)
-        const searchText = [title, content || '', tags || ''].join(' ').trim();
+        // MUST lowercase because D1's FTS5 is case-sensitive and query terms are lowercased
+        const searchText = [title, content || '', tags || ''].join(' ').trim().toLowerCase();
 
         await env.DB.prepare(`
           INSERT INTO notes (id, tenant_id, user_id, title, content, category, tags, source_type, source_reference, source_context, pinned, search_text, created_at, updated_at)
@@ -3254,7 +3255,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Rebuild search_text if title, content, or tags changed
         if (title !== undefined || content !== undefined || tags !== undefined) {
-          const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim();
+          // MUST lowercase because D1's FTS5 is case-sensitive and query terms are lowercased
+          const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim().toLowerCase();
           updates.push('search_text = ?');
           bindings.push(searchText);
 
@@ -3856,8 +3858,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
             const tags = note.tags || '';
 
-            // Build search text
-            const searchText = [decryptedTitle, decryptedContent, tags].join(' ').trim();
+            // Build search text - MUST lowercase for D1's case-sensitive FTS5
+            const searchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
 
             // Update notes table search_text column
             await env.DB.prepare(`
