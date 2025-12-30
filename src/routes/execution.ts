@@ -4,6 +4,7 @@ import { getAuth } from '../lib/auth.ts';
 import { findById } from '../lib/db.ts';
 import { getEncryptionKey, decryptFields, decryptField } from '../lib/encryption.ts';
 import { NotFoundError, AppError, ValidationError } from '../lib/errors.ts';
+import { findFailureIndicator } from '../lib/validation.ts';
 
 const ENCRYPTED_IDEA_FIELDS = ['title', 'description'];
 const ENCRYPTED_TASK_FIELDS = ['title', 'description', 'result'];
@@ -418,6 +419,21 @@ execution.post('/tasks/:id/complete', async (c) => {
 
   const body = await c.req.json<{ result?: string }>();
   const now = new Date().toISOString();
+
+  // Validate that the result doesn't contain failure indicators
+  // This catches false completions where the user says "completed" but the result
+  // indicates the work wasn't actually done (e.g., "couldn't find the file...")
+  if (body.result) {
+    const matchedIndicator = findFailureIndicator(body.result);
+    if (matchedIndicator) {
+      throw new AppError(
+        `Task completion rejected - result indicates task was not actually completed. ` +
+        `Detected phrase: "${matchedIndicator}". Mark task as failed instead, or ensure deliverables are present before completing.`,
+        400,
+        'FALSE_COMPLETION_DETECTED'
+      );
+    }
+  }
 
   // Encrypt result if provided
   let encryptedResult = null;
