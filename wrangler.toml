@@ -17,10 +17,11 @@ ENVIRONMENT = "development"
 NEXUS_URL = "https://nexus-mcp.solamp.workers.dev"
 # DE text-gen URL for workflows (workflows can't use service bindings)
 TEXT_GEN_URL = "https://de-text-gen.solamp.workers.dev"
-# Sandbox executor URL for task execution (claude-code and claude-ai tasks)
-SANDBOX_EXECUTOR_URL = "https://sandbox-executor.solamp.workers.dev"
-# DE Workflows URL for triggering CodeExecutionWorkflow via HTTP
-DE_WORKFLOWS_URL = "https://de-workflows.solamp.workers.dev"
+# INTAKE URL for workflows (workflows can't use service bindings)
+INTAKE_URL = "https://intake.solamp.workers.dev"
+# DEPRECATED: Use INTAKE service binding or INTAKE_URL instead
+# SANDBOX_EXECUTOR_URL = "https://sandbox-executor.solamp.workers.dev"
+# DE_WORKFLOWS_URL = "https://de-workflows.solamp.workers.dev"
 # Cloudflare Access - set these for production auth
 # TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 # POLICY_AUD = "your-application-audience-tag"

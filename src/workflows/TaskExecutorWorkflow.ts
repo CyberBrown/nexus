@@ -347,7 +347,8 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
   }
 
   /**
-   * Execute a code task via sandbox-executor
+   * Execute a code task via INTAKE (routes to PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor)
+   * Workflows can't use service bindings, so we use INTAKE_URL for HTTP access.
    */
   private async executeWithSandbox(
     step: WorkflowStep,
@@ -355,7 +356,7 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
     ideaContext: IdeaContext
   ): Promise<ExecutionResult> {
     return step.do(
-      'execute-with-sandbox',
+      'execute-with-intake',
       {
         retries: {
           limit: 2,
@@ -365,9 +366,9 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
         timeout: '10 minutes', // Code tasks can take longer
       },
       async () => {
-        const sandboxUrl = this.env.SANDBOX_EXECUTOR_URL;
-        if (!sandboxUrl) {
-          throw new Error('SANDBOX_EXECUTOR_URL not configured. Set SANDBOX_EXECUTOR_URL in wrangler.toml [vars]');
+        const intakeUrl = this.env.INTAKE_URL;
+        if (!intakeUrl) {
+          throw new Error('INTAKE_URL not configured. Set INTAKE_URL in wrangler.toml [vars]');
         }
 
         // Parse repo/branch from task fields or description
@@ -376,66 +377,53 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
         // Build the task prompt
         const taskPrompt = buildCodeTaskPrompt(task, ideaContext);
 
-        const requestBody: Record<string, unknown> = {
-          task: taskPrompt,
-          context: `Idea: ${ideaContext.title}\n${ideaContext.description || ''}`,
-          options: {
-            max_tokens: 8192,
-            temperature: 0.3,
+        // INTAKE request format
+        const intakeRequest = {
+          query: `Execute code task: ${task.title}`,
+          task_type: 'code',
+          task_id: task.id,
+          prompt: taskPrompt,
+          repo_url: repoInfo.repo ? `https://github.com/${repoInfo.repo}` : undefined,
+          callback_url: `${this.env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev'}/workflow-callback`,
+          timeout_ms: 600000, // 10 minutes
+          metadata: {
+            idea_id: task.idea_id,
+            idea_title: ideaContext.title,
+            branch: repoInfo.branch || 'main',
+            commit_message: task.commit_message || task.title.slice(0, 50),
           },
         };
 
-        // Add repo info if available
-        if (repoInfo.repo) {
-          requestBody.repo = repoInfo.repo;
-          requestBody.branch = repoInfo.branch || 'main';
-          if (task.commit_message) {
-            requestBody.commitMessage = task.commit_message;
-          } else {
-            requestBody.commitMessage = `${task.title.slice(0, 50)}`;
-          }
-        }
+        console.log(`Calling INTAKE for code task: ${task.id}, repo: ${repoInfo.repo}`);
 
-        console.log(`Calling sandbox-executor with repo: ${repoInfo.repo}, branch: ${repoInfo.branch}`);
-
-        const response = await fetch(`${sandboxUrl}/execute`, {
+        const response = await fetch(`${intakeUrl}/intake`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify(requestBody),
+          body: JSON.stringify(intakeRequest),
         });
 
         if (!response.ok) {
           const error = await response.text();
-          throw new Error(`Sandbox executor error: ${response.status} - ${error}`);
+          throw new Error(`INTAKE error: ${response.status} - ${error}`);
         }
 
-        const data = await response.json() as SandboxExecutorResponse;
+        const data = await response.json() as {
+          success: boolean;
+          request_id?: string;
+          workflow_instance_id?: string;
+          error?: string;
+        };
 
         if (!data.success) {
-          throw new Error(data.error || 'Sandbox executor returned failure');
+          throw new Error(data.error || 'INTAKE returned failure');
         }
 
-        // Build output summary
-        let output = data.result?.output || 'Task completed';
-        if (data.result?.files && data.result.files.length > 0) {
-          output += `\n\nGenerated ${data.result.files.length} file(s):\n`;
-          output += data.result.files.map(f => `- ${f.path}`).join('\n');
-        }
-        if (data.commit?.success && data.commit.sha) {
-          output += `\n\nCommitted to ${data.commit.branch}: ${data.commit.sha}`;
-          output += `\nURL: ${data.commit.url}`;
-        }
-
+        // INTAKE triggers async workflow - we return success and the callback will update the task
         return {
           success: true,
-          output,
-          commit: data.commit?.success ? {
-            sha: data.commit.sha!,
-            url: data.commit.url!,
-            branch: data.commit.branch!,
-          } : undefined,
+          output: `Workflow triggered via INTAKE: ${data.workflow_instance_id || data.request_id}. Results will be delivered via callback.`,
         };
       }
     );

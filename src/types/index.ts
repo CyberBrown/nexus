@@ -36,10 +36,12 @@ export interface Env {
   NEXUS_URL?: string;
   // DE text-gen URL (for workflows that can't use service bindings)
   TEXT_GEN_URL?: string;
-  // Sandbox executor URL for task execution
+  // INTAKE URL for workflows (HTTP fallback when service binding unavailable)
+  INTAKE_URL?: string;
+  // Sandbox executor URL for task execution (DEPRECATED - use INTAKE)
   SANDBOX_EXECUTOR_URL?: string;
   SANDBOX_AUTH_TOKEN?: string;
-  // DE Workflows URL for triggering CodeExecutionWorkflow via HTTP
+  // DE Workflows URL (DEPRECATED - use INTAKE)
   DE_WORKFLOWS_URL?: string;
   // Fallback Anthropic API key (for environments without DE)
   ANTHROPIC_API_KEY?: string;

@@ -1,10 +1,15 @@
 /**
  * Sandbox Executor Client
  *
- * Connects Nexus to the sandbox-executor service for task execution.
- * All task types route through /execute endpoint which uses OAuth credentials.
- * - /execute - Main execution path for all tasks (uses OAuth credentials)
- * - /execute/sdk - Legacy SDK path (deprecated, not used - would consume API credits)
+ * @deprecated This client is DEPRECATED. Use INTAKE instead.
+ * All code execution should go through:
+ *   Nexus → INTAKE → PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
+ *
+ * For service binding contexts: use createIntakeClient() from './intake-client.ts'
+ * For workflow contexts (no service bindings): use INTAKE_URL env var with HTTP calls
+ *
+ * This file is kept for reference but should not be used in new code.
+ * See architecture in CLAUDE.md for details.
  */
 
 // ========================================

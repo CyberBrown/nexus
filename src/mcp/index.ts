@@ -19,6 +19,7 @@ import { getEncryptionKey, encryptField, decryptField, decryptFields } from '../
 import { executeQueueEntry, promoteDependentTasks } from '../scheduled/task-executor.ts';
 import { hasUnmetDependencies, determineExecutorType } from '../scheduled/task-dispatcher.ts';
 import { archiveQueueEntry, archiveQueueEntriesByTask } from '../lib/queue-archive.ts';
+import { createIntakeClient } from '../lib/intake-client.ts';
 
 // ========================================
 // SAFE DECRYPT HELPER
@@ -46,20 +47,21 @@ async function safeDecrypt(value: unknown, key: CryptoKey | null): Promise<strin
 
 /**
  * Generate routing explanation for dispatch messages.
- * Currently all tasks route through claude-code (on-prem runner) since SDK mode isn't operational.
+ * Executor types: 'ai', 'human', 'human-ai'
  */
 function getRoutingNote(executorType: string): string {
-  if (executorType === 'claude-code') {
-    return 'Routes to on-prem claude-runner via Cloudflare Tunnel.';
+  if (executorType === 'ai') {
+    return 'Routes to DE via PrimeWorkflow for autonomous execution.';
   }
-  if (executorType === 'claude-ai') {
-    return 'Note: claude-ai tasks currently execute via claude-code path (SDK mode not yet operational).';
+  if (executorType === 'human-ai') {
+    return 'Human leads with AI assistance available.';
   }
   if (executorType === 'human') {
     return 'Requires human action - will not auto-execute.';
   }
-  if (executorType === 'de-agent') {
-    return 'Routes to DE service binding.';
+  // Legacy types (for backwards compatibility with queue entries)
+  if (executorType === 'claude-code' || executorType === 'claude-ai' || executorType === 'de-agent') {
+    return 'Legacy executor type - routes to DE via PrimeWorkflow.';
   }
   return '';
 }
@@ -312,7 +314,20 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             executorType = executorType || 'human'; // Default to human if no pattern matches
           }
 
-          // Create execution queue entry
+          // Check circuit breaker - prevent runaway retry loops
+          // Note: For new tasks this is usually a no-op, but it's a safety measure
+          const { checkCircuitBreaker } = await import('../scheduled/task-dispatcher.ts');
+          const circuitBreaker = await checkCircuitBreaker(env.DB, taskId);
+          if (circuitBreaker.tripped) {
+            // Don't dispatch but still return success for task creation
+            dispatchResult = {
+              dispatched: false,
+              circuit_breaker: true,
+              reason: circuitBreaker.reason,
+              quarantine_count: circuitBreaker.quarantineCount,
+            };
+          } else {
+            // Create execution queue entry
           const queueId = crypto.randomUUID();
           const priority = urgency * importance;
 
@@ -369,41 +384,25 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             workflow_error: undefined as string | undefined,
           };
 
-          // Trigger workflow for 'ai' tasks via DE /execute entry point (PrimeWorkflow)
-          // The workflow handles execution via sandbox-executor and reports back
-          // Note: Cross-worker workflow bindings are NOT supported by CF Workflows,
-          // so we trigger via HTTP to the de-workflows worker instead
-          if (executorType === 'ai' && env.DE_WORKFLOWS_URL) {
+          // Trigger workflow for 'ai' tasks via INTAKE service binding
+          // INTAKE routes to PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
+          const intakeClient = createIntakeClient(env);
+          if (executorType === 'ai' && intakeClient) {
             try {
-              const workflowUrl = `${env.DE_WORKFLOWS_URL}/execute`;
-
-              const workflowResponse = await fetch(workflowUrl, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'X-Passphrase': env.WRITE_PASSPHRASE || '',
+              const intakeResult = await intakeClient.triggerWorkflow({
+                query: `Execute task: ${args.title}`,
+                task_type: 'code',
+                task_id: taskId,
+                prompt: args.description || args.title,
+                callback_url: `${env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev'}/workflow-callback`,
+                timeout_ms: 300000, // 5 minutes
+                metadata: {
+                  source: 'nexus_create_task',
+                  queue_id: queueId,
                 },
-                body: JSON.stringify({
-                  params: {
-                    task_id: taskId,
-                    title: args.title,
-                    description: args.description || '',
-                    context: {
-                      repo: args.project_id ? undefined : undefined, // TODO: resolve project to repo
-                    },
-                    hints: {
-                      workflow: 'code-execution',
-                      provider: 'claude',
-                    },
-                    callback_url: `${env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev'}/workflow-callback`,
-                    timeout_ms: 300000, // 5 minutes
-                  },
-                }),
               });
 
-              const workflowResult = await workflowResponse.json() as { success: boolean; error?: string; code?: string };
-
-              if (workflowResult.success) {
+              if (intakeResult.success) {
                 // Update queue status to 'dispatched' since workflow is triggered
                 await env.DB.prepare(`
                   UPDATE execution_queue SET status = 'dispatched', updated_at = ? WHERE id = ?
@@ -415,15 +414,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 `).bind(now, taskId).run();
 
                 dispatchResult.workflow_triggered = true;
-                console.log(`[nexus_create_task] PrimeWorkflow triggered for task ${taskId}`);
+                console.log(`[nexus_create_task] Workflow triggered via INTAKE for task ${taskId}: ${intakeResult.workflow_instance_id}`);
               } else {
-                // Handle duplicate workflow gracefully
-                if (workflowResult.code === 'DUPLICATE_WORKFLOW') {
-                  dispatchResult.workflow_triggered = false;
-                  dispatchResult.workflow_error = 'Workflow already exists for this task';
-                } else {
-                  throw new Error(workflowResult.error || 'Failed to trigger workflow');
-                }
+                throw new Error(intakeResult.error || 'Unknown INTAKE error');
               }
             } catch (workflowError: any) {
               // Log but don't fail - task is still queued even if workflow trigger fails
@@ -433,6 +426,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               dispatchResult.workflow_error = workflowError.message;
             }
           }
+          } // Close else block for circuit breaker check
         }
 
         const response: Record<string, unknown> = {
@@ -1259,7 +1253,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     'Claim a task for execution. This prevents duplicate work by marking who is working on it. Returns full context needed to execute.',
     {
       task_id: z.string().describe('The UUID of the task to claim'),
-      executor_id: z.string().describe('Identifier of the executor claiming the task (e.g., "claude-code", "claude-ai", "human")'),
+      executor_id: z.string().describe('Identifier of the executor claiming the task (e.g., "ai", "human-ai", "human", or session ID)'),
       passphrase: passphraseSchema,
     },
     async (args): Promise<CallToolResult> => {
@@ -4137,37 +4131,47 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }>();
 
           // Auto-detect executor patterns
+          // Uses normalized types: 'ai', 'human', 'human-ai'
+          // See task-dispatcher.ts for canonical pattern definitions
           const patterns: Array<{ pattern: RegExp; executor: string }> = [
             // Literal executor names (highest priority)
-            { pattern: /^\[claude-code\]/i, executor: 'claude-code' },
-            { pattern: /^\[claude-ai\]/i, executor: 'claude-ai' },
-            { pattern: /^\[de-agent\]/i, executor: 'de-agent' },
-            // Shorthand tags
-            { pattern: /^\[CC\]/i, executor: 'claude-code' },
-            { pattern: /^\[AI\]/i, executor: 'claude-ai' },
-            { pattern: /^\[DE\]/i, executor: 'de-agent' },
+            { pattern: /^\[human\]/i, executor: 'human' },
+            { pattern: /^\[human-ai\]/i, executor: 'human-ai' },
+            { pattern: /^\[ai\]/i, executor: 'ai' },
+
+            // Legacy tags - map to 'ai'
+            { pattern: /^\[claude-code\]/i, executor: 'ai' },
+            { pattern: /^\[claude-ai\]/i, executor: 'ai' },
+            { pattern: /^\[de-agent\]/i, executor: 'ai' },
+            { pattern: /^\[CC\]/i, executor: 'ai' },
+            { pattern: /^\[AI\]/i, executor: 'ai' },
+            { pattern: /^\[DE\]/i, executor: 'ai' },
+
+            // Human-only tasks
             { pattern: /^\[HUMAN\]/i, executor: 'human' },
             { pattern: /^\[BLOCKED\]/i, executor: 'human' },
-            // Semantic tags
-            { pattern: /^\[implement\]/i, executor: 'claude-code' },
-            { pattern: /^\[deploy\]/i, executor: 'claude-code' },
-            { pattern: /^\[fix\]/i, executor: 'claude-code' },
-            { pattern: /^\[refactor\]/i, executor: 'claude-code' },
-            { pattern: /^\[test\]/i, executor: 'claude-code' },
-            { pattern: /^\[debug\]/i, executor: 'claude-code' },
-            { pattern: /^\[code\]/i, executor: 'claude-code' },
-            { pattern: /^\[research\]/i, executor: 'claude-ai' },
-            { pattern: /^\[design\]/i, executor: 'claude-ai' },
-            { pattern: /^\[document\]/i, executor: 'claude-ai' },
-            { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
-            { pattern: /^\[plan\]/i, executor: 'claude-ai' },
-            { pattern: /^\[write\]/i, executor: 'claude-ai' },
-            { pattern: /^\[human\]/i, executor: 'human' },
-            { pattern: /^\[review\]/i, executor: 'human' },
-            { pattern: /^\[approve\]/i, executor: 'human' },
-            { pattern: /^\[decide\]/i, executor: 'human' },
             { pattern: /^\[call\]/i, executor: 'human' },
             { pattern: /^\[meeting\]/i, executor: 'human' },
+
+            // Human-AI collaborative tasks
+            { pattern: /^\[review\]/i, executor: 'human-ai' },
+            { pattern: /^\[approve\]/i, executor: 'human-ai' },
+            { pattern: /^\[decide\]/i, executor: 'human-ai' },
+
+            // AI-executable tasks
+            { pattern: /^\[implement\]/i, executor: 'ai' },
+            { pattern: /^\[deploy\]/i, executor: 'ai' },
+            { pattern: /^\[fix\]/i, executor: 'ai' },
+            { pattern: /^\[refactor\]/i, executor: 'ai' },
+            { pattern: /^\[test\]/i, executor: 'ai' },
+            { pattern: /^\[debug\]/i, executor: 'ai' },
+            { pattern: /^\[code\]/i, executor: 'ai' },
+            { pattern: /^\[research\]/i, executor: 'ai' },
+            { pattern: /^\[design\]/i, executor: 'ai' },
+            { pattern: /^\[document\]/i, executor: 'ai' },
+            { pattern: /^\[analyze\]/i, executor: 'ai' },
+            { pattern: /^\[plan\]/i, executor: 'ai' },
+            { pattern: /^\[write\]/i, executor: 'ai' },
           ];
 
           for (const task of (readyTasks.results || [])) {
@@ -4184,6 +4188,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
             // Only auto-dispatch tasks for the SAME executor type
             if (taskExecutorType !== executorType) continue;
+
+            // Check circuit breaker - prevent runaway retry loops
+            const { checkCircuitBreaker, tripCircuitBreaker } = await import('../scheduled/task-dispatcher.ts');
+            const circuitBreaker = await checkCircuitBreaker(env.DB, task.id);
+            if (circuitBreaker.tripped) {
+              await tripCircuitBreaker(env.DB, task.id, tenantId, circuitBreaker.reason!);
+              continue; // Skip this task - it's been cancelled
+            }
 
             // Calculate priority
             const priority = (task.urgency || 3) * (task.importance || 3);
@@ -4530,6 +4542,26 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
+        // Check circuit breaker - prevent runaway retry loops
+        const { checkCircuitBreaker, tripCircuitBreaker } = await import('../scheduled/task-dispatcher.ts');
+        const circuitBreaker = await checkCircuitBreaker(env.DB, taskId);
+        if (circuitBreaker.tripped) {
+          await tripCircuitBreaker(env.DB, taskId, tenantId, circuitBreaker.reason!);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: circuitBreaker.reason,
+                circuit_breaker: true,
+                quarantine_count: circuitBreaker.quarantineCount,
+                task_id: taskId,
+              }, null, 2)
+            }],
+            isError: true
+          };
+        }
+
         // Check for unmet dependencies
         const hasUnmet = await hasUnmetDependencies(env.DB, taskId, tenantId);
         if (hasUnmet) {
@@ -4790,6 +4822,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             continue;
           }
 
+          // Check circuit breaker - prevent runaway retry loops
+          const { checkCircuitBreaker, tripCircuitBreaker } = await import('../scheduled/task-dispatcher.ts');
+          const circuitBreaker = await checkCircuitBreaker(env.DB, task.id);
+          if (circuitBreaker.tripped) {
+            await tripCircuitBreaker(env.DB, task.id, tenantId, circuitBreaker.reason!);
+            skipped.push({ task_id: task.id, reason: `circuit_breaker: ${circuitBreaker.quarantineCount} quarantines` });
+            continue;
+          }
+
           // Decrypt title
           const decryptedTitle = await safeDecrypt(task.title, encryptionKey);
 
@@ -4889,12 +4930,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   // Tool: nexus_execute_task
   server.tool(
     'nexus_execute_task',
-    'Execute a queued task immediately via sandbox-executor. Routes both claude-ai and claude-code tasks to /execute endpoint (uses OAuth credentials). Also supports de-agent tasks via DE service. Use this for immediate task execution instead of waiting for the 15-minute cron.',
+    'Execute a queued task immediately via sandbox-executor. Routes AI tasks to /execute endpoint (uses OAuth credentials). Use this for immediate task execution instead of waiting for the 15-minute cron.',
     {
       queue_id: z.string().uuid().describe('Queue entry ID to execute (from nexus_check_queue)'),
-      repo: z.string().optional().describe('GitHub repo in owner/repo format (e.g., "CyberBrown/nexus"). Overrides any repo in task context. For claude-code tasks only.'),
-      branch: z.string().optional().describe('Git branch to create/use. Overrides any branch in task context. For claude-code tasks only.'),
-      commit_message: z.string().optional().describe('Commit message for changes. If not provided, auto-generates from task title. For claude-code tasks only.'),
+      repo: z.string().optional().describe('GitHub repo in owner/repo format (e.g., "CyberBrown/nexus"). Overrides any repo in task context. For AI tasks only.'),
+      branch: z.string().optional().describe('Git branch to create/use. Overrides any branch in task context. For AI tasks only.'),
+      commit_message: z.string().optional().describe('Commit message for changes. If not provided, auto-generates from task title. For AI tasks only.'),
       passphrase: passphraseSchema,
     },
     async (args): Promise<CallToolResult> => {
