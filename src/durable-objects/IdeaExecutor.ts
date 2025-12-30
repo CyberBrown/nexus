@@ -270,17 +270,27 @@ export class IdeaExecutor extends DurableObject<Env> {
 
     const task = this.state.tasks.find(t => t.taskId === body.taskId);
     if (task) {
-      // Validate completion - check for failure indicators in the result
-      // This prevents marking tasks as complete when the AI said "I couldn't find..."
-      if (body.status === 'completed' && body.result) {
-        const failureIndicator = findFailureIndicator(body.result);
-        if (failureIndicator) {
-          console.log(`[IdeaExecutor] Task ${body.taskId} reported complete but result contains failure indicator: "${failureIndicator}"`);
-          console.log(`[IdeaExecutor] Result preview: ${body.result.substring(0, 200)}`);
-          // Mark as failed instead of completed
+      // Validate completion - prevent marking tasks complete without proper validation
+      if (body.status === 'completed') {
+        // SECURITY: Require result for completion validation
+        // This prevents marking tasks complete when no result is provided
+        if (!body.result || body.result.trim().length < 50) {
+          console.log(`[IdeaExecutor] Task ${body.taskId} reported complete but result is missing or too short (${body.result?.length || 0} chars)`);
+          console.log(`[IdeaExecutor] Rejecting completion - result required for validation`);
+          // Mark as failed - we can't verify the work was done
           task.status = 'failed';
         } else {
-          task.status = body.status;
+          // Check for failure indicators in the result
+          // This prevents marking tasks as complete when the AI said "I couldn't find..."
+          const failureIndicator = findFailureIndicator(body.result);
+          if (failureIndicator) {
+            console.log(`[IdeaExecutor] Task ${body.taskId} reported complete but result contains failure indicator: "${failureIndicator}"`);
+            console.log(`[IdeaExecutor] Result preview: ${body.result.substring(0, 200)}`);
+            // Mark as failed instead of completed
+            task.status = 'failed';
+          } else {
+            task.status = body.status;
+          }
         }
       } else {
         task.status = body.status;

@@ -2556,26 +2556,41 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const now = new Date().toISOString();
 
+        // SECURITY: Require notes for completion validation
+        // This prevents marking tasks complete without evidence of work done
+        if (!notes || notes.trim().length < 50) {
+          console.log(`nexus_complete_task rejected - notes missing or too short (${notes?.length || 0} chars)`);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: 'Task completion rejected - notes are required (minimum 50 characters)',
+                hint: 'Provide a summary of the work completed. This is required to validate task completion.',
+              }, null, 2)
+            }],
+            isError: true
+          };
+        }
+
         // Check for failure indicators in the completion notes
         // Uses shared utility from lib/validation.ts that handles curly quote normalization
-        if (notes) {
-          const matchedIndicator = findFailureIndicator(notes);
-          if (matchedIndicator) {
-            console.log(`nexus_complete_task rejected - notes contain failure indicator: "${matchedIndicator}"`);
-            console.log(`Notes preview: ${notes.substring(0, 200)}`);
-            return {
-              content: [{
-                type: 'text',
-                text: JSON.stringify({
-                  success: false,
-                  error: 'Task completion rejected - notes indicate task was not actually completed',
-                  detected_indicator: matchedIndicator,
-                  hint: 'The notes suggest the task could not be completed. Do not mark as complete unless work was actually done.',
-                }, null, 2)
-              }],
-              isError: true
-            };
-          }
+        const matchedIndicator = findFailureIndicator(notes);
+        if (matchedIndicator) {
+          console.log(`nexus_complete_task rejected - notes contain failure indicator: "${matchedIndicator}"`);
+          console.log(`Notes preview: ${notes.substring(0, 200)}`);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: 'Task completion rejected - notes indicate task was not actually completed',
+                detected_indicator: matchedIndicator,
+                hint: 'The notes suggest the task could not be completed. Do not mark as complete unless work was actually done.',
+              }, null, 2)
+            }],
+            isError: true
+          };
         }
 
         const result = await env.DB.prepare(`
@@ -3546,9 +3561,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // IMPORTANT: FTS5 with space-separated terms uses OR by default, not AND
-        // We must use explicit AND operator to require all terms to match
-        // Terms are not prefixed with column name - FTS5 matches against all indexed columns
+        // FTS5 uses implicit AND for space-separated terms, but explicit AND is also valid
+        // Removed column prefix (search_text:) since it's the only indexed column
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match words in exact sequence
@@ -3558,9 +3572,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             return term;
           }
         });
-        // Use explicit AND operator between terms to require all terms to match
-        // This is the correct FTS5 syntax for multi-word search
-        const ftsQuery = terms.join(' AND ');
+        // Space-separated terms are implicitly ANDed in FTS5
+        const ftsQuery = terms.join(' ');
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {

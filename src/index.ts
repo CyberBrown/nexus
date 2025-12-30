@@ -1390,6 +1390,21 @@ app.post('/api/tasks/:id/complete', async (c) => {
     // This is a defense-in-depth check; DE's nexus-callback.ts should also check this
     // Uses shared utility from lib/validation.ts that handles curly quote normalization
     const resultText = body.notes || body.output || '';
+
+    // SECURITY: Require meaningful notes/output for completion validation
+    // This prevents marking tasks complete without evidence of work done
+    if (resultText.trim().length < 50) {
+      console.log(`Task ${taskId} complete callback rejected - notes/output too short (${resultText.length} chars)`);
+
+      // Don't update task status - just reject the callback
+      return c.json({
+        success: false,
+        error: 'Task completion rejected - notes/output required (minimum 50 characters)',
+        task_id: taskId,
+        hint: 'Provide a summary of the work completed to validate task completion.',
+      }, 400);
+    }
+
     const matchedIndicator = findFailureIndicator(resultText);
 
     if (matchedIndicator) {
