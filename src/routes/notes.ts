@@ -260,7 +260,8 @@ notes.post('/', async (c) => {
   const id = crypto.randomUUID();
 
   // Build plaintext search_text for FTS indexing
-  const searchText = [validated.title, validated.content || '', validated.tags || ''].join(' ').trim();
+  // MUST lowercase because D1's FTS5 is case-sensitive and query terms are lowercased
+  const searchText = [validated.title, validated.content || '', validated.tags || ''].join(' ').trim().toLowerCase();
 
   const note: Partial<Note> & { search_text?: string } = {
     id,
@@ -341,7 +342,8 @@ notes.patch('/:id', async (c) => {
       ? validated.tags
       : existing.tags;
 
-    const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim();
+    // MUST lowercase because D1's FTS5 is case-sensitive and query terms are lowercased
+    const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim().toLowerCase();
     updates.search_text = searchText;
 
     // Update FTS index
