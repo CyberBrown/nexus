@@ -2512,6 +2512,54 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const now = new Date().toISOString();
 
+        // Check for failure indicators in the completion notes
+        // This prevents marking tasks complete when AI says "I couldn't find..." or similar
+        // IMPORTANT: Keep this in sync with TaskExecutorWorkflow.ts and /workflow-callback handler
+        if (notes) {
+          const notesLower = notes.toLowerCase();
+          const failureIndicators = [
+            // Resource not found patterns
+            "couldn't find", "could not find", "can't find", "cannot find",
+            "doesn't have", "does not have", "not found", "no such file",
+            "doesn't exist", "does not exist", "file not found", "directory not found",
+            "repo not found", "repository not found", "project not found",
+            "reference not found", "idea not found",
+            // Failure action patterns
+            "failed to", "unable to", "i can't", "i cannot",
+            "i'm unable", "i am unable", "cannot locate", "couldn't locate",
+            "couldn't create", "could not create", "wasn't able", "was not able",
+            // Empty/missing result patterns
+            "no matching", "nothing found", "no results", "empty result", "no data",
+            // Explicit error indicators
+            "error:", "error occurred", "exception:",
+            // Task incomplete patterns
+            "task incomplete", "could not complete", "couldn't complete",
+            "unable to complete", "did not complete", "didn't complete",
+            // Missing reference patterns (for idea-based tasks)
+            "reference doesn't have", "reference does not have",
+            "doesn't have a corresponding", "does not have a corresponding",
+            "no corresponding file", "no corresponding project",
+            "missing reference", "invalid reference",
+          ];
+          const matchedIndicator = failureIndicators.find(indicator => notesLower.includes(indicator));
+          if (matchedIndicator) {
+            console.log(`nexus_complete_task rejected - notes contain failure indicator: "${matchedIndicator}"`);
+            console.log(`Notes preview: ${notes.substring(0, 200)}`);
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: 'Task completion rejected - notes indicate task was not actually completed',
+                  detected_indicator: matchedIndicator,
+                  hint: 'The notes suggest the task could not be completed. Do not mark as complete unless work was actually done.',
+                }, null, 2)
+              }],
+              isError: true
+            };
+          }
+        }
+
         const result = await env.DB.prepare(`
           UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ?
           WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL AND status != 'completed'
