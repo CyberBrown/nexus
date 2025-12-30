@@ -3630,27 +3630,59 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             console.log('[nexus_search_notes] Created FTS5 table');
           }
 
-          // Check for notes that need search_text populated
-          // This catches notes where search_text is NULL OR notes not in FTS index
+          // Check for notes that need search_text populated or fixed
+          // This catches notes where:
+          // 1. search_text is NULL or empty
+          // 2. Note is not in FTS index
+          // 3. search_text doesn't match decrypted content (validates search_text integrity)
           const notesNeedingRebuild = await env.DB.prepare(`
             SELECT COUNT(*) as cnt FROM notes
             WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-              AND (search_text IS NULL OR search_text = '' OR id NOT IN (SELECT note_id FROM notes_fts))
+              AND (search_text IS NULL OR search_text = '' OR TRIM(search_text) = '' OR id NOT IN (SELECT note_id FROM notes_fts))
           `).bind(tenantId, userId).first<{ cnt: number }>();
 
-          // Auto-rebuild if any notes need it
-          if ((notesNeedingRebuild?.cnt || 0) > 0) {
-            console.log(`[nexus_search_notes] ${notesNeedingRebuild?.cnt || 0} notes need search index rebuild`);
+          // Also check if search_text content is valid by sampling a note
+          // This catches cases where search_text contains encrypted/garbage data
+          let needsContentValidation = false;
+          if ((notesNeedingRebuild?.cnt || 0) === 0) {
+            const sampleNote = await env.DB.prepare(`
+              SELECT id, title, content, tags, search_text FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL AND search_text IS NOT NULL
+              LIMIT 1
+            `).bind(tenantId, userId).first<{
+              id: string; title: string | null; content: string | null; tags: string | null; search_text: string | null;
+            }>();
 
-            // Get notes that need rebuilding (NULL search_text OR missing from FTS)
-            // Use higher limit (500) for faster initial population - will be batched across searches
-            const missingNotes = await env.DB.prepare(`
-              SELECT id, title, content, tags FROM notes
-              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-                AND (search_text IS NULL OR search_text = '' OR id NOT IN (SELECT note_id FROM notes_fts))
-              LIMIT 500
-            `).bind(tenantId, userId).all<{
-              id: string; title: string | null; content: string | null; tags: string | null;
+            if (sampleNote && sampleNote.search_text) {
+              // Decrypt and check if search_text matches actual content
+              const decryptedTitle = sampleNote.title ? await safeDecrypt(sampleNote.title, encryptionKey) : '';
+
+              // If search_text doesn't contain key words from decrypted content, it's likely corrupted
+              const titleWords = decryptedTitle.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+              if (titleWords.length > 0 && !titleWords.some(word => sampleNote.search_text!.includes(word))) {
+                console.log(`[nexus_search_notes] Sample note search_text appears corrupted, triggering rebuild`);
+                needsContentValidation = true;
+              }
+            }
+          }
+
+          // Auto-rebuild if any notes need it or content validation failed
+          if ((notesNeedingRebuild?.cnt || 0) > 0 || needsContentValidation) {
+            console.log(`[nexus_search_notes] ${notesNeedingRebuild?.cnt || 0} notes need search index rebuild (content validation: ${needsContentValidation})`);
+
+            // Get notes that need rebuilding
+            // If content validation failed, rebuild ALL notes; otherwise just missing ones
+            const rebuildQuery = needsContentValidation
+              ? `SELECT id, title, content, tags, search_text FROM notes
+                 WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                 LIMIT 500`
+              : `SELECT id, title, content, tags, search_text FROM notes
+                 WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                   AND (search_text IS NULL OR search_text = '' OR TRIM(search_text) = '' OR id NOT IN (SELECT note_id FROM notes_fts))
+                 LIMIT 500`;
+
+            const missingNotes = await env.DB.prepare(rebuildQuery).bind(tenantId, userId).all<{
+              id: string; title: string | null; content: string | null; tags: string | null; search_text: string | null;
             }>();
 
             for (const note of missingNotes.results || []) {

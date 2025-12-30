@@ -67,6 +67,33 @@ notes.get('/', async (c) => {
           if ((ftsCount?.cnt || 0) < (notesCount?.cnt || 0)) {
             ftsNeedsRebuild = true;
           }
+
+          // Also validate search_text content by sampling a note
+          // This catches cases where search_text contains encrypted/garbage data
+          if (!ftsNeedsRebuild && (notesCount?.cnt || 0) > 0) {
+            const rebuildKey = await getEncryptionKey(c.env.KV, tenantId);
+            const sampleNote = await c.env.DB.prepare(`
+              SELECT id, title, search_text FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL AND search_text IS NOT NULL
+              LIMIT 1
+            `).bind(tenantId, userId).first<{
+              id: string; title: string | null; search_text: string | null;
+            }>();
+
+            if (sampleNote && sampleNote.search_text && sampleNote.title) {
+              // Decrypt title and check if search_text contains its words
+              let decryptedTitle = '';
+              try {
+                decryptedTitle = await decryptField(sampleNote.title, rebuildKey);
+              } catch {
+                decryptedTitle = sampleNote.title; // Already plaintext
+              }
+              const titleWords = decryptedTitle.toLowerCase().split(/\s+/).filter((w: string) => w.length > 3);
+              if (titleWords.length > 0 && !titleWords.some((word: string) => sampleNote.search_text!.includes(word))) {
+                ftsNeedsRebuild = true;
+              }
+            }
+          }
         }
 
         // Rebuild FTS if needed
