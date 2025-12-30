@@ -154,24 +154,19 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query with OR for broad matching
-      // D1's FTS5 has known issues with AND operator - it can silently fail
-      // We use OR to get all potentially matching results, then post-filter
-      // with matchesAllTerms() to enforce AND semantics in application code
-      //
-      // FTS5 query syntax notes:
-      // - Use prefix matching (term*) for more forgiving search
-      // - Wrap OR expressions in parentheses for proper parsing
-      const ftsQuery = ftsTerms.length === 1
-        ? (ftsTerms[0]!.startsWith('"') ? ftsTerms[0] : `${ftsTerms[0]}*`)
-        : ftsTerms.length > 0
-          ? '(' + ftsTerms.map(term => {
-              if (term.startsWith('"') && term.endsWith('"')) {
-                return term;
-              }
-              return `${term}*`;
-            }).join(' OR ') + ')'
-          : '';
+      // Build FTS5 query with AND semantics (FTS5 default for space-separated terms)
+      // Use prefix matching (term*) for better partial word matching
+      // Post-filter with matchesAllTerms() ensures exact term presence in decrypted content
+      const ftsQuery = ftsTerms.length > 0
+        ? ftsTerms.map(term => {
+            if (term.startsWith('"') && term.endsWith('"')) {
+              // Quoted phrase - use as-is for exact phrase matching
+              return term;
+            }
+            // Add prefix wildcard for partial matching
+            return `${term}*`;
+          }).join(' ')
+        : '';
 
       if (ftsQuery) {
         // Build conditions

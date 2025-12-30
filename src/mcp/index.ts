@@ -3613,20 +3613,90 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let searchMethod = 'none';
         const archivedCondition = include_archived ? '' : 'AND archived_at IS NULL';
 
-        // PRIMARY SEARCH: FTS5 full-text search
-        // D1's FTS5 has known issues with AND operator - it can silently fail
-        // We use OR to get all potentially matching results, then post-filter
-        // with matchesAllTerms() to enforce AND semantics in application code
+        // Ensure FTS5 infrastructure exists and is populated
         try {
-          // Build FTS5 query: use OR between terms for broad matching
-          // Post-filter enforces AND semantics after decryption
-          const ftsQuery = ftsTerms.length === 1
-            ? (ftsTerms[0]!.startsWith('"') ? ftsTerms[0] : `${ftsTerms[0]}*`)
-            : '(' + ftsTerms.map(term =>
-                term.startsWith('"') ? term : `${term}*`
-              ).join(' OR ') + ')';
+          // Check if FTS table exists with correct schema
+          const ftsTable = await env.DB.prepare(
+            `SELECT name, sql FROM sqlite_master WHERE type='table' AND name='notes_fts'`
+          ).first<{ name: string; sql: string } | null>();
 
-          console.log(`[nexus_search_notes] FTS5 search (OR query, AND post-filter): query="${ftsQuery}", terms=[${searchTerms.join(', ')}]`);
+          if (!ftsTable || !ftsTable.sql || !ftsTable.sql.includes('note_id')) {
+            // Create FTS5 table with correct schema
+            await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+            await env.DB.prepare(`
+              CREATE VIRTUAL TABLE notes_fts USING fts5(
+                note_id UNINDEXED,
+                search_text,
+                tokenize='porter unicode61'
+              )
+            `).run();
+            console.log('[nexus_search_notes] Created FTS5 table');
+          }
+
+          // Check FTS index completeness - compare counts
+          const ftsCount = await env.DB.prepare(`
+            SELECT COUNT(*) as cnt FROM notes_fts WHERE note_id IN (
+              SELECT id FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+            )
+          `).bind(tenantId, userId).first<{ cnt: number }>();
+
+          const notesCount = await env.DB.prepare(`
+            SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+          `).bind(tenantId, userId).first<{ cnt: number }>();
+
+          // Auto-rebuild if FTS has fewer entries than notes
+          if ((ftsCount?.cnt || 0) < (notesCount?.cnt || 0)) {
+            console.log(`[nexus_search_notes] FTS index incomplete (${ftsCount?.cnt || 0}/${notesCount?.cnt || 0}), rebuilding...`);
+
+            // Get notes missing from FTS
+            const missingNotes = await env.DB.prepare(`
+              SELECT id, title, content, tags FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND id NOT IN (SELECT note_id FROM notes_fts)
+              LIMIT 100
+            `).bind(tenantId, userId).all<{
+              id: string; title: string | null; content: string | null; tags: string | null;
+            }>();
+
+            for (const note of missingNotes.results || []) {
+              const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+              const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+              const searchText = [decryptedTitle, decryptedContent, note.tags || ''].join(' ').trim().toLowerCase();
+
+              if (searchText) {
+                try {
+                  // Update search_text column
+                  await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                    .bind(searchText, note.id).run();
+                  // Insert into FTS index
+                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                    .bind(note.id, searchText).run();
+                } catch { /* ignore individual insert errors */ }
+              }
+            }
+            console.log(`[nexus_search_notes] Rebuilt FTS index for ${missingNotes.results?.length || 0} notes`);
+          }
+        } catch (err) {
+          console.error('[nexus_search_notes] FTS setup/rebuild error (will continue to fallback):', err);
+        }
+
+        // PRIMARY SEARCH: FTS5 full-text search
+        // FTS5 uses implicit AND for space-separated terms by default
+        // We use prefix matching (term*) for better recall on partial matches
+        // Post-filter with matchesAllTerms() ensures exact term presence
+        try {
+          // Build FTS5 query: space-separated terms for AND semantics (FTS5 default)
+          // Use prefix matching for better partial word matching
+          const ftsQuery = ftsTerms.map(term => {
+            if (term.startsWith('"') && term.endsWith('"')) {
+              // Quoted phrase - use as-is for exact phrase matching
+              return term;
+            }
+            // Add prefix wildcard for partial matching
+            return `${term}*`;
+          }).join(' ');
+
+          console.log(`[nexus_search_notes] FTS5 search (AND with prefix): query="${ftsQuery}", terms=[${searchTerms.join(', ')}]`);
 
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
