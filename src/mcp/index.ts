@@ -3443,7 +3443,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
               // Escape special FTS5 characters and use prefix matching
               // FTS5 prefix syntax: word* (no quotes for prefix search)
-              const escaped = word.replace(/[*^"():]/g, '');
+              // MUST lowercase because porter tokenizer normalizes to lowercase
+              const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
               if (escaped.length > 0) {
                 ftsTerms.push(`${escaped}*`);
               }
@@ -3452,8 +3453,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           // Add the quoted phrase (exact match, no prefix)
           const phrase = match[1]!.trim();
           if (phrase.length > 0) {
-            // Escape any quotes within the phrase
-            const escapedPhrase = phrase.replace(/"/g, '');
+            // Escape any quotes within the phrase and lowercase for porter tokenizer
+            const escapedPhrase = phrase.replace(/"/g, '').toLowerCase();
             ftsTerms.push(`"${escapedPhrase}"`);
           }
           lastIndex = match.index + match[0].length;
@@ -3465,15 +3466,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
             // Escape special FTS5 characters and use prefix matching
             // FTS5 prefix syntax: word* (no quotes for prefix search)
-            const escaped = word.replace(/[*^"():]/g, '');
+            // MUST lowercase because porter tokenizer normalizes to lowercase
+            const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
               ftsTerms.push(`${escaped}*`);
             }
           }
         }
 
-        // Join with space for implicit AND (FTS5 treats space-separated terms as AND)
-        const ftsQuery = ftsTerms.join(' ');
+        // Join with AND for explicit boolean AND (more reliable than implicit space-separated AND)
+        const ftsQuery = ftsTerms.join(' AND ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
