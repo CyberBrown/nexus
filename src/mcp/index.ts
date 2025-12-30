@@ -3679,12 +3679,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // PRIMARY SEARCH: FTS5 MATCH query for efficient multi-word search
         // Uses the notes_fts virtual table with porter stemming for word matching
-        // FTS5 uses implicit AND for space-separated terms
+        // FTS5 requires explicit AND operators for multi-term searches
         try {
-          // Build FTS5 query using plain terms (no column filter prefix needed)
+          // Build FTS5 query using explicit AND operators for multi-word search
           // Since notes_fts only has one indexed column (search_text), FTS5 searches it by default
-          // Space-separated terms = implicit AND in FTS5
           // Porter stemmer handles word variations (e.g., "validate" matches "validation")
+          // IMPORTANT: FTS5 space-separated terms match as a PHRASE (adjacent words in order).
+          // To match terms appearing ANYWHERE in the document, use explicit AND operators.
           const ftsQuery = searchTerms
             .map(term => {
               const cleaned = term.replace(/["']/g, '');
@@ -3696,7 +3697,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               // Plain term - FTS5 will apply porter stemmer
               return cleaned;
             })
-            .join(' ');  // Space-separated = implicit AND in FTS5
+            .join(' AND ');  // Use explicit AND for multi-term searches
 
           console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}"`);
 

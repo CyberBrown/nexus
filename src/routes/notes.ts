@@ -170,8 +170,9 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query with AND semantics (FTS5 default for space-separated terms)
-      // Use plain terms - FTS5 searches the indexed column (search_text) by default
+      // Build FTS5 query with explicit AND operators for multi-term search
+      // FTS5 space-separated terms match as a PHRASE (adjacent words in order).
+      // To match terms appearing ANYWHERE in the document, use explicit AND operators.
       // Porter stemmer handles word variations (e.g., "validate" matches "validation")
       // Post-filter with matchesAllTerms() ensures exact term presence in decrypted content
       const ftsQuery = ftsTerms.length > 0
@@ -182,7 +183,7 @@ notes.get('/', async (c) => {
             }
             // Plain term - FTS5 will apply porter stemmer
             return term;
-          }).join(' ')
+          }).join(' AND ')
         : '';
 
       if (ftsQuery) {
