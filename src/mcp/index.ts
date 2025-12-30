@@ -3530,6 +3530,60 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           });
         }
 
+        // If FTS returned 0 results, fall back to search_text column (FTS index may be empty)
+        if (matchingNotes.length === 0) {
+          // Use search_text column as fallback
+          const searchTerms = ftsTerms.map(t => t.replace(/\*$/, '').replace(/^"/, '').replace(/"$/, '').toLowerCase());
+
+          const archivedSql = include_archived ? '' : 'AND archived_at IS NULL';
+          const fallbackNotes = await env.DB.prepare(`
+            SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
+            FROM notes
+            WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${archivedSql}
+            ORDER BY pinned DESC, created_at DESC
+          `).bind(tenantId, userId).all();
+
+          for (const note of fallbackNotes.results) {
+            const searchableText = (note.search_text as string || '').toLowerCase();
+            if (searchTerms.every(term => searchableText.includes(term))) {
+              const decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
+              const decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
+
+              matchingNotes.push({
+                id: note.id,
+                title: decryptedTitle,
+                content_preview: decryptedContent
+                  ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                  : '',
+                category: note.category,
+                tags: note.tags,
+                source_type: note.source_type,
+                pinned: note.pinned === 1,
+                archived: !!note.archived_at,
+                created_at: note.created_at,
+              });
+              if (matchingNotes.length >= (limit || 20)) break;
+            }
+          }
+
+          if (matchingNotes.length > 0) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: true,
+                  query: query,
+                  fts_query: ftsQuery,
+                  count: matchingNotes.length,
+                  notes: matchingNotes,
+                  fallback: true,
+                  hint: 'FTS index may need rebuilding. Run nexus_rebuild_notes_fts to improve search performance.',
+                }, null, 2)
+              }]
+            };
+          }
+        }
+
         return {
           content: [{
             type: 'text',
