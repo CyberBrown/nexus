@@ -3499,11 +3499,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_search_notes - Search notes using FTS5 full-text search
-  // Uses FTS5 MATCH query for efficient multi-word search with porter stemming
+  // Tool: nexus_search_notes - Search notes with reliable multi-word support
+  // SIMPLIFIED APPROACH: Use SQL LIKE as primary method (most reliable)
+  // Falls back to full scan with decryption for notes missing search_text
   server.tool(
     'nexus_search_notes',
-    'Search notes by title, content, or tags. Supports multi-word search (all terms must match) and quoted phrases for exact matching. Uses FTS5 full-text search.',
+    'Search notes by title, content, or tags. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
     {
       query: z.string().describe('Search query. Multiple words are ANDed together. Use quotes for exact phrases, e.g. "MCP validation" or MCP validation'),
       limit: z.number().optional().default(20).describe('Maximum results'),
@@ -3513,9 +3514,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
         const trimmedQuery = query.trim();
+        const maxLimit = limit || 20;
 
         // Parse search terms - handle quoted phrases and individual words
-        const searchTerms: Array<{ term: string; isPhrase: boolean }> = [];
+        const searchTerms: string[] = [];
         const phraseRegex = /"([^"]+)"/g;
         let lastIndex = 0;
         let match: RegExpExecArray | null;
@@ -3525,17 +3527,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           const before = trimmedQuery.slice(lastIndex, match.index).trim();
           if (before) {
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
-              // Escape FTS5 special characters and lowercase
-              const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
-              if (escaped.length > 0) {
-                searchTerms.push({ term: escaped, isPhrase: false });
-              }
+              searchTerms.push(word.toLowerCase());
             }
           }
-          // Add the quoted phrase
+          // Add the quoted phrase as a single term
           const phrase = match[1]!.trim().toLowerCase();
           if (phrase.length > 0) {
-            searchTerms.push({ term: phrase, isPhrase: true });
+            searchTerms.push(phrase);
           }
           lastIndex = match.index + match[0].length;
         }
@@ -3544,10 +3542,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const remaining = trimmedQuery.slice(lastIndex).trim();
         if (remaining) {
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
-            const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
-            if (escaped.length > 0) {
-              searchTerms.push({ term: escaped, isPhrase: false });
-            }
+            searchTerms.push(word.toLowerCase());
           }
         }
 
@@ -3566,31 +3561,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query for multi-word search
-        // Use explicit AND operator for reliable multi-term matching in D1's FTS5
-        // Space-separated terms should be implicitly ANDed, but explicit AND is more reliable
-        const terms = searchTerms.map(({ term, isPhrase }) => {
-          if (isPhrase) {
-            // Quoted phrase - must match words in exact sequence
-            return `"${term}"`;
-          } else {
-            // Single word - porter stemmer will normalize during matching
-            // Escape any FTS5 special characters that might cause syntax errors
-            return term.replace(/['"]/g, '');
-          }
-        });
-        // Join with explicit AND operator for reliable multi-word matching
-        // This is more reliable than implicit space-separated ANDing in some FTS5 implementations
-        const ftsQuery = terms.join(' AND ');
-
-        // Helper to check if all search terms match in a text (for fallback)
+        // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
           const lowerText = text.toLowerCase();
-          return searchTerms.every(({ term }) => lowerText.includes(term));
+          return searchTerms.every(term => lowerText.includes(term));
         };
-
-        // Build archived condition
-        const archivedCondition = include_archived ? '' : 'AND n.archived_at IS NULL';
 
         const matchingNotes: Array<{
           id: string;
@@ -3604,380 +3579,143 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           created_at: string;
         }> = [];
 
-        let usedFts = false;
-        let ftsMatchCount = 0;
-        let fallbackMatchCount = 0;
-        let ftsSchemaFixed = false;
-        let totalNotesScanned = 0;
-        let ftsIndexCount = 0;
-        const maxLimit = limit || 20;
+        let searchMethod = 'none';
+        const archivedCondition = include_archived ? '' : 'AND archived_at IS NULL';
 
-        // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
-        // Also ensure search_text column exists in notes table (added in migration 0018)
+        // STEP 1: Try SQL LIKE search on search_text column (most reliable for multi-word)
         try {
-          // Check if search_text column exists in notes table
-          const searchTextCol = await env.DB.prepare(
-            `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
-          ).first<{ name: string } | null>();
+          // Build LIKE conditions for all search terms - all must match
+          const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
+          const likeBindings = searchTerms.map(term => `%${term}%`);
 
-          if (!searchTextCol) {
-            // Add search_text column if it doesn't exist
-            await env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
-          }
+          const sqlSearchResults = await env.DB.prepare(`
+            SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at
+            FROM notes
+            WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+              ${archivedCondition}
+              AND search_text IS NOT NULL AND search_text != ''
+              AND ${likeConditions}
+            ORDER BY pinned DESC, created_at DESC
+            LIMIT ?
+          `).bind(tenantId, userId, ...likeBindings, maxLimit).all();
 
-          const tableInfo = await env.DB.prepare(
-            `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
-          ).first<{ name: string } | null>();
+          if (sqlSearchResults.results && sqlSearchResults.results.length > 0) {
+            searchMethod = 'sql_like';
+            for (const note of sqlSearchResults.results as Array<{
+              id: string;
+              title: string | null;
+              content: string | null;
+              category: string;
+              tags: string | null;
+              source_type: string | null;
+              pinned: number;
+              archived_at: string | null;
+              created_at: string;
+            }>) {
+              const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+              const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
 
-          if (!tableInfo) {
-            // FTS table either doesn't exist or has old schema - recreate with correct schema
-            await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
-            await env.DB.prepare(`
-              CREATE VIRTUAL TABLE notes_fts USING fts5(
-                note_id UNINDEXED,
-                search_text,
-                tokenize='porter unicode61'
-              )
-            `).run();
-            ftsSchemaFixed = true;
-          }
-        } catch {
-          // Schema check failed, FTS may not be available
-        }
-
-        // Auto-populate FTS index BEFORE searching (same as notes route)
-        // This ensures notes are searchable even if they weren't indexed when created
-        try {
-          // Find notes that have search_text but are missing from FTS
-          // Increased limit to 500 to ensure more notes get indexed in one pass
-          const notesWithSearchText = await env.DB.prepare(`
-            SELECT n.id, n.search_text FROM notes n
-            LEFT JOIN notes_fts f ON n.id = f.note_id
-            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
-              AND n.search_text IS NOT NULL AND n.search_text != ''
-              AND f.note_id IS NULL
-            LIMIT 500
-          `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
-
-          if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
-            for (const note of notesWithSearchText.results) {
-              try {
-                await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                  .bind(note.id, note.search_text).run();
-              } catch {
-                // Ignore duplicates or FTS errors
-              }
+              matchingNotes.push({
+                id: note.id,
+                title: decryptedTitle,
+                content_preview: decryptedContent
+                  ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                  : '',
+                category: note.category,
+                tags: note.tags,
+                source_type: note.source_type,
+                pinned: note.pinned === 1,
+                archived: !!note.archived_at,
+                created_at: note.created_at,
+              });
             }
-          }
-
-          // Also fix notes that ARE in FTS but with mismatched/stale search_text
-          // This handles corrupted FTS entries from old migration 0017 that indexed encrypted content
-          const notesWithMismatchedFts = await env.DB.prepare(`
-            SELECT n.id, n.search_text, f.search_text as fts_text FROM notes n
-            INNER JOIN notes_fts f ON n.id = f.note_id
-            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
-              AND n.search_text IS NOT NULL AND n.search_text != ''
-              AND f.search_text != n.search_text
-            LIMIT 200
-          `).bind(tenantId, userId).all<{ id: string; search_text: string; fts_text: string }>();
-
-          if (notesWithMismatchedFts.results && notesWithMismatchedFts.results.length > 0) {
-            for (const note of notesWithMismatchedFts.results) {
-              try {
-                // Update FTS with correct search_text
-                await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
-                await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                  .bind(note.id, note.search_text).run();
-              } catch {
-                // Ignore errors
-              }
-            }
-          }
-
-          // Find notes WITHOUT search_text - decrypt and populate both columns
-          // Increased limit to 200 for more aggressive population
-          const notesWithoutSearchText = await env.DB.prepare(`
-            SELECT n.id, n.title, n.content, n.tags FROM notes n
-            LEFT JOIN notes_fts f ON n.id = f.note_id
-            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
-              AND (n.search_text IS NULL OR n.search_text = '')
-              AND f.note_id IS NULL
-            LIMIT 200
-          `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
-
-          if (notesWithoutSearchText.results && notesWithoutSearchText.results.length > 0) {
-            for (const note of notesWithoutSearchText.results) {
-              try {
-                // Decrypt title and content
-                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-                const tagsText = note.tags ? String(note.tags) : '';
-
-                // Build search_text (lowercase for FTS case sensitivity)
-                const searchText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.trim().toLowerCase();
-
-                if (searchText) {
-                  // Update notes table with search_text
-                  await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
-                    .bind(searchText, note.id).run();
-
-                  // Insert into FTS index
-                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                    .bind(note.id, searchText).run();
-                }
-              } catch {
-                // Ignore individual note errors
-              }
-            }
-          }
-
-          // Handle notes that ARE in FTS (with stale/encrypted data) but have no search_text
-          // This catches cases where migration 0017 indexed encrypted content but 0018's search_text column wasn't populated
-          const notesInFtsWithoutSearchText = await env.DB.prepare(`
-            SELECT n.id, n.title, n.content, n.tags FROM notes n
-            INNER JOIN notes_fts f ON n.id = f.note_id
-            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
-              AND (n.search_text IS NULL OR n.search_text = '')
-            LIMIT 200
-          `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
-
-          if (notesInFtsWithoutSearchText.results && notesInFtsWithoutSearchText.results.length > 0) {
-            for (const note of notesInFtsWithoutSearchText.results) {
-              try {
-                // Decrypt title and content
-                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-                const tagsText = note.tags ? String(note.tags) : '';
-
-                // Build search_text (lowercase for FTS case sensitivity)
-                const searchText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.trim().toLowerCase();
-
-                if (searchText) {
-                  // Update notes table with search_text
-                  await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
-                    .bind(searchText, note.id).run();
-
-                  // Delete old FTS entry and insert correct one
-                  await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
-                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                    .bind(note.id, searchText).run();
-                }
-              } catch {
-                // Ignore individual note errors
-              }
-            }
-          }
-        } catch {
-          // Auto-populate failed, search will still work via fallback
-        }
-
-        // Try FTS5 search first
-        let ftsError: Error | null = null;
-        try {
-          // First, count how many notes are in the FTS index for this user
-          try {
-            const ftsCountResult = await env.DB.prepare(`
-              SELECT COUNT(*) as cnt FROM notes_fts
-              WHERE note_id IN (SELECT id FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL)
-            `).bind(tenantId, userId).first<{ cnt: number }>();
-            ftsIndexCount = ftsCountResult?.cnt || 0;
-          } catch {
-            // FTS table might not exist
-          }
-
-          // Only try FTS if index is populated
-          if (ftsIndexCount > 0) {
-            // Use subquery with MATCH for FTS5 query
-            // In FTS5, MATCH must be against the table name (not a column name)
-            // The syntax is: WHERE table_name MATCH 'query'
-            const ftsResults = await env.DB.prepare(`
-              SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
-              FROM notes n
-              WHERE n.id IN (
-                SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
-              )
-                AND n.tenant_id = ?
-                AND n.user_id = ?
-                AND n.deleted_at IS NULL
-                ${archivedCondition}
-              ORDER BY n.pinned DESC, n.created_at DESC
-              LIMIT ?
-            `).bind(ftsQuery, tenantId, userId, maxLimit).all();
-
-            usedFts = true;
-
-          for (const note of ftsResults.results || []) {
-            const decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
-            const decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
-
-            matchingNotes.push({
-              id: note.id as string,
-              title: decryptedTitle,
-              content_preview: decryptedContent
-                ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
-                : '',
-              category: note.category as string,
-              tags: note.tags as string | null,
-              source_type: note.source_type as string | null,
-              pinned: note.pinned === 1,
-              archived: !!note.archived_at,
-              created_at: note.created_at as string,
-            });
-            ftsMatchCount++;
-          }
           }
         } catch (err) {
-          // FTS5 query failed - might be malformed query or table doesn't exist
-          ftsError = err as Error;
-          console.error('FTS5 search failed, falling back to scan:', err);
+          console.error('SQL LIKE search failed:', err);
         }
 
-        // If FTS returned no results or failed, fall back to scanning notes directly
+        // STEP 2: If SQL LIKE found nothing, do full scan with decryption
+        // This handles notes where search_text is not populated
         if (matchingNotes.length === 0) {
-          // Try SQL-based search using LIKE on search_text column first (most efficient fallback)
-          // This uses the search_text column which stores plaintext for searching
-          let sqlSearchWorked = false;
-
           try {
-            // Build LIKE conditions for all search terms - all must match
-            const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
-            const likeBindings = searchTerms.map(({ term }) => `%${term}%`);
-
-            const sqlSearchResults = await env.DB.prepare(`
+            const allNotes = await env.DB.prepare(`
               SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
               FROM notes
               WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-                ${include_archived ? '' : 'AND archived_at IS NULL'}
-                AND search_text IS NOT NULL AND search_text != ''
-                AND ${likeConditions}
+                ${archivedCondition}
               ORDER BY pinned DESC, created_at DESC
-              LIMIT ?
-            `).bind(tenantId, userId, ...likeBindings, maxLimit).all();
+            `).bind(tenantId, userId).all();
 
-            if (sqlSearchResults.results && sqlSearchResults.results.length > 0) {
-              sqlSearchWorked = true;
-              for (const note of sqlSearchResults.results as Array<{
-                id: string;
-                title: string | null;
-                content: string | null;
-                category: string;
-                tags: string | null;
-                source_type: string | null;
-                pinned: number;
-                archived_at: string | null;
-                created_at: string;
-                search_text: string | null;
-              }>) {
-                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+            searchMethod = 'full_scan';
+            let notesRepaired = 0;
 
-                matchingNotes.push({
-                  id: note.id,
-                  title: decryptedTitle,
-                  content_preview: decryptedContent
-                    ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
-                    : '',
-                  category: note.category as string,
-                  tags: note.tags as string | null,
-                  source_type: note.source_type as string | null,
-                  pinned: note.pinned === 1,
-                  archived: !!note.archived_at,
-                  created_at: note.created_at as string,
-                });
-                fallbackMatchCount++;
+            for (const note of (allNotes.results || []) as Array<{
+              id: string;
+              title: string | null;
+              content: string | null;
+              category: string;
+              tags: string | null;
+              source_type: string | null;
+              pinned: number;
+              archived_at: string | null;
+              created_at: string;
+              search_text: string | null;
+            }>) {
+              // Decrypt title and content for matching
+              const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+              const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+              const tagsText = note.tags ? String(note.tags) : '';
+
+              // Build searchable text
+              const searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
+
+              // Check if all search terms match
+              if (!matchesAllTerms(searchableText)) {
+                continue;
               }
-            }
-          } catch {
-            // SQL search failed, continue to full scan fallback
-          }
 
-          // If SQL-based search didn't find results, do full scan (handles notes without search_text)
-          if (!sqlSearchWorked) {
-            // Query notes - try with search_text column first, fall back without it
-            let allNotes: { results: unknown[] | null };
-            try {
-              allNotes = await env.DB.prepare(`
-                SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
-                FROM notes
-                WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
-                ORDER BY pinned DESC, created_at DESC
-              `).bind(tenantId, userId).all();
-            } catch {
-              // search_text column might not exist, query without it
-              allNotes = await env.DB.prepare(`
-                SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, NULL as search_text
-                FROM notes
-                WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
-                ORDER BY pinned DESC, created_at DESC
-              `).bind(tenantId, userId).all();
-            }
-
-            totalNotesScanned = allNotes.results?.length || 0;
-
-          for (const note of (allNotes.results || []) as Array<{
-            id: string;
-            title: string | null;
-            content: string | null;
-            category: string;
-            tags: string | null;
-            source_type: string | null;
-            pinned: number;
-            archived_at: string | null;
-            created_at: string;
-            search_text: string | null;
-          }>) {
-            // Always decrypt title and content for matching
-            // Don't trust search_text as it may be corrupted/stale
-            const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-            const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-            const tagsText = note.tags ? String(note.tags) : '';
-
-            // Build fresh searchable text from decrypted content
-            const searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
-
-            // Check if all search terms match
-            if (!matchesAllTerms(searchableText)) {
-              continue;
-            }
-
-            // Auto-repair: update search_text and FTS if needed
-            if (!note.search_text || note.search_text !== searchableText) {
-              try {
-                await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
-                  .bind(searchableText, note.id).run();
+              // Auto-repair: populate search_text if missing or stale
+              if (!note.search_text || note.search_text.trim() === '' || !matchesAllTerms(note.search_text)) {
+                notesRepaired++;
                 try {
-                  await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
-                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                    .bind(note.id, searchableText).run();
+                  await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                    .bind(searchableText, note.id).run();
+                  // Also update FTS index
+                  try {
+                    await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                    await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                      .bind(note.id, searchableText).run();
+                  } catch {
+                    // FTS table may not exist
+                  }
                 } catch {
-                  // FTS table may not exist, that's OK
+                  // Repair failed
                 }
-              } catch {
-                // Repair failed, continue anyway
               }
+
+              // Add to results
+              matchingNotes.push({
+                id: note.id,
+                title: decryptedTitle,
+                content_preview: decryptedContent
+                  ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                  : '',
+                category: note.category,
+                tags: note.tags,
+                source_type: note.source_type,
+                pinned: note.pinned === 1,
+                archived: !!note.archived_at,
+                created_at: note.created_at,
+              });
+
+              if (matchingNotes.length >= maxLimit) break;
             }
 
-            // Match found - add to results
-            matchingNotes.push({
-              id: note.id,
-              title: decryptedTitle,
-              content_preview: decryptedContent
-                ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
-                : '',
-              category: note.category as string,
-              tags: note.tags as string | null,
-              source_type: note.source_type as string | null,
-              pinned: note.pinned === 1,
-              archived: !!note.archived_at,
-              created_at: note.created_at as string,
-            });
-            fallbackMatchCount++;
-
-            // Stop if we've hit the limit
-            if (matchingNotes.length >= maxLimit) {
-              break;
+            if (notesRepaired > 0) {
+              searchMethod = `full_scan_repaired_${notesRepaired}`;
             }
-          }
+          } catch (err) {
+            console.error('Full scan search failed:', err);
           }
         }
 
@@ -3985,168 +3723,29 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const response: Record<string, unknown> = {
           success: true,
           query: query,
-          search_terms: searchTerms.map(t => t.isPhrase ? `"${t.term}"` : t.term),
-          fts_query: ftsQuery,
+          search_terms: searchTerms,
           count: matchingNotes.length,
           notes: matchingNotes,
+          search_method: searchMethod,
         };
 
-        // If no results found, check if notes exist and try auto-rebuild of FTS
-        // NOTE: We trigger rebuild even if FTS was used but returned 0 results,
-        // because the FTS index may be stale/corrupted or have mismatched content
-        let autoRebuilt = false;
+        // Add helpful hints
         if (matchingNotes.length === 0) {
-          // Count total notes for this user
           let totalNotes = 0;
           try {
             const countResult = await env.DB.prepare(`
               SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
             `).bind(tenantId, userId).first<{ cnt: number }>();
             totalNotes = countResult?.cnt || 0;
-          } catch { /* ignore count error */ }
+          } catch { /* ignore */ }
 
-          // If notes exist but weren't found, do an aggressive FTS rebuild
-          // Also rebuild if FTS count matches but search returned nothing (stale index)
-          if (totalNotes > 0 && (ftsIndexCount < totalNotes || usedFts)) {
-            try {
-              // Rebuild FTS for ALL notes (not batched)
-              const allNotesForFts = await env.DB.prepare(`
-                SELECT id, title, content, tags, search_text
-                FROM notes
-                WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-              `).bind(tenantId, userId).all<{
-                id: string;
-                title: string | null;
-                content: string | null;
-                tags: string | null;
-                search_text: string | null;
-              }>();
-
-              for (const note of allNotesForFts.results || []) {
-                try {
-                  let searchText = note.search_text;
-
-                  // If search_text is missing, build it from decrypted content
-                  if (!searchText || searchText.trim() === '') {
-                    const decTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-                    const decContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-                    const tagsText = note.tags ? String(note.tags) : '';
-                    searchText = `${decTitle} ${decContent} ${tagsText}`.trim().toLowerCase();
-
-                    // Update notes table with search_text
-                    if (searchText) {
-                      await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
-                        .bind(searchText, note.id).run();
-                    }
-                  }
-
-                  // Update FTS index
-                  if (searchText) {
-                    await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
-                    await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                      .bind(note.id, searchText).run();
-                  }
-                } catch {
-                  // Ignore individual note errors
-                }
-              }
-
-              autoRebuilt = true;
-
-              // Retry FTS search after rebuild
-              try {
-                const ftsRetryResults = await env.DB.prepare(`
-                  SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
-                  FROM notes n
-                  WHERE n.id IN (
-                    SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
-                  )
-                    AND n.tenant_id = ?
-                    AND n.user_id = ?
-                    AND n.deleted_at IS NULL
-                    ${archivedCondition}
-                  ORDER BY n.pinned DESC, n.created_at DESC
-                  LIMIT ?
-                `).bind(ftsQuery, tenantId, userId, maxLimit).all();
-
-                for (const note of ftsRetryResults.results || []) {
-                  const decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
-                  const decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
-
-                  matchingNotes.push({
-                    id: note.id as string,
-                    title: decryptedTitle,
-                    content_preview: decryptedContent
-                      ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
-                      : '',
-                    category: note.category as string,
-                    tags: note.tags as string | null,
-                    source_type: note.source_type as string | null,
-                    pinned: note.pinned === 1,
-                    archived: !!note.archived_at,
-                    created_at: note.created_at as string,
-                  });
-                  ftsMatchCount++;
-                }
-
-                if (matchingNotes.length > 0) {
-                  usedFts = true;
-                }
-              } catch {
-                // FTS retry failed, will use fallback results
-              }
-            } catch {
-              // Auto-rebuild failed
-            }
-          }
-        }
-
-        // Update response count after potential auto-rebuild
-        response.count = matchingNotes.length;
-        response.notes = matchingNotes;
-
-        // Always include search method info for debugging
-        if (usedFts && ftsMatchCount > 0) {
-          response.search_method = autoRebuilt ? 'fts5_auto_rebuilt' : 'fts5';
-          if (autoRebuilt) {
-            response.hint = 'FTS index was automatically rebuilt. Search should be fast from now on.';
-          }
-        } else if (fallbackMatchCount > 0) {
-          response.search_method = 'fallback_scan';
-          if (ftsSchemaFixed) {
-            response.hint = 'FTS5 schema was auto-repaired. Run nexus_rebuild_notes_fts to populate the full-text index for faster searches.';
-          } else {
-            response.hint = 'Run nexus_rebuild_notes_fts to enable faster FTS5 search.';
-          }
-        } else if (matchingNotes.length === 0) {
-          // No results - provide diagnostic info with total note count
-          let totalNotes = 0;
-          try {
-            const countResult = await env.DB.prepare(`
-              SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-            `).bind(tenantId, userId).first<{ cnt: number }>();
-            totalNotes = countResult?.cnt || 0;
-          } catch { /* ignore count error */ }
-
-          response.search_method = usedFts ? 'fts5_empty' : (autoRebuilt ? 'auto_rebuilt_empty' : 'fallback_empty');
-          response.debug = {
-            fts_attempted: usedFts,
-            fts_schema_fixed: ftsSchemaFixed,
-            fts_index_count: ftsIndexCount,
-            total_notes_scanned: totalNotesScanned,
-            total_notes_in_db: totalNotes,
-            fts_error: ftsError ? ftsError.message : null,
-            auto_rebuilt: autoRebuilt,
-          };
           if (totalNotes === 0) {
             response.hint = 'No notes found for this user. Create some notes first.';
-          } else if (autoRebuilt) {
-            response.hint = 'FTS index was rebuilt but no matching notes found. The search terms may not appear together in any notes.';
-          } else if (ftsIndexCount === 0) {
-            response.hint = `FTS index is empty but ${totalNotes} notes exist. Run nexus_rebuild_notes_fts to rebuild the search index.`;
           } else {
-            response.hint = 'No matching notes found. The search terms may not appear together in any notes. Try simpler search terms.';
+            response.hint = `No matching notes found. ${totalNotes} notes exist. Try simpler search terms or check spelling.`;
           }
+        } else if (searchMethod.startsWith('full_scan')) {
+          response.hint = 'Search used full scan. Run nexus_rebuild_notes_fts to enable faster indexed search.';
         }
 
         return {
