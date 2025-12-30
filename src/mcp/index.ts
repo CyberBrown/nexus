@@ -3966,9 +3966,123 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           notes: matchingNotes,
         };
 
+        // If no results found, check if notes exist and try auto-rebuild of FTS
+        let autoRebuilt = false;
+        if (matchingNotes.length === 0 && !usedFts) {
+          // Count total notes for this user
+          let totalNotes = 0;
+          try {
+            const countResult = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+            `).bind(tenantId, userId).first<{ cnt: number }>();
+            totalNotes = countResult?.cnt || 0;
+          } catch { /* ignore count error */ }
+
+          // If notes exist but weren't found, do an aggressive FTS rebuild
+          if (totalNotes > 0 && ftsIndexCount < totalNotes) {
+            try {
+              // Rebuild FTS for ALL notes (not batched)
+              const allNotesForFts = await env.DB.prepare(`
+                SELECT id, title, content, tags, search_text
+                FROM notes
+                WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+              `).bind(tenantId, userId).all<{
+                id: string;
+                title: string | null;
+                content: string | null;
+                tags: string | null;
+                search_text: string | null;
+              }>();
+
+              for (const note of allNotesForFts.results || []) {
+                try {
+                  let searchText = note.search_text;
+
+                  // If search_text is missing, build it from decrypted content
+                  if (!searchText || searchText.trim() === '') {
+                    const decTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                    const decContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                    const tagsText = note.tags ? String(note.tags) : '';
+                    searchText = `${decTitle} ${decContent} ${tagsText}`.trim().toLowerCase();
+
+                    // Update notes table with search_text
+                    if (searchText) {
+                      await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                        .bind(searchText, note.id).run();
+                    }
+                  }
+
+                  // Update FTS index
+                  if (searchText) {
+                    await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                    await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                      .bind(note.id, searchText).run();
+                  }
+                } catch {
+                  // Ignore individual note errors
+                }
+              }
+
+              autoRebuilt = true;
+
+              // Retry FTS search after rebuild
+              try {
+                const ftsRetryResults = await env.DB.prepare(`
+                  SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
+                  FROM notes n
+                  WHERE n.id IN (
+                    SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
+                  )
+                    AND n.tenant_id = ?
+                    AND n.user_id = ?
+                    AND n.deleted_at IS NULL
+                    ${archivedCondition}
+                  ORDER BY n.pinned DESC, n.created_at DESC
+                  LIMIT ?
+                `).bind(ftsQuery, tenantId, userId, maxLimit).all();
+
+                for (const note of ftsRetryResults.results || []) {
+                  const decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
+                  const decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
+
+                  matchingNotes.push({
+                    id: note.id as string,
+                    title: decryptedTitle,
+                    content_preview: decryptedContent
+                      ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                      : '',
+                    category: note.category as string,
+                    tags: note.tags as string | null,
+                    source_type: note.source_type as string | null,
+                    pinned: note.pinned === 1,
+                    archived: !!note.archived_at,
+                    created_at: note.created_at as string,
+                  });
+                  ftsMatchCount++;
+                }
+
+                if (matchingNotes.length > 0) {
+                  usedFts = true;
+                }
+              } catch {
+                // FTS retry failed, will use fallback results
+              }
+            } catch {
+              // Auto-rebuild failed
+            }
+          }
+        }
+
+        // Update response count after potential auto-rebuild
+        response.count = matchingNotes.length;
+        response.notes = matchingNotes;
+
         // Always include search method info for debugging
         if (usedFts && ftsMatchCount > 0) {
-          response.search_method = 'fts5';
+          response.search_method = autoRebuilt ? 'fts5_auto_rebuilt' : 'fts5';
+          if (autoRebuilt) {
+            response.hint = 'FTS index was automatically rebuilt. Search should be fast from now on.';
+          }
         } else if (fallbackMatchCount > 0) {
           response.search_method = 'fallback_scan';
           if (ftsSchemaFixed) {
@@ -3986,7 +4100,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             totalNotes = countResult?.cnt || 0;
           } catch { /* ignore count error */ }
 
-          response.search_method = usedFts ? 'fts5_empty' : 'fallback_empty';
+          response.search_method = usedFts ? 'fts5_empty' : (autoRebuilt ? 'auto_rebuilt_empty' : 'fallback_empty');
           response.debug = {
             fts_attempted: usedFts,
             fts_schema_fixed: ftsSchemaFixed,
@@ -3994,9 +4108,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             total_notes_scanned: totalNotesScanned,
             total_notes_in_db: totalNotes,
             fts_error: ftsError ? ftsError.message : null,
+            auto_rebuilt: autoRebuilt,
           };
           if (totalNotes === 0) {
             response.hint = 'No notes found for this user. Create some notes first.';
+          } else if (autoRebuilt) {
+            response.hint = 'FTS index was rebuilt but no matching notes found. The search terms may not appear together in any notes.';
           } else if (ftsIndexCount === 0) {
             response.hint = `FTS index is empty but ${totalNotes} notes exist. Run nexus_rebuild_notes_fts to rebuild the search index.`;
           } else {
