@@ -3517,10 +3517,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_search_notes - Search notes using LIKE-based search on search_text column
-  // PRIMARY: LIKE search with AND conditions for multi-word queries (most reliable in D1)
-  // FALLBACK: Full table scan with decryption if search_text is not populated
-  // The search_text column stores lowercase plaintext for searching encrypted notes
+  // Tool: nexus_search_notes - Search notes using FTS5 full-text search
+  // PRIMARY: FTS5 MATCH with AND conditions for multi-word queries
+  // FALLBACK 1: LIKE search if FTS5 fails or returns nothing
+  // FALLBACK 2: Full table scan with decryption if search_text is not populated
+  // The search_text column stores lowercase plaintext for searching
   server.tool(
     'nexus_search_notes',
     'Search notes by title, content, or tags. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
@@ -3675,13 +3676,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // PRIMARY SEARCH: FTS5 MATCH query for efficient multi-word search
         // Uses the notes_fts virtual table with porter stemming for word matching
-        // FTS5 supports AND semantics: 'term1 term2' matches both terms
+        // FTS5 default is OR for space-separated terms, so we use explicit AND
         try {
-          // Build FTS5 query: escape special chars and join with spaces (implicit AND)
-          // FTS5 treats space-separated terms as AND by default
+          // Build FTS5 query: escape special chars and join with AND for multi-term matching
+          // FTS5 uses OR by default, so we need explicit AND between terms
           const ftsQuery = searchTerms
             .map(term => term.replace(/["']/g, '')) // Remove quotes
-            .join(' ');
+            .join(' AND ');
 
           console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}"`);
 
