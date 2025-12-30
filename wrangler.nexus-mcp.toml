@@ -88,6 +88,10 @@ tag = "v8"
 [[migrations]]
 tag = "v9"
 
+# v10 - Sync with production
+[[migrations]]
+tag = "v10"
+
 # Service Bindings - Worker-to-Worker communication
 [[services]]
 binding = "DE"
