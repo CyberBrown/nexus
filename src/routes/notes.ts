@@ -198,8 +198,8 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // Use column prefix 'search_text:' for D1 FTS5 compatibility
-      // Implicit AND (space-separated) works reliably in D1's FTS5 implementation
+      // IMPORTANT: FTS5 with space-separated terms uses OR by default, not AND
+      // We must use explicit AND operator to require all terms to match
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -216,8 +216,7 @@ notes.get('/', async (c) => {
             // Escape special FTS5 characters and lowercase for porter tokenizer
             const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              // Use column prefix for D1 compatibility
-              ftsTerms.push(`search_text:${escaped}`);
+              ftsTerms.push(escaped);
             }
           }
         }
@@ -226,8 +225,7 @@ notes.get('/', async (c) => {
         if (phrase.length > 0) {
           // Escape any quotes within the phrase and lowercase for porter tokenizer
           const escapedPhrase = phrase.replace(/"/g, '').toLowerCase();
-          // Use column prefix for D1 compatibility
-          ftsTerms.push(`search_text:"${escapedPhrase}"`);
+          ftsTerms.push(`"${escapedPhrase}"`);
         }
         lastIndex = match.index + match[0].length;
       }
@@ -239,15 +237,14 @@ notes.get('/', async (c) => {
           // Escape special FTS5 characters and lowercase for porter tokenizer
           const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            // Use column prefix for D1 compatibility
-            ftsTerms.push(`search_text:${escaped}`);
+            ftsTerms.push(escaped);
           }
         }
       }
 
-      // Use space-separated terms (implicit AND) - D1's FTS5 treats this as requiring all terms
-      // This is more reliable than explicit AND keyword in D1
-      const ftsQuery = ftsTerms.join(' ');
+      // Use explicit AND operator between terms to require all terms to match
+      // This is the correct FTS5 syntax for multi-word search
+      const ftsQuery = ftsTerms.join(' AND ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)

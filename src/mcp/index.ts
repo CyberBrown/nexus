@@ -3546,22 +3546,21 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // Use column prefix 'search_text:' for D1 FTS5 compatibility
-        // For phrases: quote them to require exact sequence match
-        // Implicit AND (space-separated) works reliably in D1's FTS5 implementation
+        // IMPORTANT: FTS5 with space-separated terms uses OR by default, not AND
+        // We must use explicit AND operator to require all terms to match
+        // Terms are not prefixed with column name - FTS5 matches against all indexed columns
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match words in exact sequence
-            // Use column prefix for D1 compatibility
-            return `search_text:"${term}"`;
+            return `"${term}"`;
           } else {
-            // Single word with column prefix - porter stemmer will normalize during matching
-            return `search_text:${term}`;
+            // Single word - porter stemmer will normalize during matching
+            return term;
           }
         });
-        // Use space-separated terms (implicit AND) - D1's FTS5 treats this as requiring all terms
-        // This is more reliable than explicit AND keyword in D1
-        const ftsQuery = terms.join(' ');
+        // Use explicit AND operator between terms to require all terms to match
+        // This is the correct FTS5 syntax for multi-word search
+        const ftsQuery = terms.join(' AND ');
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {
