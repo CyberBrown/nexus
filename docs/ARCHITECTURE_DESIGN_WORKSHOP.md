@@ -1737,3 +1737,568 @@ User Input: "Update the auth flow in the nexus project"
 ---
 
 *Last updated: 2025-12-30 - Architecture Design Workshop Session 2*
+
+---
+
+## 10. Final Architecture Workshop Session: 2025-12-30
+
+### Session 3: Implementation Gap Analysis & Final Decisions
+
+This session validates the architecture decisions against the current codebase implementation and produces concrete implementation tasks.
+
+---
+
+### 10.1 Implementation Status Audit
+
+#### ✅ Already Implemented
+
+| Component | Location | Status |
+|-----------|----------|--------|
+| Notes FTS5 | `migrations/0017_add_notes_fts.sql` | ✅ Complete with triggers |
+| Executor Type Simplification | `migrations/0011_simplify_executor_types.sql` | ✅ `ai`, `human`, `human-ai` |
+| Memory Items Schema | `migrations/0016_add_memory_items_table.sql` | ✅ Full schema with tags/environments |
+| Task Dependencies | `migrations/0012_task_dependencies.sql` | ✅ Dependency tracking |
+| Dual Execution Paths | `src/index.ts`, `src/mcp/index.ts` | ✅ IntakeClient + HTTP both working |
+| Workflow Callbacks | `/workflow-callback` endpoint | ✅ Task completion/failure handling |
+| Dependent Task Promotion | `promoteDependentTasks()` | ✅ Auto-triggers next tasks |
+| 40+ MCP Tools | `src/mcp/index.ts` | ✅ Comprehensive toolset |
+| AI Classification | `src/lib/classifier.ts` | ✅ Via DE Text-Gen |
+
+#### 🔴 Not Yet Implemented
+
+| Component | Gap | Priority |
+|-----------|-----|----------|
+| Tasks FTS5 | No FTS table for tasks | P1 |
+| Ideas FTS5 | No FTS table for ideas | P1 |
+| Projects FTS5 | No FTS table for projects | P1 |
+| Unified `/api/search` | No cross-entity search endpoint | P1 |
+| `task_type` field | Tasks table lacks formal task type | P2 |
+| MCP Search Tool | No `nexus_search` MCP tool | P2 |
+| Classifier Task Type | Classifier doesn't output task_type | P3 |
+| Entity Detection | No AMM/entity detection service | P4 |
+| Mnemo Cache | No working memory cache layer | P5 |
+
+---
+
+### 10.2 Critical Decision: Encrypted Field Search
+
+**Problem Identified:** The notes FTS migration operates on encrypted data. Full-text search on encrypted fields will not produce useful results because:
+1. Encrypted content is base64-encoded ciphertext
+2. FTS5 will index gibberish, not actual content
+3. Search queries won't match encrypted text
+
+**Analysis of Current Implementation:**
+```sql
+-- Migration 0017 indexes encrypted fields!
+INSERT INTO notes_fts(rowid, title, content, tags)
+SELECT rowid,
+       COALESCE(title, ''),      -- This is encrypted!
+       COALESCE(content, ''),    -- This is encrypted!
+       COALESCE(tags, '')        -- tags is NOT encrypted
+FROM notes WHERE deleted_at IS NULL;
+```
+
+**ADR-008: Search on Encrypted Data**
+
+**Status:** Approved
+
+**Context:** All sensitive content (titles, descriptions) is encrypted at the application layer before storage. D1 FTS5 cannot search encrypted content meaningfully.
+
+**Decision:** Implement a hybrid search strategy:
+
+1. **Unencrypted Metadata Search (Immediate)**
+   - FTS5 on non-sensitive fields: `tags`, `domain`, `status`, `category`
+   - These fields provide sufficient filtering for most use cases
+
+2. **Application-Layer Search (Current)**
+   - Continue using post-decryption filtering (like `notes.ts:58-83`)
+   - Works well for small-medium datasets (<10K items per user)
+
+3. **Searchable Encryption (Future)**
+   - If scale requires, implement searchable encryption or keyword-blind indexing
+   - Store encrypted keyword hashes for deterministic search
+   - More complex, defer unless needed
+
+**Consequences:**
+- (+) Security maintained - encrypted content stays encrypted
+- (+) Existing approach works for current scale
+- (-) FTS5 limited to metadata fields
+- (-) Full-text on content requires decrypt + filter
+
+**Immediate Action:** Create FTS tables for tasks/ideas/projects on **unencrypted fields only**:
+- `tasks_fts`: tags, domain, status, contexts
+- `ideas_fts`: tags, domain, category
+- `projects_fts`: tags, domain, status
+
+---
+
+### 10.3 Revised Search Architecture
+
+Given the encryption constraint, the search architecture is updated:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    HYBRID SEARCH ARCHITECTURE                        │
+│                    (Encryption-Aware)                                │
+└─────────────────────────────────────────────────────────────────────┘
+
+Search Request → /api/search?q=keyword&types=task,note
+                    │
+                    ├──────────────────────────────────────────────┐
+                    │                                              │
+                    ▼                                              ▼
+         ┌─────────────────────┐               ┌─────────────────────────┐
+         │ PHASE 1: FTS5       │               │ PHASE 2: Decrypt+Filter │
+         │ (Metadata)          │               │ (Encrypted Content)     │
+         │                     │               │                         │
+         │ - tags              │               │ - title                 │
+         │ - domain            │               │ - description           │
+         │ - status            │               │ - content               │
+         │ - category          │               │                         │
+         │ - contexts          │               │ (Only if needed)        │
+         └─────────┬───────────┘               └───────────┬─────────────┘
+                   │                                       │
+                   │ Fast: ~1-5ms                          │ Slower: ~50-200ms
+                   │                                       │
+                   ▼                                       ▼
+         ┌─────────────────────────────────────────────────────────────┐
+         │                    Result Merger                             │
+         │  - Combine results                                           │
+         │  - Rank by relevance                                         │
+         │  - Apply pagination                                          │
+         └─────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────┐
+                    │   Search Results    │
+                    └─────────────────────┘
+```
+
+**Search Mode Options:**
+- `mode: 'fast'` - FTS5 metadata only (default)
+- `mode: 'full'` - FTS5 + decrypt content search (slower)
+
+---
+
+### 10.4 Final Implementation Roadmap
+
+#### Sprint 1: Search Foundation (Priority 1)
+
+**Task 1.1: Create FTS5 Tables for Tasks/Ideas/Projects**
+- File: `migrations/0018_add_entity_fts.sql`
+- Tables: `tasks_fts`, `ideas_fts`, `projects_fts`
+- Fields: Unencrypted metadata only (tags, domain, status, etc.)
+- Effort: 2 hours
+
+**Task 1.2: Implement Unified Search Endpoint**
+- File: `src/routes/search.ts`
+- Endpoint: `GET /api/search`
+- Features: Multi-entity search, FTS5 queries, result merging
+- Effort: 4 hours
+
+**Task 1.3: Add MCP Search Tool**
+- File: `src/mcp/index.ts`
+- Tool: `nexus_search`
+- Description: Search across all entities from Claude.ai/Code
+- Effort: 2 hours
+
+#### Sprint 2: Task Type Classification (Priority 2)
+
+**Task 2.1: Add task_type Field to Tasks**
+- File: `migrations/0019_add_task_type.sql`
+- Values: `code`, `research`, `content`, `outreach`, `review`, `decision`
+- Effort: 1 hour
+
+**Task 2.2: Update Classifier to Output task_type**
+- File: `src/lib/classifier.ts`
+- Logic: Infer task_type from content analysis
+- Effort: 2 hours
+
+**Task 2.3: Update Routing Logic**
+- Files: `src/scheduled/task-dispatcher.ts`, `src/lib/routing.ts`
+- Logic: Route by task_type instead of title prefix matching
+- Effort: 3 hours
+
+#### Sprint 3: Memory/Context Enhancement (Priority 3)
+
+**Task 3.1: Memory Items CRUD Endpoints**
+- File: `src/routes/memory.ts`
+- Endpoints: CRUD for memory_items table
+- Effort: 4 hours
+
+**Task 3.2: Memory MCP Tools**
+- File: `src/mcp/index.ts`
+- Tools: `nexus_remember`, `nexus_recall`, `nexus_forget`
+- Effort: 3 hours
+
+#### Sprint 4: Future (Priority 4+)
+
+- Entity Detection Service
+- Mnemo Cache Layer
+- Vectorize Semantic Search
+- Bridge Development
+
+---
+
+### 10.5 Encryption Audit
+
+**Encrypted Fields by Entity:**
+
+| Table | Encrypted Fields | Unencrypted Fields |
+|-------|------------------|-------------------|
+| `tasks` | title, description | tags, domain, status, contexts, urgency, importance |
+| `ideas` | title, description | tags, domain, category, excitement_level, feasibility |
+| `projects` | name, description, objective | tags, domain, status, health |
+| `notes` | title, content | tags, category, source_type |
+| `people` | name, email, phone, notes | relationship, organization |
+| `memory_items` | content, summary | memory_type, scope, tags, categories |
+
+**Implication:** FTS5 indexes must be created on unencrypted columns only.
+
+---
+
+### 10.6 Updated ADR Summary
+
+| ADR | Decision | Status |
+|-----|----------|--------|
+| ADR-001 | Dual Execution Paths (IntakeClient + HTTP) | ✅ Accepted |
+| ADR-002 | Hybrid Search (FTS5 + Vectorize) | ✅ Accepted |
+| ADR-003 | Simplified Executor Types (ai/human/human-ai) | ✅ Implemented |
+| ADR-004 | Task Type Taxonomy (6 types) | ⏳ Pending Implementation |
+| ADR-005 | Callback-Based Workflows | ✅ Implemented |
+| ADR-006 | D1 FTS5 as Primary Search | ✅ Accepted |
+| ADR-007 | Nexus Controls Memory Loading | ✅ Accepted |
+| ADR-008 | Search on Encrypted Data (Metadata Only) | ✅ Accepted |
+
+---
+
+### 10.7 Session 3 Conclusions
+
+1. **Encryption Constraint Identified:** FTS5 cannot meaningfully search encrypted content. Design updated to search metadata fields only.
+
+2. **Implementation Status Clear:**
+   - Core execution pipeline: ✅ Complete
+   - Search infrastructure: 🔴 Not implemented
+   - Task type routing: 🔴 Not implemented
+   - Memory system: 🟡 Schema exists, no API
+
+3. **Priority Order Validated:**
+   1. Search endpoint (high user value, foundation for MCP)
+   2. Task type classification (enables smarter routing)
+   3. Memory CRUD (enables persistent context)
+   4. Entity detection (enables proactive context loading)
+
+4. **Next Immediate Actions:**
+   - Create migration 0018 for entity FTS tables
+   - Implement `/api/search` endpoint
+   - Add `nexus_search` MCP tool
+
+---
+
+---
+
+## 11. Final Workshop Session: 2025-12-30 (Session 4)
+
+### Session Objective: Architecture Validation & Implementation Handoff
+
+This final session validates all architectural decisions against the current implementation, confirms the encryption strategy, and produces a complete implementation handoff document.
+
+---
+
+### 11.1 Architecture Validation Checklist
+
+#### ✅ Confirmed Architectural Decisions
+
+| Decision | Status | Validation |
+|----------|--------|------------|
+| **Dual Execution Paths** | ✅ Validated | IntakeClient (cron) + HTTP (MCP) both working correctly |
+| **Executor Type Simplification** | ✅ Implemented | Migration 0011 - `ai`, `human`, `human-ai` in production |
+| **Notes FTS5 with search_text** | ✅ Implemented | Migration 0018 - Fixes encryption issue correctly |
+| **Memory Items Schema** | ✅ Implemented | Migration 0016 - Complete schema with tags/environments |
+| **Task Dependencies** | ✅ Implemented | Migration 0012 - Dependency tracking with promotion |
+| **Callback-Based Workflows** | ✅ Implemented | `/workflow-callback` endpoint operational |
+| **Cloudflare Access Auth** | ✅ Implemented | JWT validation + dev token fallback |
+| **Service Binding Pattern** | ✅ Implemented | DE, INTAKE, SANDBOX_EXECUTOR bindings active |
+
+#### 🔴 Confirmed Implementation Gaps
+
+| Gap | Priority | Estimated Effort | Dependencies |
+|-----|----------|------------------|--------------|
+| `task_type` field in tasks table | P1 | 1h | None |
+| Cross-entity FTS5 tables (tasks, ideas, projects) | P1 | 2h | None |
+| Unified `/api/search` endpoint | P1 | 4h | FTS5 tables |
+| `nexus_search` MCP tool (cross-entity) | P2 | 2h | Search endpoint |
+| Classifier task_type output | P2 | 3h | task_type field |
+| Memory items CRUD API | P3 | 4h | None |
+| Memory MCP tools | P3 | 3h | Memory API |
+| Entity detection service (AMM) | P4 | 8h | Memory system |
+| Mnemo cache layer | P5 | 12h | Entity detection |
+
+---
+
+### 11.2 Encryption Strategy - Finalized
+
+**ADR-008 Implementation Details:**
+
+The encryption strategy is now fully validated:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    ENCRYPTION-AWARE SEARCH STRATEGY                      │
+└─────────────────────────────────────────────────────────────────────────┘
+
+ENCRYPTED FIELDS (AES-256-GCM at application layer):
+├── tasks: title, description
+├── ideas: title, description
+├── projects: name, description, objective
+├── notes: title, content → search_text (plaintext for FTS)
+├── people: name, email, phone, notes
+└── memory_items: content, summary
+
+UNENCRYPTED FIELDS (Searchable via FTS5):
+├── tasks: tags, domain, status, contexts, urgency, importance
+├── ideas: tags, domain, category, excitement_level, feasibility
+├── projects: tags, domain, status, health
+├── notes: tags, category, source_type, search_text
+└── memory_items: memory_type, scope, tags, categories, environments
+
+SEARCH APPROACH:
+1. FTS5 on unencrypted metadata fields (fast, ~1-5ms)
+2. Application-level decrypt+filter for content search (slower, ~50-200ms)
+3. Notes use search_text pattern for full-text on plaintext copy
+```
+
+**Why This Works:**
+- Security is preserved - all PII/sensitive data remains encrypted at rest
+- Metadata search handles 90%+ of use cases (filter by tags, domain, status)
+- Full content search available when needed via decrypt+filter
+- Notes pattern can be extended to other entities if content search demand grows
+
+---
+
+### 11.3 Search Architecture - Final Design
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        SEARCH REQUEST FLOW                               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+GET /api/search?q=keyword&types=task,idea,note&mode=fast
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         SEARCH ROUTER                                    │
+│                                                                          │
+│  mode=fast (default):                                                   │
+│    └── FTS5 metadata search only → Return immediately                  │
+│                                                                          │
+│  mode=full:                                                              │
+│    ├── FTS5 metadata search (parallel)                                  │
+│    └── Decrypt + content filter (parallel)                              │
+│    └── Merge results → Return                                           │
+│                                                                          │
+│  Entity-specific routing:                                                │
+│    ├── notes: Uses notes_fts (search_text column)                       │
+│    ├── tasks: Uses tasks_fts (tags, domain, status, contexts)           │
+│    ├── ideas: Uses ideas_fts (tags, domain, category)                   │
+│    └── projects: Uses projects_fts (tags, domain, status)               │
+└─────────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        RESPONSE                                          │
+│  {                                                                       │
+│    "success": true,                                                      │
+│    "data": [                                                             │
+│      { "entity_type": "task", "id": "...", "snippet": "...", ... },    │
+│      { "entity_type": "note", "id": "...", "snippet": "...", ... }     │
+│    ],                                                                    │
+│    "meta": { "query": "keyword", "mode": "fast", "took_ms": 12 }       │
+│  }                                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 11.4 Task Type Classification - Final Design
+
+**Task Type Enum Values:**
+
+| Type | Description | Default Executor | Execution Path |
+|------|-------------|------------------|----------------|
+| `code` | Code generation, modification, deployment | `ai` | IntakeClient → CodeExecution |
+| `research` | Information gathering, analysis | `ai` | DE Text-Gen (future: ResearchLoop) |
+| `content` | Writing, documentation, content creation | `ai` | DE Text-Gen (future: ContentLoop) |
+| `outreach` | Communication, email, networking | `human-ai` | Dashboard + AI suggestions |
+| `review` | Requires human judgment/approval | `human` | Dashboard queue |
+| `decision` | CEO/owner decision required | `human` | Dashboard priority queue |
+
+**Routing Logic Pseudocode:**
+
+```typescript
+function getExecutorType(task: Task): ExecutorType {
+  // 1. Explicit executor override takes precedence
+  if (task.executor_type) return task.executor_type;
+
+  // 2. Route by task_type
+  const routing: Record<TaskType, ExecutorType> = {
+    'code': 'ai',
+    'research': 'ai',
+    'content': 'ai',
+    'outreach': 'human-ai',
+    'review': 'human',
+    'decision': 'human'
+  };
+
+  if (task.task_type && routing[task.task_type]) {
+    return routing[task.task_type];
+  }
+
+  // 3. Fallback: classify from title/description
+  return classifyFromContent(task.title, task.description);
+}
+```
+
+---
+
+### 11.5 Data Flow Validation
+
+All documented data flows have been validated against implementation:
+
+| Flow | Documented | Implemented | Status |
+|------|------------|-------------|--------|
+| Capture → Classification → Entity | ✅ | ✅ | Working |
+| Idea → Planning → Task Generation | ✅ | ✅ | Working |
+| Task Cron Dispatch → IntakeClient → PrimeWorkflow | ✅ | ✅ | Working |
+| MCP Task Creation → HTTP → PrimeWorkflow | ✅ | ✅ | Working |
+| Workflow Completion → Callback → Task Update | ✅ | ✅ | Working |
+| Dependent Task Promotion | ✅ | ✅ | Working |
+| Notes FTS5 Search | ✅ | ✅ | Working |
+
+---
+
+### 11.6 Implementation Handoff Specification
+
+#### Sprint 1: Search Foundation (Week 1)
+
+**Migration 0019: Add Entity FTS Tables**
+
+```sql
+-- File: migrations/0019_add_entity_fts.sql
+
+-- Tasks FTS (metadata only - encrypted fields excluded)
+CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+    task_id UNINDEXED,
+    tags,
+    domain,
+    status,
+    contexts,
+    tokenize='porter unicode61'
+);
+
+-- Ideas FTS (metadata only)
+CREATE VIRTUAL TABLE IF NOT EXISTS ideas_fts USING fts5(
+    idea_id UNINDEXED,
+    tags,
+    domain,
+    category,
+    tokenize='porter unicode61'
+);
+
+-- Projects FTS (metadata only)
+CREATE VIRTUAL TABLE IF NOT EXISTS projects_fts USING fts5(
+    project_id UNINDEXED,
+    tags,
+    domain,
+    status,
+    tokenize='porter unicode61'
+);
+```
+
+**New Route: `/api/search`**
+
+```typescript
+// File: src/routes/search.ts
+// Unified search endpoint across all entities
+// Supports: q, types, mode, domain, status, limit, offset
+// Returns: Merged, ranked results with snippets
+```
+
+**MCP Tool: `nexus_search`**
+
+```typescript
+// Add to src/mcp/index.ts
+// Tool: nexus_search
+// Description: Search across tasks, ideas, notes, and projects
+// Parameters: query, types?, mode?, limit?
+```
+
+#### Sprint 2: Task Type Classification (Week 2)
+
+**Migration 0020: Add task_type Field**
+
+```sql
+-- File: migrations/0020_add_task_type.sql
+
+ALTER TABLE tasks ADD COLUMN task_type TEXT;
+-- Valid values: 'code', 'research', 'content', 'outreach', 'review', 'decision'
+
+CREATE INDEX IF NOT EXISTS idx_tasks_task_type ON tasks(tenant_id, task_type);
+
+-- Update existing tasks based on title patterns (optional)
+UPDATE tasks SET task_type = 'code'
+WHERE title LIKE '[implement]%' OR title LIKE '[fix]%' OR title LIKE '[deploy]%';
+```
+
+**Classifier Update**
+
+```typescript
+// Update src/lib/classifier.ts
+// Add task_type inference to classification output
+// Use LLM to classify: code, research, content, outreach, review, decision
+```
+
+**Routing Update**
+
+```typescript
+// Update src/scheduled/task-dispatcher.ts
+// Use task_type for executor routing instead of title prefix matching
+```
+
+---
+
+### 11.7 Success Criteria
+
+The architecture workshop is complete when:
+
+1. ✅ All 8 ADRs are documented and accepted
+2. ✅ Encryption strategy is validated and documented
+3. ✅ Search architecture is designed with encryption awareness
+4. ✅ Task type taxonomy is defined with routing rules
+5. ✅ All data flows are validated against implementation
+6. ✅ Implementation handoff specification is complete
+7. ⏳ Sprint 1 implementation begins (Search Foundation)
+
+---
+
+### 11.8 Architecture Workshop Summary
+
+| Aspect | Status | Key Decisions |
+|--------|--------|---------------|
+| **Integration Strategy** | ✅ Finalized | Dual execution paths (IntakeClient + HTTP) |
+| **Data Flow** | ✅ Validated | All flows implemented and working |
+| **Search Routing** | ✅ Designed | FTS5 metadata + decrypt+filter for content |
+| **Executor Types** | ✅ Implemented | ai, human, human-ai |
+| **Task Types** | ⏳ Ready | 6 types defined, awaiting implementation |
+| **Encryption** | ✅ Validated | ADR-008 approach confirmed |
+| **Memory/Context** | ⏳ Planned | Schema exists, API needed |
+
+**Total ADRs:** 8 (all accepted)
+**Implementation Gaps:** 9 items identified with effort estimates
+**Next Sprint:** Search Foundation (8h total effort)
+
+---
+
+*Workshop Complete: 2025-12-30*
+*All architectural decisions finalized and documented.*
+*Implementation roadmap ready for execution.*
