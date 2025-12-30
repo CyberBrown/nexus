@@ -1603,15 +1603,17 @@ app.post('/workflow-callback', async (c) => {
     // ========================================
     // Check for idea_tasks first (from TaskExecutorWorkflow)
     // These are dispatched async and need callback handling
+    // FIX: Handle race condition where callback arrives before status is set to 'dispatched'
+    // We now accept 'in_progress' OR 'dispatched' status to handle the race condition
     // ========================================
     if (body.task_id) {
       const ideaTask = await c.env.DB.prepare(`
         SELECT id, idea_id, tenant_id, status FROM idea_tasks
-        WHERE id = ? AND status = 'dispatched' AND deleted_at IS NULL
+        WHERE id = ? AND status IN ('dispatched', 'in_progress') AND deleted_at IS NULL
       `).bind(body.task_id).first<{ id: string; idea_id: string; tenant_id: string; status: string }>();
 
       if (ideaTask) {
-        console.log(`Workflow callback: found idea_task ${ideaTask.id} in dispatched state`);
+        console.log(`Workflow callback: found idea_task ${ideaTask.id} in ${ideaTask.status} state`);
 
         if (isSuccess) {
           // Validate that work was actually done:
@@ -1718,14 +1720,24 @@ app.post('/workflow-callback', async (c) => {
         console.log(`Workflow callback: idea_task ${ideaTask.id} ${isSuccess ? 'completed' : 'failed'}`);
         return c.json({ success: true, type: 'idea_task' });
       } else {
-        // Check if the task exists but with an unexpected status (helps debug race conditions)
+        // Check if the task exists but with an unexpected status (helps debug issues)
         const anyStatusTask = await c.env.DB.prepare(`
           SELECT id, status FROM idea_tasks WHERE id = ? AND deleted_at IS NULL
         `).bind(body.task_id).first<{ id: string; status: string }>();
 
         if (anyStatusTask) {
-          console.warn(`Workflow callback: idea_task ${body.task_id} exists but has unexpected status '${anyStatusTask.status}' (expected 'dispatched' or 'in_progress')`);
-          console.warn(`Workflow callback: This may indicate a race condition or duplicate callback. isSuccess=${isSuccess}, output_preview=${resultText.substring(0, 200)}`);
+          // Task exists but has a status we don't handle (e.g., 'completed', 'failed', 'pending')
+          // This could be:
+          // 1. A duplicate callback (task already processed)
+          // 2. Task was cancelled/reset before callback arrived
+          // 3. Task hasn't started execution yet ('pending')
+          console.warn(`Workflow callback: idea_task ${body.task_id} exists with status '${anyStatusTask.status}' (expected 'dispatched' or 'in_progress')`);
+          console.warn(`Workflow callback: Skipping update. isSuccess=${isSuccess}, output_preview=${resultText.substring(0, 200)}`);
+
+          // If the task is 'pending' or 'ready', this callback is premature - log error
+          if (['pending', 'ready'].includes(anyStatusTask.status)) {
+            console.error(`Workflow callback: CRITICAL - callback arrived for idea_task ${body.task_id} that hasn't started execution (status=${anyStatusTask.status})`);
+          }
         }
       }
     }
