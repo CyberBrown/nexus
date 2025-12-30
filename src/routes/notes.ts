@@ -247,8 +247,9 @@ notes.get('/', async (c) => {
         }
       }
 
-      // FTS5 query with explicit AND operator for multi-word search
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' AND ') : '';
+      // FTS5 query with implicit AND (space-separated) for multi-word search
+      // Space separation is more reliable than explicit AND in D1's FTS5 implementation
+      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' ') : '';
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)

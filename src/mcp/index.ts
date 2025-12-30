@@ -3548,7 +3548,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Build FTS5 query for multi-word search
         // For single words: use unquoted terms (porter stemmer will normalize)
         // For phrases: quote them to require exact sequence
-        // Use explicit AND operator between terms for maximum compatibility
+        // Use implicit AND (space separation) for maximum D1 FTS5 compatibility
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match words in sequence
@@ -3559,9 +3559,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             return term;
           }
         });
-        // Use explicit AND operator for multi-word search
-        // This is more reliable than space-separated implicit AND in D1 FTS5
-        const ftsQuery = terms.join(' AND ');
+        // Use implicit AND (space-separated terms) for multi-word search
+        // FTS5 treats space-separated terms as implicit AND which is more reliable
+        // than explicit AND operator in D1's FTS5 implementation
+        const ftsQuery = terms.join(' ');
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {
