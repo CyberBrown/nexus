@@ -3485,17 +3485,18 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
         // Prefix queries use raw (pre-tokenized) form, so "validation*" won't match
         // the stemmed "valid" in the index. Let FTS5 handle stemming naturally.
-        // IMPORTANT: Use explicit column prefix "search_text:" for proper FTS5 matching
-        // since the table has note_id (UNINDEXED) and search_text columns
-        const ftsQuery = searchTerms.map(({ term, isPhrase }) => {
+        // FTS5 column filter syntax: "column:(terms)" - NO spaces around colon
+        // Terms are implicitly ANDed when space-separated
+        const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match exactly in sequence
-            return `search_text:"${term}"`;
+            return `"${term}"`;
           } else {
             // Single word - let FTS5 porter stemmer handle matching
-            return `search_text:${term}`;
+            return term;
           }
         }).join(' ');
+        const ftsQuery = `search_text:(${terms})`;
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {

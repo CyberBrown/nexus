@@ -176,13 +176,9 @@ notes.get('/', async (c) => {
         }
       }
 
-      // Use explicit column prefix "search_text:" for proper FTS5 matching
-      const ftsQuery = ftsTerms.map(term => {
-        if (term.startsWith('"') && term.endsWith('"')) {
-          return `search_text:${term}`;
-        }
-        return `search_text:${term}`;
-      }).join(' ');
+      // FTS5 column filter syntax: "column:(terms)" - NO spaces around colon
+      // Terms are implicitly ANDed when space-separated
+      const ftsQuery = ftsTerms.length > 0 ? `search_text:(${ftsTerms.join(' ')})` : '';
 
       if (ftsQuery) {
         // Build conditions
