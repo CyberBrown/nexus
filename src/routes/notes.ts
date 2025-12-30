@@ -214,10 +214,10 @@ notes.get('/', async (c) => {
         if (before) {
           for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
             // Escape special FTS5 characters and lowercase for porter tokenizer
-            const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
+            const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              // Add column prefix for D1 compatibility
-              ftsTerms.push(`search_text:${escaped}`);
+              // No column prefix needed - notes_fts only has one searchable column
+              ftsTerms.push(escaped);
             }
           }
         }
@@ -226,8 +226,8 @@ notes.get('/', async (c) => {
         if (phrase.length > 0) {
           // Escape any quotes within the phrase and lowercase for porter tokenizer
           const escapedPhrase = phrase.replace(/"/g, '').toLowerCase();
-          // Add column prefix for D1 compatibility
-          ftsTerms.push(`search_text:"${escapedPhrase}"`);
+          // Quoted phrase for exact sequence matching
+          ftsTerms.push(`"${escapedPhrase}"`);
         }
         lastIndex = match.index + match[0].length;
       }
@@ -237,10 +237,10 @@ notes.get('/', async (c) => {
       if (remaining) {
         for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
           // Escape special FTS5 characters and lowercase for porter tokenizer
-          const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
+          const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            // Add column prefix for D1 compatibility
-            ftsTerms.push(`search_text:${escaped}`);
+            // No column prefix needed - notes_fts only has one searchable column
+            ftsTerms.push(escaped);
           }
         }
       }

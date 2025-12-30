@@ -3531,16 +3531,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // D1's FTS5 requires explicit column prefix for reliable matching
-        // Space-separated terms are implicitly ANDed in FTS5
+        // In FTS5, space-separated terms are implicitly ANDed
+        // Since notes_fts only has one searchable column (search_text), we don't need column prefixes
+        // Using column prefixes for every term can cause issues in some FTS5 implementations
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match words in exact sequence
-            // Use column prefix for D1 compatibility
-            return `search_text:"${term}"`;
+            return `"${term}"`;
           } else {
-            // Single word with column prefix - porter stemmer will normalize during matching
-            return `search_text:${term}`;
+            // Single word - porter stemmer will normalize during matching
+            // Escape any FTS5 special characters that might cause syntax errors
+            return term.replace(/['"]/g, '');
           }
         });
         // Join with spaces - FTS5 implicitly ANDs space-separated terms
