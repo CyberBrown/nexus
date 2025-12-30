@@ -255,11 +255,12 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query - use explicit AND operator for reliable multi-word matching
-      // D1's FTS5 should support AND operator like standard SQLite FTS5
-      // Example: "mcp validation" becomes "mcp AND validation" (explicit AND)
-      // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
-      const ftsQuery = ftsTerms.join(' AND ');
+      // Build FTS5 query - use space-separated terms for implicit AND matching
+      // In FTS5, space-separated terms are implicitly ANDed together
+      // This is more reliable than explicit AND operators in D1's FTS5
+      // Example: "mcp validation" matches documents containing BOTH terms
+      // Quoted phrases stay quoted: '"exact phrase"' for sequence matching
+      const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
