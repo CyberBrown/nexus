@@ -254,11 +254,13 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query using space-separated terms (implicit AND in FTS5)
-      // SQLite FTS5 treats space-separated terms as implicit AND by default.
-      // Don't use explicit AND or OR operators - they can cause issues with D1.
+      // Build FTS5 query using explicit AND operators for multi-word search
+      // SQLite FTS5 supports explicit AND for reliable multi-term matching.
+      // Using explicit AND is more reliable than implicit (space-separated) in D1.
       // Post-filter ensures all terms match in case FTS behavior differs.
-      const ftsQuery = ftsTerms.join(' ');
+      const ftsQuery = ftsTerms.length > 1
+        ? ftsTerms.join(' AND ')
+        : ftsTerms[0] || '';
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)

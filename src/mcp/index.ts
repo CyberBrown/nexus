@@ -3583,7 +3583,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // D1's FTS5 implementation may not treat space-separated terms as AND by default,
         // so we use explicit AND operators to ensure all terms must match.
         // Post-filter still ensures all terms match after decryption.
-        const ftsQuery = ftsTerms.join(' AND ');
+        const ftsQuery = ftsTerms.length > 1
+          ? ftsTerms.join(' AND ')
+          : ftsTerms[0] || '';
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
