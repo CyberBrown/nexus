@@ -3531,15 +3531,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
               const lowerWord = word.toLowerCase();
               searchTerms.push(lowerWord);
-              // Escape special FTS5 characters and quote single terms for reliable matching
+              // Escape special FTS5 characters - do NOT quote individual terms
+              // D1's FTS5 works better with unquoted terms for simple word matching
               const escaped = lowerWord.replace(/[*^"():'"]/g, '');
               if (escaped.length > 0) {
-                // Quote single terms to ensure literal matching (avoids porter stemmer issues)
-                ftsTerms.push(`"${escaped}"`);
+                ftsTerms.push(escaped);
               }
             }
           }
-          // Add the quoted phrase as a single term
+          // Add the quoted phrase as a single term (for exact sequence matching)
           const phrase = match[1]!.trim().toLowerCase();
           if (phrase.length > 0) {
             searchTerms.push(phrase);
@@ -3556,11 +3556,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
             const lowerWord = word.toLowerCase();
             searchTerms.push(lowerWord);
-            // Escape special FTS5 characters and quote single terms for reliable matching
+            // Escape special FTS5 characters - do NOT quote individual terms
             const escaped = lowerWord.replace(/[*^"():'"]/g, '');
             if (escaped.length > 0) {
-              // Quote single terms to ensure literal matching (avoids porter stemmer issues)
-              ftsTerms.push(`"${escaped}"`);
+              ftsTerms.push(escaped);
             }
           }
         }
@@ -3580,12 +3579,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query with explicit AND operator
-        // D1's FTS5 may not reliably use implicit AND for space-separated terms
-        // Using explicit AND ensures all terms must match
-        // Quoted phrases stay quoted for exact sequence matching
-        // Example: 'mcp AND validation' matches documents containing BOTH terms
-        const ftsQuery = ftsTerms.join(' AND ');
+        // Build FTS5 query - use space separation for implicit AND
+        // D1's FTS5 with sqlite uses implicit AND for space-separated terms
+        // This is simpler and more reliable than explicit AND with quoted terms
+        // Example: 'mcp validation' matches documents containing BOTH terms
+        // Quoted phrases (for exact matching) are already quoted in ftsTerms
+        const ftsQuery = ftsTerms.join(' ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {

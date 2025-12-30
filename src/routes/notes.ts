@@ -198,8 +198,7 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // D1's FTS5 requires explicit AND operator for reliable multi-word matching
-      // Terms are joined with ' AND ' for proper boolean matching
+      // Use space separation for implicit AND - simpler and more reliable with D1
       const ftsTerms: string[] = [];
       const searchTerms: string[] = []; // For post-filtering to ensure all terms match
       const trimmedSearch = search.trim();
@@ -215,10 +214,10 @@ notes.get('/', async (c) => {
         if (before) {
           for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
             // Escape special FTS5 characters and lowercase for porter tokenizer
+            // Do NOT quote individual terms - use implicit AND with space separation
             const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              // Quote single terms for reliable matching (avoids porter stemmer issues)
-              ftsTerms.push(`"${escaped}"`);
+              ftsTerms.push(escaped);
               searchTerms.push(escaped);
             }
           }
@@ -240,10 +239,10 @@ notes.get('/', async (c) => {
       if (remaining) {
         for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
           // Escape special FTS5 characters and lowercase for porter tokenizer
+          // Do NOT quote individual terms - use implicit AND with space separation
           const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            // Quote single terms for reliable matching (avoids porter stemmer issues)
-            ftsTerms.push(`"${escaped}"`);
+            ftsTerms.push(escaped);
             searchTerms.push(escaped);
           }
         }
@@ -255,12 +254,11 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query with explicit AND operator
-      // D1's FTS5 may not reliably use implicit AND for space-separated terms
-      // Using explicit AND ensures all terms must match
-      // Quoted phrases stay quoted for exact sequence matching
-      // Example: 'mcp AND validation' matches documents containing BOTH terms
-      const ftsQuery = ftsTerms.join(' AND ');
+      // Build FTS5 query with space separation for implicit AND
+      // D1's FTS5 uses implicit AND for space-separated terms
+      // Example: 'mcp validation' matches documents containing BOTH terms
+      // Quoted phrases (for exact matching) are already quoted in ftsTerms
+      const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
