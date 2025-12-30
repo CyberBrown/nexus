@@ -3548,7 +3548,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Build FTS5 query for multi-word search
         // For single words: use unquoted terms (porter stemmer will normalize)
         // For phrases: quote them to require exact sequence
-        // D1's FTS5 requires explicit AND operator for multi-word search
+        // FTS5 uses implicit AND - space-separated terms require ALL to match
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match words in sequence
@@ -3559,9 +3559,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             return term;
           }
         });
-        // Use explicit AND operator for multi-word search in D1's FTS5
-        // Implicit AND (space separation) doesn't work reliably in D1
-        const ftsQuery = terms.join(' AND ');
+        // Use implicit AND (space-separated terms) for FTS5 multi-word search
+        // Per SQLite FTS5 docs: "sequences separated by whitespace have implicit AND"
+        // This is the standard approach for matching documents containing ALL terms
+        const ftsQuery = terms.join(' ');
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {

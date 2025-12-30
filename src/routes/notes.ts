@@ -247,9 +247,9 @@ notes.get('/', async (c) => {
         }
       }
 
-      // FTS5 query with explicit AND operator for multi-word search
-      // D1's FTS5 requires explicit AND - implicit AND (space separation) doesn't work reliably
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' AND ') : '';
+      // FTS5 query with implicit AND (space-separated terms) for multi-word search
+      // Per SQLite FTS5 docs: "sequences separated by whitespace have implicit AND"
+      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' ') : '';
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
