@@ -106,9 +106,9 @@ name = "idea-execution-workflow"
 binding = "IDEA_EXECUTION_WORKFLOW"
 class_name = "IdeaExecutionWorkflow"
 
+# v10 - Empty migration to match remote state
 [[migrations]]
-tag = "v9"
-# Empty migration to match remote state
+tag = "v10"
 
 # Cron Triggers
 [triggers]
