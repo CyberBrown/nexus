@@ -255,12 +255,11 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query with explicit AND operators for multi-word search
-      // SQLite FTS5 defaults to OR for space-separated terms, not AND
-      // We use explicit AND to ensure ALL terms must match
-      // Example: "mcp AND validation" matches documents containing BOTH terms
+      // Build FTS5 query with space-separated terms (implicit AND)
+      // SQLite FTS5 treats space-separated terms as implicit AND by default
       // Quoted phrases stay quoted for exact sequence matching
-      const ftsQuery = ftsTerms.join(' AND ');
+      // Example: 'mcp validation' matches documents containing BOTH terms
+      const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
