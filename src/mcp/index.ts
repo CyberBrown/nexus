@@ -3717,15 +3717,21 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // D1's FTS5 has known issues with AND operator - it can silently fail
         // We use OR to get all potentially matching results, then post-filter
         // with matchesAllTerms() to enforce AND semantics in application code
-        // For quoted phrases, we keep them quoted for exact phrase matching
-        const ftsQuery = ftsTerms.map(term => {
-          // Already quoted phrases stay as-is
-          if (term.startsWith('"') && term.endsWith('"')) {
-            return term;
-          }
-          // Single terms don't need wrapping
-          return term;
-        }).join(' OR ');
+        //
+        // FTS5 query syntax notes:
+        // - Use prefix matching (term*) for more forgiving search
+        // - Wrap OR expressions in parentheses for proper parsing
+        // - Use column prefix (search_text:) for explicit column targeting
+        const ftsQuery = ftsTerms.length === 1
+          ? (ftsTerms[0]!.startsWith('"') ? ftsTerms[0] : `${ftsTerms[0]}*`)
+          : '(' + ftsTerms.map(term => {
+              // Quoted phrases stay as-is for exact matching
+              if (term.startsWith('"') && term.endsWith('"')) {
+                return term;
+              }
+              // Add prefix wildcard for more forgiving matching
+              return `${term}*`;
+            }).join(' OR ') + ')';
 
         // STEP 1: FTS5 search (PRIMARY method)
         // Uses OR operator for broad matching, then post-filters for AND semantics

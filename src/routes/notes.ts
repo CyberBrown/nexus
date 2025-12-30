@@ -158,7 +158,20 @@ notes.get('/', async (c) => {
       // D1's FTS5 has known issues with AND operator - it can silently fail
       // We use OR to get all potentially matching results, then post-filter
       // with matchesAllTerms() to enforce AND semantics in application code
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' OR ') : '';
+      //
+      // FTS5 query syntax notes:
+      // - Use prefix matching (term*) for more forgiving search
+      // - Wrap OR expressions in parentheses for proper parsing
+      const ftsQuery = ftsTerms.length === 1
+        ? (ftsTerms[0]!.startsWith('"') ? ftsTerms[0] : `${ftsTerms[0]}*`)
+        : ftsTerms.length > 0
+          ? '(' + ftsTerms.map(term => {
+              if (term.startsWith('"') && term.endsWith('"')) {
+                return term;
+              }
+              return `${term}*`;
+            }).join(' OR ') + ')'
+          : '';
 
       if (ftsQuery) {
         // Build conditions
