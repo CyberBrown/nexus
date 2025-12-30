@@ -3403,8 +3403,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
         // Convert search query to FTS5 format
-        // FTS5 uses implicit AND for multiple terms when properly formatted
-        // Use prefix matching (word*) for individual terms, exact phrases for quoted strings
+        // FTS5 uses implicit AND when terms are space-separated
+        // Use "word"* syntax for prefix matching (asterisk OUTSIDE quotes)
         const ftsTerms: string[] = [];
         const trimmedQuery = query.trim();
 
@@ -3419,10 +3419,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (before) {
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
               // Escape special FTS5 characters and use prefix matching
-              // FTS5 prefix syntax is: word* (no quotes around the word)
+              // FTS5 prefix syntax: "word"* (asterisk outside quotes)
               const escaped = word.replace(/[*^"():]/g, '');
               if (escaped.length > 0) {
-                ftsTerms.push(`${escaped}*`);
+                ftsTerms.push(`"${escaped}"*`);
               }
             }
           }
@@ -3441,15 +3441,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         if (remaining) {
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
             // Escape special FTS5 characters and use prefix matching
+            // FTS5 prefix syntax: "word"* (asterisk outside quotes)
             const escaped = word.replace(/[*^"():]/g, '');
             if (escaped.length > 0) {
-              ftsTerms.push(`${escaped}*`);
+              ftsTerms.push(`"${escaped}"*`);
             }
           }
         }
 
-        // Join with AND for explicit boolean query
-        const ftsQuery = ftsTerms.join(' AND ');
+        // Join with space for implicit AND (FTS5 treats space-separated terms as AND)
+        const ftsQuery = ftsTerms.join(' ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
