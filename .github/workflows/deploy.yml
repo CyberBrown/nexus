@@ -24,6 +24,7 @@ jobs:
 
       - name: Apply D1 Migrations
         uses: cloudflare/wrangler-action@v3
+        continue-on-error: true
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           command: d1 migrations apply nexus-db --remote
