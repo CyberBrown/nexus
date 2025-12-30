@@ -197,11 +197,10 @@ notes.get('/', async (c) => {
         // Table check/creation failed, will fall back to in-memory search
       }
 
-      // Convert search query to FTS5 format
-      // FTS5 uses implicit AND when terms are space-separated
+      // Convert search query to FTS5 format with explicit AND operator
+      // D1's FTS5 implementation may not reliably handle implicit AND with space-separated terms
+      // Using explicit AND ensures all terms must match
       // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
-      // Prefix queries use raw (pre-tokenized) form, so "validation*" won't match
-      // the stemmed "valid" in the index. Let FTS5 handle stemming naturally.
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -246,9 +245,8 @@ notes.get('/', async (c) => {
         }
       }
 
-      // FTS5 query: space-separated terms are implicitly ANDed
-      // Since notes_fts only has one indexed column (search_text), no column filter needed
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' ') : '';
+      // FTS5 query with explicit AND operator for reliable multi-word search
+      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' AND ') : '';
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)

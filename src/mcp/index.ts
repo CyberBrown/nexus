@@ -3545,14 +3545,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query - AND all terms together
-        // For phrases, use double quotes; for single words, just the word
-        // FTS5 uses implicit AND between terms
+        // Build FTS5 query - AND all terms together using explicit AND operator
+        // D1's FTS5 implementation may not reliably handle implicit AND with space-separated terms
+        // Using explicit AND ensures all terms must match
         // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
-        // Prefix queries use raw (pre-tokenized) form, so "validation*" won't match
-        // the stemmed "valid" in the index. Let FTS5 handle stemming naturally.
-        // FTS5 column filter syntax: "column:(terms)" - NO spaces around colon
-        // Terms are implicitly ANDed when space-separated
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match exactly in sequence
@@ -3561,9 +3557,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             // Single word - let FTS5 porter stemmer handle matching
             return term;
           }
-        }).join(' ');
-        // FTS5 query: space-separated terms are implicitly ANDed
-        // Since notes_fts only has one indexed column (search_text), no column filter needed
+        }).join(' AND ');
+        // FTS5 query with explicit AND operator for reliable multi-word search
         const ftsQuery = terms;
 
         // Helper to check if all search terms match in a text (for fallback)
