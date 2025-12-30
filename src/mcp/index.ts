@@ -3470,7 +3470,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // FTS5 uses implicit AND for space-separated terms
         // Note: "AND" is NOT a valid FTS5 operator - it would be treated as a literal term
-        const ftsQuery = ftsTerms.join(' ');
+        // Prefix each term with column name to ensure D1/FTS5 compatibility
+        // Format: search_text:term OR search_text:"phrase with spaces"
+        const ftsQuery = ftsTerms.map(t => `search_text:${t}`).join(' ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
