@@ -3517,10 +3517,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_search_notes - Search notes using FTS5 full-text search
-  // PRIMARY: Use FTS5 with space-separated terms (implicit AND semantics)
-  // FALLBACK: LIKE-based search if FTS5 fails
-  // FTS5 with porter stemming handles multi-word queries like "MCP validation" correctly
+  // Tool: nexus_search_notes - Search notes using LIKE-based search on search_text column
+  // PRIMARY: LIKE search with AND conditions for multi-word queries (most reliable in D1)
+  // FALLBACK: Full table scan with decryption if search_text is not populated
+  // The search_text column stores lowercase plaintext for searching encrypted notes
   server.tool(
     'nexus_search_notes',
     'Search notes by title, content, or tags. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
@@ -3537,7 +3537,6 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Parse search terms - handle quoted phrases and individual words
         const searchTerms: string[] = [];
-        const ftsTerms: string[] = []; // For FTS5 query
         const phraseRegex = /"([^"]+)"/g;
         let lastIndex = 0;
         let match: RegExpExecArray | null;
@@ -3550,7 +3549,6 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
               if (escaped.length > 0) {
                 searchTerms.push(escaped);
-                ftsTerms.push(escaped);
               }
             }
           }
@@ -3559,8 +3557,6 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (phrase.length > 0) {
             const escapedPhrase = phrase.replace(/"/g, '');
             searchTerms.push(escapedPhrase);
-            // FTS5 phrase query with double quotes
-            ftsTerms.push(`"${escapedPhrase}"`);
           }
           lastIndex = match.index + match[0].length;
         }
@@ -3572,7 +3568,6 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
             if (escaped.length > 0) {
               searchTerms.push(escaped);
-              ftsTerms.push(escaped);
             }
           }
         }
@@ -3680,42 +3675,34 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           console.error('[nexus_search_notes] FTS setup/rebuild error (will continue to fallback):', err);
         }
 
-        // PRIMARY SEARCH: FTS5 full-text search
-        // FTS5 uses implicit AND for space-separated terms by default
-        // We use prefix matching (term*) for better recall on partial matches
-        // Post-filter with matchesAllTerms() ensures exact term presence
+        // PRIMARY SEARCH: LIKE-based search on search_text column
+        // This is the most reliable method for multi-word AND queries in D1
+        // The search_text column contains lowercased plaintext (title + content + tags)
+        // LIKE with multiple AND conditions properly handles multi-word queries
         try {
-          // Build FTS5 query: space-separated terms for AND semantics (FTS5 default)
-          // Use prefix matching for better partial word matching
-          const ftsQuery = ftsTerms.map(term => {
-            if (term.startsWith('"') && term.endsWith('"')) {
-              // Quoted phrase - use as-is for exact phrase matching
-              return term;
-            }
-            // Add prefix wildcard for partial matching
-            return `${term}*`;
-          }).join(' ');
+          const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
+          const likeBindings = searchTerms.map(term => `%${term}%`);
 
-          console.log(`[nexus_search_notes] FTS5 search (AND with prefix): query="${ftsQuery}", terms=[${searchTerms.join(', ')}]`);
+          console.log(`[nexus_search_notes] LIKE search: terms=[${searchTerms.join(', ')}]`);
 
-          const ftsResults = await env.DB.prepare(`
-            SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
-            FROM notes n
-            INNER JOIN notes_fts f ON f.note_id = n.id
-            WHERE f.search_text MATCH ?
-              AND n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+          const likeResults = await env.DB.prepare(`
+            SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at
+            FROM notes
+            WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+              AND search_text IS NOT NULL AND search_text != ''
+              AND (${likeConditions})
               ${archivedCondition}
-            ORDER BY n.pinned DESC, n.created_at DESC
+            ORDER BY pinned DESC, created_at DESC
             LIMIT ?
-          `).bind(ftsQuery, tenantId, userId, maxLimit * 2).all();
+          `).bind(tenantId, userId, ...likeBindings, maxLimit * 2).all();
 
-          console.log(`[nexus_search_notes] FTS5 search returned ${ftsResults.results?.length || 0} results`);
+          console.log(`[nexus_search_notes] LIKE search returned ${likeResults.results?.length || 0} results`);
 
-          if (ftsResults.results && ftsResults.results.length > 0) {
-            searchMethod = 'fts5';
+          if (likeResults.results && likeResults.results.length > 0) {
+            searchMethod = 'like';
             const foundIds = new Set<string>();
 
-            for (const note of ftsResults.results as Array<{
+            for (const note of likeResults.results as Array<{
               id: string;
               title: string | null;
               content: string | null;
@@ -3755,79 +3742,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }
           }
         } catch (err: any) {
-          console.error('[nexus_search_notes] FTS5 search failed:', err);
-          searchMethod = `fts5_error: ${err.message || String(err)}`;
+          console.error('[nexus_search_notes] LIKE search failed:', err);
+          searchMethod = `like_error: ${err.message || String(err)}`;
         }
 
-        // FALLBACK: LIKE-based search if FTS5 returned no results (regardless of error status)
-        // This ensures LIKE search runs even when FTS5 table is missing or corrupted
-        if (matchingNotes.length === 0) {
-          try {
-            const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
-            const likeBindings = searchTerms.map(term => `%${term}%`);
-
-            console.log(`[nexus_search_notes] LIKE fallback: terms=[${searchTerms.join(', ')}]`);
-            const likeResults = await env.DB.prepare(`
-              SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at
-              FROM notes
-              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-                AND search_text IS NOT NULL AND search_text != ''
-                AND (${likeConditions})
-                ${archivedCondition}
-              ORDER BY pinned DESC, created_at DESC
-              LIMIT ?
-            `).bind(tenantId, userId, ...likeBindings, maxLimit * 2).all();
-
-            console.log(`[nexus_search_notes] LIKE fallback returned ${likeResults.results?.length || 0} results`);
-            if (likeResults.results && likeResults.results.length > 0) {
-              searchMethod = 'like_fallback';
-              const foundIds = new Set<string>();
-
-              for (const note of likeResults.results as Array<{
-                id: string;
-                title: string | null;
-                content: string | null;
-                category: string;
-                tags: string | null;
-                source_type: string | null;
-                pinned: number;
-                archived_at: string | null;
-                created_at: string;
-              }>) {
-                if (foundIds.has(note.id)) continue;
-
-                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-                const tagsText = note.tags ? String(note.tags) : '';
-
-                const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
-                if (!matchesAllTerms(combinedText)) continue;
-
-                matchingNotes.push({
-                  id: note.id,
-                  title: decryptedTitle,
-                  content_preview: decryptedContent
-                    ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
-                    : '',
-                  category: note.category,
-                  tags: note.tags,
-                  source_type: note.source_type,
-                  pinned: note.pinned === 1,
-                  archived: !!note.archived_at,
-                  created_at: note.created_at,
-                });
-                foundIds.add(note.id);
-
-                if (matchingNotes.length >= maxLimit) break;
-              }
-            }
-          } catch (err: any) {
-            console.error('[nexus_search_notes] LIKE fallback failed:', err);
-            searchMethod = `${searchMethod}+like_error`;
-          }
-        }
-
-        // FINAL FALLBACK: Full scan with decryption if FTS5 and LIKE both failed
+        // FALLBACK: Full scan with decryption if LIKE search failed or found nothing
         // This handles cases where search_text is not populated for some notes
         if (matchingNotes.length === 0 && searchTerms.length > 0) {
           try {
