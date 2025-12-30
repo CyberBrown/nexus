@@ -3597,14 +3597,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query using explicit AND operators for multi-word search
-        // D1's FTS5 implementation uses OR by default for space-separated terms,
-        // so we must use explicit AND with column targeting for reliable multi-term matching.
-        // Format: search_text:(term1 AND term2) - this matches the notes route implementation.
-        // Post-filter still ensures all terms match after decryption.
-        const ftsQuery = ftsTerms.length > 1
-          ? `search_text:(${ftsTerms.join(' AND ')})`
-          : ftsTerms[0] || '';
+        // Build FTS5 query for multi-word search
+        // D1's FTS5 requires explicit AND operators for reliable multi-word matching
+        // Space-separated terms may not work consistently across D1 implementations
+        // Use: "term1" AND "term2" for reliable conjunction queries
+        const ftsQuery = ftsTerms.length > 0
+          ? ftsTerms.map(term => term.startsWith('"') ? term : `"${term}"`).join(' AND ')
+          : '';
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {

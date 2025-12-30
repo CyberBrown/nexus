@@ -254,13 +254,13 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query using explicit AND operators for multi-word search
-      // D1's FTS5 implementation requires explicit column targeting with parentheses
-      // for reliable multi-term AND matching. Format: search_text:(term1 AND term2)
-      // Post-filter ensures all terms match in case FTS behavior differs.
-      const ftsQuery = ftsTerms.length > 1
-        ? `search_text:(${ftsTerms.join(' AND ')})`
-        : ftsTerms[0] || '';
+      // Build FTS5 query for multi-word search
+      // D1's FTS5 requires explicit AND operators for reliable multi-word matching
+      // Space-separated terms may not work consistently across D1 implementations
+      // Use: "term1" AND "term2" for reliable conjunction queries
+      const ftsQuery = ftsTerms.length > 0
+        ? ftsTerms.map(term => term.startsWith('"') ? term : `"${term}"`).join(' AND ')
+        : '';
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
