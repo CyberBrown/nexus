@@ -3580,9 +3580,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Build FTS5 query - terms separated by space are implicitly ANDed in FTS5
         // No column prefix needed since notes_fts has only one searchable column (search_text)
-        // Wrap each term in parentheses to ensure proper grouping for multi-word search
-        // Example: "mcp validation" becomes "(mcp) (validation)"
-        const ftsQuery = ftsTerms.map(term => `(${term})`).join(' ');
+        // Use simple space-separated terms for implicit AND
+        // Example: "mcp validation" becomes "mcp validation"
+        // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
+        const ftsQuery = ftsTerms.join(' ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
@@ -3623,6 +3624,58 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                   tokenize='porter unicode61'
                 )
               `).run();
+            }
+
+            // Auto-populate FTS index from notes that have search_text but are missing from FTS
+            // This handles notes created before FTS was set up or after schema migration
+            try {
+              const missingFromFts = await env.DB.prepare(`
+                SELECT n.id, n.search_text FROM notes n
+                LEFT JOIN notes_fts f ON n.id = f.note_id
+                WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+                  AND n.search_text IS NOT NULL AND n.search_text != ''
+                  AND f.note_id IS NULL
+                LIMIT 100
+              `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
+
+              if (missingFromFts.results && missingFromFts.results.length > 0) {
+                for (const note of missingFromFts.results) {
+                  try {
+                    await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                      .bind(note.id, note.search_text).run();
+                  } catch {
+                    // Ignore duplicates
+                  }
+                }
+              }
+            } catch {
+              // Auto-populate failed, continue with search
+            }
+
+            // Fix stale FTS entries (from old migration 0017 that indexed encrypted content)
+            try {
+              const staleFtsEntries = await env.DB.prepare(`
+                SELECT n.id, n.search_text FROM notes n
+                INNER JOIN notes_fts f ON n.id = f.note_id
+                WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+                  AND n.search_text IS NOT NULL AND n.search_text != ''
+                  AND f.search_text != n.search_text
+                LIMIT 50
+              `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
+
+              if (staleFtsEntries.results && staleFtsEntries.results.length > 0) {
+                for (const note of staleFtsEntries.results) {
+                  try {
+                    await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                    await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                      .bind(note.id, note.search_text).run();
+                  } catch {
+                    // Ignore errors
+                  }
+                }
+              }
+            } catch {
+              // Stale fix failed, continue with search
             }
 
             // Use FTS5 MATCH with subquery for reliable multi-word search

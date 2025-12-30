@@ -246,9 +246,10 @@ notes.get('/', async (c) => {
       }
 
       // Build FTS5 query - space-separated terms are implicitly ANDed in FTS5
-      // Wrap each term in parentheses to ensure proper grouping for multi-word search
-      // Example: "mcp validation" becomes "(mcp) (validation)"
-      const ftsQuery = ftsTerms.map((term: string) => `(${term})`).join(' ');
+      // Use simple space-separated terms for implicit AND
+      // Example: "mcp validation" becomes "mcp validation"
+      // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
+      const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
