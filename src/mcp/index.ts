@@ -3662,7 +3662,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
                   AND n.search_text IS NOT NULL AND n.search_text != ''
                   AND f.search_text != n.search_text
-                LIMIT 50
+                LIMIT 100
               `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
 
               if (staleFtsEntries.results && staleFtsEntries.results.length > 0) {
@@ -3681,7 +3681,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }
 
             // Auto-populate search_text for notes missing it (created before migration 0018)
-            // This decrypts notes and builds search_text for FTS indexing
+            // This builds search_text from plaintext title/content/tags (encryption is disabled)
             try {
               const notesMissingSearchText = await env.DB.prepare(`
                 SELECT n.id, n.title, n.content, n.tags FROM notes n
@@ -3689,7 +3689,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
                   AND (n.search_text IS NULL OR n.search_text = '')
                   AND f.note_id IS NULL
-                LIMIT 20
+                LIMIT 100
               `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
 
               if (notesMissingSearchText.results && notesMissingSearchText.results.length > 0) {

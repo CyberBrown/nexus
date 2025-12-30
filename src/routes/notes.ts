@@ -86,7 +86,7 @@ notes.get('/', async (c) => {
           WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
             AND n.search_text IS NOT NULL AND n.search_text != ''
             AND f.search_text != n.search_text
-          LIMIT 50
+          LIMIT 100
         `).bind(tenantId, userId).all<{ id: string; search_text: string; fts_text: string }>();
 
         if (notesWithMismatchedFts.results && notesWithMismatchedFts.results.length > 0) {
@@ -155,7 +155,7 @@ notes.get('/', async (c) => {
           INNER JOIN notes_fts f ON n.id = f.note_id
           WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
             AND (n.search_text IS NULL OR n.search_text = '')
-          LIMIT 50
+          LIMIT 100
         `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
 
         if (notesInFtsWithoutSearchText.results && notesInFtsWithoutSearchText.results.length > 0) {
