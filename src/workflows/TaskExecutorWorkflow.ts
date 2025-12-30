@@ -216,21 +216,31 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
       const isDispatched = result.output?.startsWith('DISPATCHED:');
 
       // Determine status: dispatched tasks stay in 'dispatched' state until callback
-      // IMPORTANT: Even if result.success is true, we MUST validate the output doesn't contain
-      // failure indicators. This is a secondary check to catch edge cases where the AI "succeeds"
-      // but actually reports it couldn't complete the task. This matches the validation in the
-      // /workflow-callback handler in index.ts (lines 1674-1687).
+      // IMPORTANT: Even if result.success is true, we MUST validate:
+      // 1. The output doesn't contain failure indicators (AI says "I couldn't find...")
+      // 2. The output has substantial content (not just a short error message)
+      // This matches the validation in /workflow-callback handler in index.ts (lines 1674-1687).
       let newStatus: string;
       if (isDispatched) {
         newStatus = 'dispatched';
       } else if (result.success) {
-        // Secondary validation: check if "successful" output actually contains failure indicators
-        // This catches cases where executeWithClaude returned success but the content indicates failure
+        // Secondary validation #1: check for failure indicators in output
         const hasFailureIndicators = result.output ? containsFailureIndicators(result.output) : false;
+
+        // Secondary validation #2: check for minimum output length (short outputs are usually errors)
+        // A real task completion should have substantial output (>100 chars for research/planning tasks)
+        const hasSubstantialOutput = result.output && result.output.trim().length >= 100;
+
         if (hasFailureIndicators) {
           console.log(`Task ${task_id} marked success but output contains failure indicators - marking as failed`);
+          console.log(`Failure indicator output preview: ${result.output?.substring(0, 300)}`);
           newStatus = 'failed';
-          result.success = false; // Update result object to reflect actual failure
+          result.success = false;
+        } else if (!hasSubstantialOutput) {
+          console.log(`Task ${task_id} marked success but output is too short (${result.output?.length || 0} chars) - marking as failed`);
+          console.log(`Short output: ${result.output}`);
+          newStatus = 'failed';
+          result.success = false;
         } else {
           newStatus = 'completed';
         }
