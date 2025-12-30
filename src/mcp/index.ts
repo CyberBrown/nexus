@@ -3546,6 +3546,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             ORDER BY pinned DESC, created_at DESC
           `).bind(tenantId, userId).all();
 
+          // Track diagnostic info for debugging
+          let notesWithSearchText = 0;
+          let notesWithoutSearchText = 0;
+
           // Helper to check if all search terms match
           const matchesAllTerms = (text: string): boolean => {
             return searchTerms.every(({ term, isPhrase }) => {
@@ -3566,6 +3570,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             let decryptedContent: string;
 
             if (note.search_text) {
+              notesWithSearchText++;
               searchableText = (note.search_text as string).toLowerCase();
               // Only decrypt if we match (optimization for when search_text exists)
               if (!matchesAllTerms(searchableText)) {
@@ -3574,6 +3579,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
               decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
             } else {
+              notesWithoutSearchText++;
               // search_text is NULL - decrypt and search against actual content
               decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
               decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
@@ -3617,11 +3623,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               }]
             };
           }
-        }
 
-        // If still no results, provide diagnostic information
-        if (matchingNotes.length === 0) {
-          // Extract cleaned search terms for debug output
+          // If still no results, provide diagnostic information
           const debugTerms = ftsTerms.map(t => t.replace(/\*$/, '').replace(/^"/, '').replace(/"$/, '').toLowerCase());
           return {
             content: [{
@@ -3635,8 +3638,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 debug: {
                   fts_returned_zero: true,
                   fallback_checked: true,
+                  total_notes_checked: fallbackNotes.results?.length || 0,
+                  notes_with_search_text: notesWithSearchText,
+                  notes_without_search_text: notesWithoutSearchText,
                   search_terms: debugTerms,
-                  hint: 'No notes found matching all search terms. Try fewer/different terms or run nexus_rebuild_notes_fts to rebuild the search index.',
+                  hint: notesWithSearchText === 0 && notesWithoutSearchText > 0
+                    ? 'No notes have search_text populated. Run nexus_rebuild_notes_fts to rebuild the search index.'
+                    : 'No notes found matching all search terms. Try fewer/different terms or check if notes exist with these terms.',
                 },
               }, null, 2)
             }]

@@ -41,7 +41,8 @@ notes.get('/', async (c) => {
           for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
             // Escape special FTS5 characters and use prefix matching
             // FTS5 prefix syntax: word* (no quotes for prefix search)
-            const escaped = word.replace(/[*^"():]/g, '');
+            // MUST lowercase because porter tokenizer normalizes to lowercase
+            const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
               ftsTerms.push(`${escaped}*`);
             }
@@ -50,8 +51,8 @@ notes.get('/', async (c) => {
         // Add the quoted phrase (exact match, no prefix)
         const phrase = match[1]!.trim();
         if (phrase.length > 0) {
-          // Escape any quotes within the phrase
-          const escapedPhrase = phrase.replace(/"/g, '');
+          // Escape any quotes within the phrase and lowercase for porter tokenizer
+          const escapedPhrase = phrase.replace(/"/g, '').toLowerCase();
           ftsTerms.push(`"${escapedPhrase}"`);
         }
         lastIndex = match.index + match[0].length;
@@ -63,7 +64,8 @@ notes.get('/', async (c) => {
         for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
           // Escape special FTS5 characters and use prefix matching
           // FTS5 prefix syntax: word* (no quotes for prefix search)
-          const escaped = word.replace(/[*^"():]/g, '');
+          // MUST lowercase because porter tokenizer normalizes to lowercase
+          const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
           if (escaped.length > 0) {
             ftsTerms.push(`${escaped}*`);
           }
