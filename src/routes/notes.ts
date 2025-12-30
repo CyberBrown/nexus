@@ -25,19 +25,46 @@ notes.get('/', async (c) => {
   if (search && search.trim()) {
     try {
       // Convert search query to FTS5 format
-      const ftsQuery = search
-        .trim()
-        .split(/\s+/)
-        .filter((term: string) => term.length > 0)
-        .map((term: string) => {
-          if (term.startsWith('"') || term.endsWith('"')) {
-            return term;
+      // Properly handle quoted phrases vs individual words
+      const ftsTerms: string[] = [];
+      const trimmedSearch = search.trim();
+
+      // Extract quoted phrases first, then handle remaining words
+      const phraseRegex = /"([^"]+)"/g;
+      let lastIndex = 0;
+      let match: RegExpExecArray | null;
+
+      while ((match = phraseRegex.exec(trimmedSearch)) !== null) {
+        // Handle any words before this quoted phrase
+        const before = trimmedSearch.slice(lastIndex, match.index).trim();
+        if (before) {
+          for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
+            const escaped = word.replace(/[*^"]/g, '');
+            if (escaped.length > 0) {
+              ftsTerms.push(`"${escaped}"*`);
+            }
           }
-          const escaped = term.replace(/[*^]/g, '');
-          return escaped.length > 0 ? `"${escaped}"*` : '';
-        })
-        .filter((term: string) => term.length > 0)
-        .join(' ');
+        }
+        // Add the quoted phrase (exact match, no prefix)
+        const phrase = match[1]!.trim();
+        if (phrase.length > 0) {
+          ftsTerms.push(`"${phrase}"`);
+        }
+        lastIndex = match.index + match[0].length;
+      }
+
+      // Handle any remaining words after the last quoted phrase
+      const remaining = trimmedSearch.slice(lastIndex).trim();
+      if (remaining) {
+        for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
+          const escaped = word.replace(/[*^"]/g, '');
+          if (escaped.length > 0) {
+            ftsTerms.push(`"${escaped}"*`);
+          }
+        }
+      }
+
+      const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
         // Build conditions

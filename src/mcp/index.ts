@@ -3403,23 +3403,47 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
         // Convert search query to FTS5 format
-        // FTS5 uses AND by default for multiple terms, quotes work for phrases
-        const ftsQuery = query
-          .trim()
-          .split(/\s+/)
-          .filter(term => term.length > 0)
-          .map(term => {
-            // Check if it's a quoted phrase (keep quotes)
-            if (term.startsWith('"') || term.endsWith('"')) {
-              return term;
+        // FTS5 uses AND by default for multiple terms
+        // Properly handle quoted phrases vs individual words
+        const ftsTerms: string[] = [];
+        const trimmedQuery = query.trim();
+
+        // Extract quoted phrases first, then handle remaining words
+        const phraseRegex = /"([^"]+)"/g;
+        let lastIndex = 0;
+        let match: RegExpExecArray | null;
+
+        while ((match = phraseRegex.exec(trimmedQuery)) !== null) {
+          // Handle any words before this quoted phrase
+          const before = trimmedQuery.slice(lastIndex, match.index).trim();
+          if (before) {
+            for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
+              const escaped = word.replace(/[*^"]/g, '');
+              if (escaped.length > 0) {
+                ftsTerms.push(`"${escaped}"*`);
+              }
             }
-            // For individual words, wrap for prefix matching
-            // Escape any special FTS5 characters
-            const escaped = term.replace(/[*^]/g, '');
-            return escaped.length > 0 ? `"${escaped}"*` : '';
-          })
-          .filter(term => term.length > 0)
-          .join(' ');
+          }
+          // Add the quoted phrase (exact match, no prefix)
+          const phrase = match[1]!.trim();
+          if (phrase.length > 0) {
+            ftsTerms.push(`"${phrase}"`);
+          }
+          lastIndex = match.index + match[0].length;
+        }
+
+        // Handle any remaining words after the last quoted phrase
+        const remaining = trimmedQuery.slice(lastIndex).trim();
+        if (remaining) {
+          for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
+            const escaped = word.replace(/[*^"]/g, '');
+            if (escaped.length > 0) {
+              ftsTerms.push(`"${escaped}"*`);
+            }
+          }
+        }
+
+        const ftsQuery = ftsTerms.join(' ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
