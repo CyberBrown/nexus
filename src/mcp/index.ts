@@ -96,6 +96,7 @@ const WRITE_TOOLS = new Set([
   'nexus_update_note',
   'nexus_delete_note',
   'nexus_archive_note',
+  'nexus_rebuild_notes_fts',
   // Queue tools
   'nexus_claim_queue_task',
   'nexus_complete_queue_task',
@@ -2988,9 +2989,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const encryptedTitle = await encryptField(title, encryptionKey);
         const encryptedContent = content ? await encryptField(content, encryptionKey) : null;
 
+        // Build plaintext search_text for FTS indexing (title + content + tags)
+        const searchText = [title, content || '', tags || ''].join(' ').trim();
+
         await env.DB.prepare(`
-          INSERT INTO notes (id, tenant_id, user_id, title, content, category, tags, source_type, source_reference, source_context, pinned, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO notes (id, tenant_id, user_id, title, content, category, tags, source_type, source_reference, source_context, pinned, search_text, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
           id,
           tenantId,
@@ -3003,9 +3007,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           source_reference || null,
           source_context || null,
           pinned ? 1 : 0,
+          searchText,
           now,
           now
         ).run();
+
+        // Insert into FTS5 index for full-text search
+        await env.DB.prepare(`
+          INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
+        `).bind(id, searchText).run();
 
         return {
           content: [{
@@ -3184,10 +3194,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       const { note_id, title, content, category, tags, pinned } = args;
 
       try {
-        // Check note exists
+        // Get existing note with current values for search_text rebuild
         const existing = await env.DB.prepare(`
-          SELECT id FROM notes WHERE id = ? AND tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-        `).bind(note_id, tenantId, userId).first();
+          SELECT id, title, content, tags FROM notes WHERE id = ? AND tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+        `).bind(note_id, tenantId, userId).first<{ id: string; title: string; content: string | null; tags: string | null }>();
 
         if (!existing) {
           return {
@@ -3201,13 +3211,25 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const updates: string[] = ['updated_at = ?'];
         const bindings: unknown[] = [now];
 
+        // Track plaintext values for rebuilding search_text
+        // Decrypt existing values if not being updated
+        let plaintextTitle = title;
+        let plaintextContent = content;
+        let plaintextTags = tags;
+
         if (title !== undefined) {
           updates.push('title = ?');
           bindings.push(await encryptField(title, encryptionKey));
+        } else {
+          // Decrypt existing title
+          plaintextTitle = await decryptField(existing.title, encryptionKey);
         }
         if (content !== undefined) {
           updates.push('content = ?');
           bindings.push(content ? await encryptField(content, encryptionKey) : null);
+        } else {
+          // Decrypt existing content
+          plaintextContent = existing.content ? await decryptField(existing.content, encryptionKey) : null;
         }
         if (category !== undefined) {
           updates.push('category = ?');
@@ -3216,10 +3238,23 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         if (tags !== undefined) {
           updates.push('tags = ?');
           bindings.push(tags);
+        } else {
+          plaintextTags = existing.tags;
         }
         if (pinned !== undefined) {
           updates.push('pinned = ?');
           bindings.push(pinned ? 1 : 0);
+        }
+
+        // Rebuild search_text if title, content, or tags changed
+        if (title !== undefined || content !== undefined || tags !== undefined) {
+          const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim();
+          updates.push('search_text = ?');
+          bindings.push(searchText);
+
+          // Update FTS index
+          await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
+          await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(note_id, searchText).run();
         }
 
         bindings.push(note_id, tenantId);
@@ -3277,6 +3312,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         await env.DB.prepare(`
           UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ?
         `).bind(now, now, note_id, tenantId).run();
+
+        // Remove from FTS index on delete
+        await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
 
         return {
           content: [{
@@ -3362,6 +3400,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     },
     async ({ query, limit, include_archived }): Promise<CallToolResult> => {
       try {
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
         // Convert search query to FTS5 format
         // FTS5 uses AND by default for multiple terms, quotes work for phrases
         const ftsQuery = query
@@ -3399,12 +3439,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Build archived condition
         const archivedCondition = include_archived ? '' : 'AND n.archived_at IS NULL';
 
-        // Use FTS5 MATCH query with JOIN to get full note data
+        // Use FTS5 MATCH query with JOIN on note_id to get full note data
         // Filter by tenant/user and non-deleted
         const notes = await env.DB.prepare(`
           SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
           FROM notes n
-          INNER JOIN notes_fts fts ON n.rowid = fts.rowid
+          INNER JOIN notes_fts fts ON n.id = fts.note_id
           WHERE fts.notes_fts MATCH ?
             AND n.tenant_id = ?
             AND n.user_id = ?
@@ -3414,19 +3454,26 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           LIMIT ?
         `).bind(ftsQuery, tenantId, userId, limit || 20).all();
 
-        const matchingNotes = notes.results.map(note => ({
-          id: note.id,
-          title: note.title || '',
-          content_preview: note.content
-            ? (note.content as string).substring(0, 200) + ((note.content as string).length > 200 ? '...' : '')
-            : '',
-          category: note.category,
-          tags: note.tags,
-          source_type: note.source_type,
-          pinned: note.pinned === 1,
-          archived: !!note.archived_at,
-          created_at: note.created_at,
-        }));
+        // Decrypt and format results
+        const matchingNotes = [];
+        for (const note of notes.results) {
+          const decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
+          const decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
+
+          matchingNotes.push({
+            id: note.id,
+            title: decryptedTitle,
+            content_preview: decryptedContent
+              ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+              : '',
+            category: note.category,
+            tags: note.tags,
+            source_type: note.source_type,
+            pinned: note.pinned === 1,
+            archived: !!note.archived_at,
+            created_at: note.created_at,
+          });
+        }
 
         return {
           content: [{
@@ -3441,8 +3488,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }]
         };
       } catch (error: any) {
-        // Fallback to LIKE-based search if FTS5 fails (e.g., migration not applied yet)
+        // Fallback to search_text column if FTS5 fails (e.g., migration not applied yet)
         if (error.message?.includes('no such table') || error.message?.includes('notes_fts')) {
+          const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
           // Parse search terms for fallback
           const searchTerms: string[] = [];
           const quotedRegex = /"([^"]+)"/g;
@@ -3468,9 +3517,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             };
           }
 
-          // Build query - optionally include archived notes
+          // Build query using search_text column - optionally include archived notes
           let sqlQuery = `
-            SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at
+            SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
             FROM notes
             WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
           `;
@@ -3483,14 +3532,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           const matchingNotes = [];
           for (const note of notes.results) {
-            const tagsText = note.tags ? String(note.tags).toLowerCase() : '';
-            const searchableText = `${note.title || ''} ${note.content || ''} ${tagsText}`.toLowerCase();
+            // Use search_text for matching (plaintext)
+            const searchableText = (note.search_text as string || '').toLowerCase();
             if (searchTerms.every(term => searchableText.includes(term))) {
+              const decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
+              const decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
+
               matchingNotes.push({
                 id: note.id,
-                title: note.title || '',
-                content_preview: note.content
-                  ? (note.content as string).substring(0, 200) + ((note.content as string).length > 200 ? '...' : '')
+                title: decryptedTitle,
+                content_preview: decryptedContent
+                  ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
                   : '',
                 category: note.category,
                 tags: note.tags,
@@ -3520,6 +3572,93 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         return {
           content: [{ type: 'text', text: `Error searching notes: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool: nexus_rebuild_notes_fts - Rebuild FTS5 index for all notes
+  server.tool(
+    'nexus_rebuild_notes_fts',
+    'Rebuild the FTS5 full-text search index for all notes. Use this after database migrations or if search returns incomplete results. Decrypts notes and populates the search index.',
+    {
+      passphrase: passphraseSchema,
+    },
+    async (args): Promise<CallToolResult> => {
+      const authError = validatePassphrase('nexus_rebuild_notes_fts', args, env.WRITE_PASSPHRASE);
+      if (authError) return authError;
+
+      try {
+        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
+        // Get all non-deleted notes for this tenant/user
+        const notes = await env.DB.prepare(`
+          SELECT id, title, content, tags
+          FROM notes
+          WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+        `).bind(tenantId, userId).all<{
+          id: string;
+          title: string | null;
+          content: string | null;
+          tags: string | null;
+        }>();
+
+        // Clear existing FTS entries for this user's notes
+        await env.DB.prepare(`
+          DELETE FROM notes_fts WHERE note_id IN (
+            SELECT id FROM notes WHERE tenant_id = ? AND user_id = ?
+          )
+        `).bind(tenantId, userId).run();
+
+        // Rebuild FTS index
+        let indexed = 0;
+        let errors = 0;
+        const errorDetails: string[] = [];
+
+        for (const note of notes.results || []) {
+          try {
+            // Decrypt fields
+            const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+            const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+            const tags = note.tags || '';
+
+            // Build search text
+            const searchText = [decryptedTitle, decryptedContent, tags].join(' ').trim();
+
+            // Update notes table search_text column
+            await env.DB.prepare(`
+              UPDATE notes SET search_text = ? WHERE id = ?
+            `).bind(searchText, note.id).run();
+
+            // Insert into FTS index
+            await env.DB.prepare(`
+              INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
+            `).bind(note.id, searchText).run();
+
+            indexed++;
+          } catch (err: any) {
+            errors++;
+            errorDetails.push(`Note ${note.id}: ${err.message}`);
+          }
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              total_notes: notes.results?.length || 0,
+              indexed,
+              errors,
+              error_details: errorDetails.length > 0 ? errorDetails.slice(0, 10) : undefined,
+              message: `FTS index rebuilt. ${indexed} notes indexed, ${errors} errors.`,
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: 'text', text: `Error rebuilding FTS index: ${error.message}` }],
           isError: true
         };
       }

@@ -66,7 +66,7 @@ notes.get('/', async (c) => {
         const result = await c.env.DB.prepare(`
           SELECT n.*
           FROM notes n
-          INNER JOIN notes_fts fts ON n.rowid = fts.rowid
+          INNER JOIN notes_fts fts ON n.id = fts.note_id
           WHERE fts.notes_fts MATCH ?
             AND n.tenant_id = ?
             AND n.user_id = ?
@@ -196,7 +196,10 @@ notes.post('/', async (c) => {
   const key = await getEncryptionKey(c.env.KV, tenantId);
   const id = crypto.randomUUID();
 
-  const note: Partial<Note> = {
+  // Build plaintext search_text for FTS indexing
+  const searchText = [validated.title, validated.content || '', validated.tags || ''].join(' ').trim();
+
+  const note: Partial<Note> & { search_text?: string } = {
     id,
     tenant_id: tenantId,
     user_id: userId,
@@ -209,10 +212,14 @@ notes.post('/', async (c) => {
     source_context: validated.source_context ?? null,
     pinned: validated.pinned ? 1 : 0,
     archived_at: null,
+    search_text: searchText,
   };
 
   const encrypted = await encryptFields(note, ENCRYPTED_FIELDS, key);
   await insert(c.env.DB, 'notes', encrypted);
+
+  // Insert into FTS5 index for full-text search
+  await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(id, searchText).run();
 
   return c.json({ success: true, data: { id } }, 201);
 });
@@ -233,7 +240,7 @@ notes.patch('/:id', async (c) => {
 
   const key = await getEncryptionKey(c.env.KV, tenantId);
 
-  const updates: Partial<Note> = {};
+  const updates: Partial<Note> & { search_text?: string } = {};
 
   if (validated.title !== undefined) updates.title = validated.title;
   if (validated.content !== undefined) updates.content = validated.content;
@@ -244,6 +251,29 @@ notes.patch('/:id', async (c) => {
   if (validated.source_context !== undefined) updates.source_context = validated.source_context;
   if (validated.pinned !== undefined) updates.pinned = validated.pinned ? 1 : 0;
   if (validated.archived_at !== undefined) updates.archived_at = validated.archived_at;
+
+  // If title, content, or tags changed, rebuild search_text and update FTS
+  if (validated.title !== undefined || validated.content !== undefined || validated.tags !== undefined) {
+    const { decryptField } = await import('../lib/encryption.ts');
+
+    // Get current plaintext values for fields not being updated
+    const plaintextTitle = validated.title !== undefined
+      ? validated.title
+      : await decryptField(existing.title, key);
+    const plaintextContent = validated.content !== undefined
+      ? validated.content
+      : (existing.content ? await decryptField(existing.content, key) : null);
+    const plaintextTags = validated.tags !== undefined
+      ? validated.tags
+      : existing.tags;
+
+    const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim();
+    updates.search_text = searchText;
+
+    // Update FTS index
+    await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
+    await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(id, searchText).run();
+  }
 
   if (Object.keys(updates).length > 0) {
     const encrypted = await encryptFields(updates, ENCRYPTED_FIELDS, key);
@@ -265,6 +295,9 @@ notes.delete('/:id', async (c) => {
   }
 
   await softDelete(c.env.DB, 'notes', id, { tenantId });
+
+  // Remove from FTS index on delete
+  await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
 
   return c.json({ success: true, data: { id } });
 });
