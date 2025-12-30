@@ -77,6 +77,52 @@ notes.get('/', async (c) => {
             }
           }
         }
+
+        // Also handle notes WITHOUT search_text - need to decrypt and populate
+        const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
+        const notesWithoutSearchText = await c.env.DB.prepare(`
+          SELECT n.id, n.title, n.content, n.tags FROM notes n
+          LEFT JOIN notes_fts f ON n.id = f.note_id
+          WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+            AND (n.search_text IS NULL OR n.search_text = '')
+            AND f.note_id IS NULL
+        `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
+
+        if (notesWithoutSearchText.results && notesWithoutSearchText.results.length > 0) {
+          // Decrypt and populate FTS index for notes missing search_text
+          for (const note of notesWithoutSearchText.results) {
+            try {
+              // Try to decrypt - if it fails, use raw value (for non-encrypted notes)
+              let decryptedTitle = '';
+              let decryptedContent = '';
+              try {
+                const { decryptField } = await import('../lib/encryption.ts');
+                decryptedTitle = note.title ? await decryptField(note.title, encryptionKey) : '';
+                decryptedContent = note.content ? await decryptField(note.content, encryptionKey) : '';
+              } catch {
+                // Decryption failed - use raw values
+                decryptedTitle = note.title || '';
+                decryptedContent = note.content || '';
+              }
+              const tagsText = note.tags ? String(note.tags) : '';
+
+              // Build search_text (lowercase for FTS case sensitivity)
+              const searchText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.trim().toLowerCase();
+
+              if (searchText) {
+                // Update notes table with search_text
+                await c.env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                  .bind(searchText, note.id).run();
+
+                // Insert into FTS index
+                await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                  .bind(note.id, searchText).run();
+              }
+            } catch {
+              // Ignore errors for individual notes
+            }
+          }
+        }
       } catch {
         // Table check/creation failed, will fall back to in-memory search
       }

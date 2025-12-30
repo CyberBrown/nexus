@@ -3479,6 +3479,42 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               }
             }
           }
+
+          // Also handle notes WITHOUT search_text - need to decrypt and populate
+          const notesWithoutSearchText = await env.DB.prepare(`
+            SELECT n.id, n.title, n.content, n.tags FROM notes n
+            LEFT JOIN notes_fts f ON n.id = f.note_id
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND (n.search_text IS NULL OR n.search_text = '')
+              AND f.note_id IS NULL
+          `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
+
+          if (notesWithoutSearchText.results && notesWithoutSearchText.results.length > 0) {
+            // Decrypt and populate FTS index for notes missing search_text
+            for (const note of notesWithoutSearchText.results) {
+              try {
+                // Decrypt title and content
+                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                const tagsText = note.tags ? String(note.tags) : '';
+
+                // Build search_text (lowercase for FTS case sensitivity)
+                const searchText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.trim().toLowerCase();
+
+                if (searchText) {
+                  // Update notes table with search_text
+                  await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                    .bind(searchText, note.id).run();
+
+                  // Insert into FTS index
+                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                    .bind(note.id, searchText).run();
+                }
+              } catch {
+                // Ignore errors for individual notes
+              }
+            }
+          }
         } catch {
           // Table check/creation failed, will fall back to search_text column
         }
@@ -3533,16 +3569,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // FTS5 uses implicit AND for space-separated terms
-        // Note: "AND" is NOT a valid FTS5 operator - it would be treated as a literal term
-        // Use explicit column prefix "search_text:" for clarity and to avoid issues with UNINDEXED columns
-        // Each term gets the column prefix to ensure proper matching
-        const ftsQuery = ftsTerms.map(term => {
-          // Quoted phrases keep their quotes, others get column prefix
-          if (term.startsWith('"') && term.endsWith('"')) {
-            return `search_text:${term}`;
-          }
-          return `search_text:${term}`;
-        }).join(' ');
+        // Since notes_fts only has one indexed column (search_text), we can use simple
+        // space-separated terms without column prefixes. This is more reliable than
+        // prefixing each term individually.
+        // Example: "mcp validation" becomes "mcp validation" (implicit AND)
+        // Example: '"exact phrase"' stays as '"exact phrase"'
+        const ftsQuery = ftsTerms.join(' ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
