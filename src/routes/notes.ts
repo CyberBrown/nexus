@@ -155,7 +155,8 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query with AND semantics (FTS5 default for space-separated terms)
-      // Use prefix matching (term*) for better partial word matching
+      // IMPORTANT: Do NOT use prefix wildcards (term*) with porter stemmer - it breaks matching
+      // The porter stemmer handles word variations automatically (e.g., "validate" matches "validation")
       // Post-filter with matchesAllTerms() ensures exact term presence in decrypted content
       const ftsQuery = ftsTerms.length > 0
         ? ftsTerms.map(term => {
@@ -163,8 +164,8 @@ notes.get('/', async (c) => {
               // Quoted phrase - use as-is for exact phrase matching
               return term;
             }
-            // Add prefix wildcard for partial matching
-            return `${term}*`;
+            // No prefix wildcard - porter stemmer handles word variations
+            return term;
           }).join(' ')
         : '';
 

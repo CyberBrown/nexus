@@ -3679,10 +3679,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // PRIMARY SEARCH: FTS5 MATCH query for efficient multi-word search
         // Uses the notes_fts virtual table with porter stemming for word matching
-        // FTS5 uses implicit AND for space-separated terms (each term with prefix wildcard)
+        // FTS5 uses implicit AND for space-separated terms (no prefix wildcards with porter)
         try {
-          // Build FTS5 query: each term with prefix wildcard for partial matching
-          // FTS5 uses implicit AND for space-separated terms - do NOT use explicit AND with prefix matching
+          // Build FTS5 query: space-separated terms = implicit AND
+          // IMPORTANT: Do NOT use prefix wildcards (term*) with porter stemmer - it breaks matching
+          // The porter stemmer handles word variations automatically (e.g., "validate" matches "validation")
           // For quoted phrases, keep them as exact phrase matches
           const ftsQuery = searchTerms
             .map(term => {
@@ -3692,8 +3693,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 // Quoted phrase - wrap in quotes for exact phrase matching
                 return `"${cleaned}"`;
               }
-              // Add prefix wildcard for partial matching (e.g., "valid" matches "validation")
-              return `${cleaned}*`;
+              // No prefix wildcard - porter stemmer handles word variations
+              return cleaned;
             })
             .join(' ');  // Space-separated = implicit AND in FTS5
 
