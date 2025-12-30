@@ -3404,7 +3404,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Convert search query to FTS5 format
         // FTS5 uses implicit AND when terms are space-separated
-        // Use "word"* syntax for prefix matching (asterisk OUTSIDE quotes)
+        // Use word* for prefix matching (no quotes around individual terms)
         const ftsTerms: string[] = [];
         const trimmedQuery = query.trim();
 
@@ -3419,10 +3419,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (before) {
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
               // Escape special FTS5 characters and use prefix matching
-              // FTS5 prefix syntax: "word"* (asterisk outside quotes)
+              // FTS5 prefix syntax: word* (no quotes for prefix search)
               const escaped = word.replace(/[*^"():]/g, '');
               if (escaped.length > 0) {
-                ftsTerms.push(`"${escaped}"*`);
+                ftsTerms.push(`${escaped}*`);
               }
             }
           }
@@ -3441,10 +3441,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         if (remaining) {
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
             // Escape special FTS5 characters and use prefix matching
-            // FTS5 prefix syntax: "word"* (asterisk outside quotes)
+            // FTS5 prefix syntax: word* (no quotes for prefix search)
             const escaped = word.replace(/[*^"():]/g, '');
             if (escaped.length > 0) {
-              ftsTerms.push(`"${escaped}"*`);
+              ftsTerms.push(`${escaped}*`);
             }
           }
         }
