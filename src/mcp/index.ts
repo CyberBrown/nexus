@@ -3698,6 +3698,59 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               // Stale fix failed, continue with search
             }
 
+            // Fix notes with corrupted search_text (contains encrypted garbage from migration 0021)
+            // Encrypted data is base64-encoded and typically starts with specific patterns
+            // or contains unusual character distributions. We detect and rebuild these.
+            try {
+              const notesWithSearchText = await env.DB.prepare(`
+                SELECT n.id, n.title, n.content, n.tags, n.search_text FROM notes n
+                WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+                  AND n.search_text IS NOT NULL AND n.search_text != ''
+                LIMIT 50
+              `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null; search_text: string }>();
+
+              if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
+                for (const note of notesWithSearchText.results) {
+                  try {
+                    // Check if search_text looks like encrypted data
+                    // Encrypted base64 typically has high entropy and unusual patterns
+                    // Check for: base64-like patterns, non-ASCII characters, or very long single "words"
+                    const searchText = note.search_text;
+                    const hasBase64Pattern = /^[A-Za-z0-9+/=]{20,}/.test(searchText.split(' ')[0] || '');
+                    const hasNonAscii = /[^\x20-\x7E\n\t]/.test(searchText);
+                    const firstWord = searchText.split(/\s+/)[0] || '';
+                    const hasVeryLongWord = firstWord.length > 50 && !/\s/.test(firstWord);
+
+                    const looksEncrypted = hasBase64Pattern || hasNonAscii || hasVeryLongWord;
+
+                    if (looksEncrypted) {
+                      // Rebuild search_text from decrypted content
+                      const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                      const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                      const tags = note.tags || '';
+
+                      const newSearchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
+
+                      if (newSearchText && newSearchText !== searchText) {
+                        // Update notes table with correct search_text
+                        await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                          .bind(newSearchText, note.id).run();
+
+                        // Update FTS index
+                        await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                        await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                          .bind(note.id, newSearchText).run();
+                      }
+                    }
+                  } catch {
+                    // Ignore errors for individual notes
+                  }
+                }
+              }
+            } catch {
+              // Encrypted garbage fix failed, continue with search
+            }
+
             // Auto-populate search_text for notes missing it (created before migration 0018)
             // This builds search_text from plaintext title/content/tags (encryption is disabled)
             try {
