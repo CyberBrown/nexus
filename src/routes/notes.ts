@@ -197,9 +197,10 @@ notes.get('/', async (c) => {
         // Table check/creation failed, will fall back to in-memory search
       }
 
-      // Convert search query to FTS5 format with implicit AND (space-separated quoted terms)
-      // Each term is quoted to ensure proper tokenization with porter stemmer
-      // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
+      // Convert search query to FTS5 format
+      // For single words: use unquoted terms (porter stemmer will normalize)
+      // For phrases: quote them to require exact sequence
+      // Use explicit AND operator between terms for maximum compatibility
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -213,16 +214,16 @@ notes.get('/', async (c) => {
         const before = trimmedSearch.slice(lastIndex, match.index).trim();
         if (before) {
           for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
-            // Escape special FTS5 characters, no prefix matching
+            // Escape special FTS5 characters
             // MUST lowercase because porter tokenizer normalizes to lowercase
             const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              // Quote single terms to ensure proper parsing
-              ftsTerms.push(`"${escaped}"`);
+              // Unquoted single words - porter stemmer will normalize
+              ftsTerms.push(escaped);
             }
           }
         }
-        // Add the quoted phrase (exact match)
+        // Add the quoted phrase (exact sequence match)
         const phrase = match[1]!.trim();
         if (phrase.length > 0) {
           // Escape any quotes within the phrase and lowercase for porter tokenizer
@@ -236,18 +237,18 @@ notes.get('/', async (c) => {
       const remaining = trimmedSearch.slice(lastIndex).trim();
       if (remaining) {
         for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
-          // Escape special FTS5 characters, no prefix matching
+          // Escape special FTS5 characters
           // MUST lowercase because porter tokenizer normalizes to lowercase
           const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            // Quote single terms to ensure proper parsing
-            ftsTerms.push(`"${escaped}"`);
+            // Unquoted single words - porter stemmer will normalize
+            ftsTerms.push(escaped);
           }
         }
       }
 
-      // FTS5 query with implicit AND (space-separated quoted terms)
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' ') : '';
+      // FTS5 query with explicit AND operator for multi-word search
+      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' AND ') : '';
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
