@@ -3591,6 +3591,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let ftsMatchCount = 0;
         let fallbackMatchCount = 0;
         let ftsSchemaFixed = false;
+        let totalNotesScanned = 0;
+        let ftsIndexCount = 0;
         const maxLimit = limit || 20;
 
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
@@ -3650,6 +3652,30 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }
           }
 
+          // Also fix notes that ARE in FTS but with mismatched/stale search_text
+          // This handles corrupted FTS entries from old migration 0017 that indexed encrypted content
+          const notesWithMismatchedFts = await env.DB.prepare(`
+            SELECT n.id, n.search_text, f.search_text as fts_text FROM notes n
+            INNER JOIN notes_fts f ON n.id = f.note_id
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND n.search_text IS NOT NULL AND n.search_text != ''
+              AND f.search_text != n.search_text
+            LIMIT 50
+          `).bind(tenantId, userId).all<{ id: string; search_text: string; fts_text: string }>();
+
+          if (notesWithMismatchedFts.results && notesWithMismatchedFts.results.length > 0) {
+            for (const note of notesWithMismatchedFts.results) {
+              try {
+                // Update FTS with correct search_text
+                await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                  .bind(note.id, note.search_text).run();
+              } catch {
+                // Ignore errors
+              }
+            }
+          }
+
           // Find notes WITHOUT search_text - decrypt and populate both columns
           const notesWithoutSearchText = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.tags FROM notes n
@@ -3691,6 +3717,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Try FTS5 search first
         try {
+          // First, count how many notes are in the FTS index for this user
+          try {
+            const ftsCountResult = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes_fts
+              WHERE note_id IN (SELECT id FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL)
+            `).bind(tenantId, userId).first<{ cnt: number }>();
+            ftsIndexCount = ftsCountResult?.cnt || 0;
+          } catch {
+            // FTS table might not exist
+          }
+
           // Note: Use same query structure as notes route for consistency
           // FTS5 MATCH uses the table name directly (notes_fts), not an alias
           const ftsResults = await env.DB.prepare(`
@@ -3752,6 +3789,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               ORDER BY pinned DESC, created_at DESC
             `).bind(tenantId, userId).all();
           }
+
+          totalNotesScanned = allNotes.results?.length || 0;
 
           for (const note of (allNotes.results || []) as Array<{
             id: string;
@@ -3841,7 +3880,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           notes: matchingNotes,
         };
 
-        // Add debug info
+        // Always include search method info for debugging
         if (usedFts && ftsMatchCount > 0) {
           response.search_method = 'fts5';
         } else if (fallbackMatchCount > 0) {
@@ -3850,6 +3889,22 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             response.hint = 'FTS5 schema was auto-repaired. Run nexus_rebuild_notes_fts to populate the full-text index for faster searches.';
           } else {
             response.hint = 'Run nexus_rebuild_notes_fts to enable faster FTS5 search.';
+          }
+        } else if (matchingNotes.length === 0) {
+          // No results - provide diagnostic info
+          response.search_method = usedFts ? 'fts5_empty' : 'fallback_empty';
+          response.debug = {
+            fts_attempted: usedFts,
+            fts_schema_fixed: ftsSchemaFixed,
+            fts_index_count: ftsIndexCount,
+            total_notes_scanned: totalNotesScanned,
+          };
+          if (ftsIndexCount === 0 && totalNotesScanned > 0) {
+            response.hint = 'FTS index is empty but notes exist. Run nexus_rebuild_notes_fts to rebuild the search index.';
+          } else if (totalNotesScanned === 0) {
+            response.hint = 'No notes found for this user.';
+          } else {
+            response.hint = 'No matching notes found. Search terms may not appear in any notes, or try running nexus_rebuild_notes_fts.';
           }
         }
 

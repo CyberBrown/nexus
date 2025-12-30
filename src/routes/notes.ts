@@ -78,6 +78,30 @@ notes.get('/', async (c) => {
           }
         }
 
+        // Also fix notes that ARE in FTS but with mismatched/stale search_text
+        // This handles corrupted FTS entries from old migration 0017 that indexed encrypted content
+        const notesWithMismatchedFts = await c.env.DB.prepare(`
+          SELECT n.id, n.search_text, f.search_text as fts_text FROM notes n
+          INNER JOIN notes_fts f ON n.id = f.note_id
+          WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+            AND n.search_text IS NOT NULL AND n.search_text != ''
+            AND f.search_text != n.search_text
+          LIMIT 50
+        `).bind(tenantId, userId).all<{ id: string; search_text: string; fts_text: string }>();
+
+        if (notesWithMismatchedFts.results && notesWithMismatchedFts.results.length > 0) {
+          for (const note of notesWithMismatchedFts.results) {
+            try {
+              // Update FTS with correct search_text
+              await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+              await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                .bind(note.id, note.search_text).run();
+            } catch {
+              // Ignore errors
+            }
+          }
+        }
+
         // Also handle notes WITHOUT search_text - need to decrypt and populate
         const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
         const notesWithoutSearchText = await c.env.DB.prepare(`
