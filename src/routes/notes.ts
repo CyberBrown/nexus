@@ -255,11 +255,13 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query for multi-word search
-      // Use implicit AND (space-separated terms) - this is standard SQLite FTS5 behavior
-      // Space-separated terms are ANDed together: "mcp validation" matches both terms
-      // We still post-filter to ensure exact matching since FTS5 uses porter stemming
+      // CRITICAL: Use OR to get broad results, then post-filter for AND semantics
+      // D1's FTS5 implementation has INCONSISTENT behavior with implicit AND
+      // (space-separated terms). Some queries work, others silently return 0 results.
+      // By using OR, we reliably get all notes containing ANY term, then filter in code.
+      // This is the ONLY reliable approach for multi-word search in D1's FTS5.
       const ftsQuery = ftsTerms.length > 0
-        ? ftsTerms.join(' ')
+        ? ftsTerms.join(' OR ')
         : '';
 
       if (ftsQuery) {

@@ -3598,11 +3598,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // Use implicit AND (space-separated terms) - this is standard SQLite FTS5 behavior
-        // Space-separated terms are ANDed together: "mcp validation" matches both terms
-        // We still post-filter to ensure exact matching since FTS5 uses porter stemming
+        // CRITICAL: Use OR to get broad results, then post-filter for AND semantics
+        // D1's FTS5 implementation has INCONSISTENT behavior with implicit AND
+        // (space-separated terms). Some queries work, others silently return 0 results.
+        // By using OR, we reliably get all notes containing ANY term, then filter in code.
+        // This is the ONLY reliable approach for multi-word search in D1's FTS5.
         const ftsQuery = ftsTerms.length > 0
-          ? ftsTerms.join(' ')
+          ? ftsTerms.join(' OR ')
           : '';
 
         // Helper to check if all search terms match in a text
@@ -3698,9 +3700,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               // Stale fix failed, continue with search
             }
 
-            // Fix notes with corrupted search_text (contains encrypted garbage from migration 0021)
-            // Encrypted data is base64-encoded and typically starts with specific patterns
-            // or contains unusual character distributions. We detect and rebuild these.
+            // Fix notes with corrupted/stale search_text by comparing against actual decrypted content
+            // This catches: encrypted garbage, outdated content, partial updates, etc.
+            // Compare decrypted title substring against search_text - if mismatch, rebuild
             try {
               const notesWithSearchText = await env.DB.prepare(`
                 SELECT n.id, n.title, n.content, n.tags, n.search_text FROM notes n
@@ -3712,35 +3714,29 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
                 for (const note of notesWithSearchText.results) {
                   try {
-                    // Check if search_text looks like encrypted data
-                    // Encrypted base64 typically has high entropy and unusual patterns
-                    // Check for: base64-like patterns, non-ASCII characters, or very long single "words"
-                    const searchText = note.search_text;
-                    const hasBase64Pattern = /^[A-Za-z0-9+/=]{20,}/.test(searchText.split(' ')[0] || '');
-                    const hasNonAscii = /[^\x20-\x7E\n\t]/.test(searchText);
-                    const firstWord = searchText.split(/\s+/)[0] || '';
-                    const hasVeryLongWord = firstWord.length > 50 && !/\s/.test(firstWord);
+                    // Decrypt actual content
+                    const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                    const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                    const tags = note.tags || '';
 
-                    const looksEncrypted = hasBase64Pattern || hasNonAscii || hasVeryLongWord;
+                    // Build expected search_text from decrypted content
+                    const expectedSearchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
 
-                    if (looksEncrypted) {
-                      // Rebuild search_text from decrypted content
-                      const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-                      const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-                      const tags = note.tags || '';
+                    // Check if current search_text actually contains the decrypted content
+                    // If the title doesn't appear in search_text, it's corrupted
+                    const searchTextLower = note.search_text.toLowerCase();
+                    const titleLower = decryptedTitle.toLowerCase().substring(0, 20);  // Check first 20 chars
+                    const isCorrupted = titleLower.length > 0 && !searchTextLower.includes(titleLower);
 
-                      const newSearchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
+                    if (isCorrupted && expectedSearchText) {
+                      // Update notes table with correct search_text
+                      await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                        .bind(expectedSearchText, note.id).run();
 
-                      if (newSearchText && newSearchText !== searchText) {
-                        // Update notes table with correct search_text
-                        await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
-                          .bind(newSearchText, note.id).run();
-
-                        // Update FTS index
-                        await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
-                        await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                          .bind(note.id, newSearchText).run();
-                      }
+                      // Update FTS index
+                      await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                      await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                        .bind(note.id, expectedSearchText).run();
                     }
                   } catch {
                     // Ignore errors for individual notes
@@ -3826,11 +3822,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
                 const tagsText = note.tags ? String(note.tags) : '';
 
-                // Post-filter FTS5 results to ensure exact term matching
-                // FTS5 uses porter stemming so "validation" matches "valid" - we want exact matches
+                // Post-filter FTS5 results to enforce AND semantics
+                // FTS5 query uses OR for broad matching; this ensures ALL search terms match.
+                // Also handles porter stemming (e.g., "validation" matches "valid") by doing exact substring checks.
                 const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
                 if (!matchesAllTerms(combinedText)) {
-                  continue; // Skip notes that don't match all terms
+                  continue; // Skip notes that don't contain ALL search terms
                 }
 
                 matchingNotes.push({
