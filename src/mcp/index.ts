@@ -3578,12 +3578,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query - terms separated by space are implicitly ANDed in FTS5
-        // No column prefix needed since notes_fts has only one searchable column (search_text)
-        // Use simple space-separated terms for implicit AND
-        // Example: "mcp validation" becomes "mcp validation"
+        // Build FTS5 query - use explicit AND operator for reliable multi-word matching in D1
+        // D1's FTS5 can be inconsistent with implicit AND (space-separated terms)
+        // Using explicit AND ensures all terms must match
+        // Example: "mcp validation" becomes "mcp AND validation"
         // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
-        const ftsQuery = ftsTerms.join(' ');
+        const ftsQuery = ftsTerms.join(' AND ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
@@ -3676,6 +3676,47 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               }
             } catch {
               // Stale fix failed, continue with search
+            }
+
+            // Auto-populate search_text for notes missing it (created before migration 0018)
+            // This decrypts notes and builds search_text for FTS indexing
+            try {
+              const notesMissingSearchText = await env.DB.prepare(`
+                SELECT n.id, n.title, n.content, n.tags FROM notes n
+                LEFT JOIN notes_fts f ON n.id = f.note_id
+                WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+                  AND (n.search_text IS NULL OR n.search_text = '')
+                  AND f.note_id IS NULL
+                LIMIT 20
+              `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
+
+              if (notesMissingSearchText.results && notesMissingSearchText.results.length > 0) {
+                for (const note of notesMissingSearchText.results) {
+                  try {
+                    // Decrypt fields
+                    const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                    const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                    const tags = note.tags || '';
+
+                    // Build search text - MUST lowercase for D1's case-sensitive FTS5
+                    const searchTextValue = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
+
+                    if (searchTextValue) {
+                      // Update notes table with search_text
+                      await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                        .bind(searchTextValue, note.id).run();
+
+                      // Insert into FTS index
+                      await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                        .bind(note.id, searchTextValue).run();
+                    }
+                  } catch {
+                    // Ignore errors for individual notes
+                  }
+                }
+              }
+            } catch {
+              // Auto-populate failed, continue with search
             }
 
             // Use FTS5 MATCH with subquery for reliable multi-word search

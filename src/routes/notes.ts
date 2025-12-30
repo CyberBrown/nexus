@@ -245,11 +245,12 @@ notes.get('/', async (c) => {
         }
       }
 
-      // Build FTS5 query - space-separated terms are implicitly ANDed in FTS5
-      // Use simple space-separated terms for implicit AND
-      // Example: "mcp validation" becomes "mcp validation"
+      // Build FTS5 query - use explicit AND operator for reliable multi-word matching in D1
+      // D1's FTS5 can be inconsistent with implicit AND (space-separated terms)
+      // Using explicit AND ensures all terms must match
+      // Example: "mcp validation" becomes "mcp AND validation"
       // Quoted phrases stay quoted: "exact phrase" becomes '"exact phrase"'
-      const ftsQuery = ftsTerms.join(' ');
+      const ftsQuery = ftsTerms.join(' AND ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
