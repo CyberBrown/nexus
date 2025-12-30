@@ -420,19 +420,28 @@ execution.post('/tasks/:id/complete', async (c) => {
   const body = await c.req.json<{ result?: string }>();
   const now = new Date().toISOString();
 
+  // SECURITY: Require result with minimum length when completing tasks
+  // This prevents marking tasks complete without evidence of work done
+  if (!body.result || body.result.trim().length < 50) {
+    throw new AppError(
+      `Task completion rejected - result is required (minimum 50 characters). ` +
+      `Provide a summary of the work completed to validate task completion.`,
+      400,
+      'RESULT_REQUIRED'
+    );
+  }
+
   // Validate that the result doesn't contain failure indicators
   // This catches false completions where the user says "completed" but the result
   // indicates the work wasn't actually done (e.g., "couldn't find the file...")
-  if (body.result) {
-    const matchedIndicator = findFailureIndicator(body.result);
-    if (matchedIndicator) {
-      throw new AppError(
-        `Task completion rejected - result indicates task was not actually completed. ` +
-        `Detected phrase: "${matchedIndicator}". Mark task as failed instead, or ensure deliverables are present before completing.`,
-        400,
-        'FALSE_COMPLETION_DETECTED'
-      );
-    }
+  const matchedIndicator = findFailureIndicator(body.result);
+  if (matchedIndicator) {
+    throw new AppError(
+      `Task completion rejected - result indicates task was not actually completed. ` +
+      `Detected phrase: "${matchedIndicator}". Mark task as failed instead, or ensure deliverables are present before completing.`,
+      400,
+      'FALSE_COMPLETION_DETECTED'
+    );
   }
 
   // Encrypt result if provided

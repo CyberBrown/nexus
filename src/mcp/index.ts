@@ -2395,24 +2395,40 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
       try {
         // Validate completion_notes when marking as completed
+        // SECURITY: completion_notes are REQUIRED when marking complete (same validation as nexus_complete_task)
         if (status === 'completed') {
-          if (completion_notes) {
-            const matchedIndicator = findFailureIndicator(completion_notes);
-            if (matchedIndicator) {
-              console.log(`nexus_update_task rejected - completion_notes contain failure indicator: "${matchedIndicator}"`);
-              return {
-                content: [{
-                  type: 'text',
-                  text: JSON.stringify({
-                    success: false,
-                    error: 'Task update rejected - completion notes indicate task was not actually completed',
-                    detected_indicator: matchedIndicator,
-                    hint: 'Do not mark as completed unless work was actually done. Use status "cancelled" if the task cannot be done.',
-                  }, null, 2)
-                }],
-                isError: true
-              };
-            }
+          // Check 1: Require completion_notes with minimum length
+          if (!completion_notes || completion_notes.trim().length < 50) {
+            console.log(`nexus_update_task rejected - completion_notes missing or too short (${completion_notes?.length || 0} chars)`);
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: 'Task update rejected - completion_notes are required when marking as completed (minimum 50 characters)',
+                  hint: 'Provide a summary of the work completed. This is required to validate task completion.',
+                }, null, 2)
+              }],
+              isError: true
+            };
+          }
+
+          // Check 2: Validate no failure indicators in notes
+          const matchedIndicator = findFailureIndicator(completion_notes);
+          if (matchedIndicator) {
+            console.log(`nexus_update_task rejected - completion_notes contain failure indicator: "${matchedIndicator}"`);
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: 'Task update rejected - completion notes indicate task was not actually completed',
+                  detected_indicator: matchedIndicator,
+                  hint: 'Do not mark as completed unless work was actually done. Use status "cancelled" if the task cannot be done.',
+                }, null, 2)
+              }],
+              isError: true
+            };
           }
         }
 
@@ -3531,9 +3547,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // In FTS5, space-separated terms are implicitly ANDed
-        // Since notes_fts only has one searchable column (search_text), we don't need column prefixes
-        // Using column prefixes for every term can cause issues in some FTS5 implementations
+        // Use explicit AND operator for reliable multi-term matching in D1's FTS5
+        // Space-separated terms should be implicitly ANDed, but explicit AND is more reliable
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match words in exact sequence
@@ -3544,8 +3559,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             return term.replace(/['"]/g, '');
           }
         });
-        // Join with spaces - FTS5 implicitly ANDs space-separated terms
-        const ftsQuery = terms.join(' ');
+        // Join with explicit AND operator for reliable multi-word matching
+        // This is more reliable than implicit space-separated ANDing in some FTS5 implementations
+        const ftsQuery = terms.join(' AND ');
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {
@@ -4459,6 +4475,23 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         const executorType = existing.executor_type;
+
+        // SECURITY: For successful completions, require result with minimum length
+        // This prevents marking tasks complete without evidence of work done
+        if (!hasError && (!args.result || args.result.trim().length < 50)) {
+          console.log(`nexus_complete_queue_task: result too short (${args.result?.length || 0} chars) for queue ${queueId}`);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: 'Task completion rejected - result is required (minimum 50 characters)',
+                hint: 'Provide a summary of the work completed. This is required to validate task completion.',
+              }, null, 2)
+            }],
+            isError: true
+          };
+        }
 
         // Check for false positive success - AI reported success but result contains failure indicators
         // This prevents tasks being marked complete when the result says "I couldn't find..." or similar
