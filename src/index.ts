@@ -1377,10 +1377,29 @@ app.post('/api/tasks/:id/complete', async (c) => {
 
     const now = new Date().toISOString();
 
-    // Find the task
-    const task = await c.env.DB.prepare(`
+    // Find the task - check both 'tasks' and 'idea_tasks' tables
+    // idea_tasks are created by TaskExecutorWorkflow for idea execution
+    // FIX: Previously only checked 'tasks' table, causing 404 for idea_tasks
+    // which meant DE's reportToNexus would fail silently and skip validation
+    let task = await c.env.DB.prepare(`
       SELECT id, tenant_id, user_id, status FROM tasks WHERE id = ? AND deleted_at IS NULL
     `).bind(taskId).first<{ id: string; tenant_id: string; user_id: string; status: string }>();
+
+    let isIdeaTask = false;
+    let ideaId: string | null = null;
+    if (!task) {
+      // Try idea_tasks table - these are tasks generated from idea execution
+      const ideaTask = await c.env.DB.prepare(`
+        SELECT id, tenant_id, user_id, status, idea_id FROM idea_tasks WHERE id = ? AND deleted_at IS NULL
+      `).bind(taskId).first<{ id: string; tenant_id: string; user_id: string; status: string; idea_id: string }>();
+
+      if (ideaTask) {
+        task = ideaTask;
+        isIdeaTask = true;
+        ideaId = ideaTask.idea_id;
+        console.log(`Task ${taskId} found in idea_tasks table (idea: ${ideaId})`);
+      }
+    }
 
     if (!task) {
       return c.json({ success: false, error: 'Task not found' }, 404);
@@ -1411,24 +1430,65 @@ app.post('/api/tasks/:id/complete', async (c) => {
       console.log(`Task ${taskId} complete callback rejected - notes contain failure indicator: "${matchedIndicator}"`);
       console.log(`Notes preview: ${resultText.substring(0, 200)}`);
 
-      // Update task to failed instead of completed
-      await c.env.DB.prepare(`
-        UPDATE tasks SET status = 'next', updated_at = ? WHERE id = ?
-      `).bind(now, taskId).run();
+      // Update task to failed instead of completed - handle both task types
+      if (isIdeaTask) {
+        await c.env.DB.prepare(`
+          UPDATE idea_tasks SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?
+        `).bind(`False completion detected: ${matchedIndicator}`, now, taskId).run();
+
+        // Update idea_executions failed count
+        if (ideaId) {
+          await c.env.DB.prepare(`
+            UPDATE idea_executions SET failed_tasks = failed_tasks + 1, updated_at = ? WHERE idea_id = ?
+          `).bind(now, ideaId).run();
+        }
+      } else {
+        await c.env.DB.prepare(`
+          UPDATE tasks SET status = 'next', updated_at = ? WHERE id = ?
+        `).bind(now, taskId).run();
+      }
 
       return c.json({
         success: false,
         error: 'Task completion rejected - output indicates failure',
         task_id: taskId,
-        status: 'next',
+        status: isIdeaTask ? 'failed' : 'next',
         detected_indicator: matchedIndicator,
       }, 400);
     }
 
-    // Update task to completed
-    await c.env.DB.prepare(`
-      UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?
-    `).bind(now, now, taskId).run();
+    // Update task to completed - handle both task types
+    if (isIdeaTask) {
+      await c.env.DB.prepare(`
+        UPDATE idea_tasks SET status = 'completed', result = ?, completed_at = ?, updated_at = ? WHERE id = ?
+      `).bind(resultText.substring(0, 10000), now, now, taskId).run();
+
+      // Update idea_executions completed count
+      if (ideaId) {
+        await c.env.DB.prepare(`
+          UPDATE idea_executions SET completed_tasks = completed_tasks + 1, updated_at = ? WHERE idea_id = ?
+        `).bind(now, ideaId).run();
+
+        // Check if all tasks are done
+        const stats = await c.env.DB.prepare(`
+          SELECT COUNT(*) as remaining FROM idea_tasks
+          WHERE idea_id = ? AND status IN ('pending', 'ready', 'in_progress', 'dispatched') AND deleted_at IS NULL
+        `).bind(ideaId).first<{ remaining: number }>();
+
+        if (stats && stats.remaining === 0) {
+          await c.env.DB.prepare(`
+            UPDATE idea_executions SET status = 'completed', completed_at = ?, updated_at = ? WHERE idea_id = ?
+          `).bind(now, now, ideaId).run();
+          await c.env.DB.prepare(`
+            UPDATE ideas SET execution_status = 'done', updated_at = ? WHERE id = ?
+          `).bind(now, ideaId).run();
+        }
+      }
+    } else {
+      await c.env.DB.prepare(`
+        UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?
+      `).bind(now, now, taskId).run();
+    }
 
     // Update any execution queue entries and archive them
     const entriesToArchive = await c.env.DB.prepare(`
@@ -1491,10 +1551,25 @@ app.post('/api/tasks/:id/error', async (c) => {
 
     const now = new Date().toISOString();
 
-    // Find the task
-    const task = await c.env.DB.prepare(`
+    // Find the task - check both 'tasks' and 'idea_tasks' tables
+    let task = await c.env.DB.prepare(`
       SELECT id, tenant_id, user_id, status FROM tasks WHERE id = ? AND deleted_at IS NULL
     `).bind(taskId).first<{ id: string; tenant_id: string; user_id: string; status: string }>();
+
+    let isIdeaTask = false;
+    let ideaId: string | null = null;
+    if (!task) {
+      const ideaTask = await c.env.DB.prepare(`
+        SELECT id, tenant_id, user_id, status, idea_id FROM idea_tasks WHERE id = ? AND deleted_at IS NULL
+      `).bind(taskId).first<{ id: string; tenant_id: string; user_id: string; status: string; idea_id: string }>();
+
+      if (ideaTask) {
+        task = ideaTask;
+        isIdeaTask = true;
+        ideaId = ideaTask.idea_id;
+        console.log(`Task ${taskId} error callback - found in idea_tasks table (idea: ${ideaId})`);
+      }
+    }
 
     if (!task) {
       return c.json({ success: false, error: 'Task not found' }, 404);
@@ -1503,10 +1578,24 @@ app.post('/api/tasks/:id/error', async (c) => {
     // Determine new status based on quarantine flag
     const newStatus = body.quarantine ? 'cancelled' : 'next'; // 'next' allows retry
 
-    // Update task
-    await c.env.DB.prepare(`
-      UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?
-    `).bind(newStatus, now, taskId).run();
+    // Update task - handle both task types
+    if (isIdeaTask) {
+      const ideaStatus = body.quarantine ? 'quarantined' : 'failed';
+      await c.env.DB.prepare(`
+        UPDATE idea_tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?
+      `).bind(ideaStatus, body.error?.substring(0, 2000) || 'Unknown error', now, taskId).run();
+
+      // Update idea_executions failed count
+      if (ideaId) {
+        await c.env.DB.prepare(`
+          UPDATE idea_executions SET failed_tasks = failed_tasks + 1, updated_at = ? WHERE idea_id = ?
+        `).bind(now, ideaId).run();
+      }
+    } else {
+      await c.env.DB.prepare(`
+        UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?
+      `).bind(newStatus, now, taskId).run();
+    }
 
     // Update any execution queue entries
     const queueStatus = body.quarantine ? 'quarantine' : 'failed';
