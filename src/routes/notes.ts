@@ -155,17 +155,18 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query with AND semantics (FTS5 default for space-separated terms)
-      // IMPORTANT: Do NOT use prefix wildcards (term*) with porter stemmer - it breaks matching
-      // The porter stemmer handles word variations automatically (e.g., "validate" matches "validation")
+      // Use column filter syntax "search_text:term" for reliable matching in D1
+      // Porter stemmer handles word variations (e.g., "validate" matches "validation")
       // Post-filter with matchesAllTerms() ensures exact term presence in decrypted content
       const ftsQuery = ftsTerms.length > 0
         ? ftsTerms.map(term => {
             if (term.startsWith('"') && term.endsWith('"')) {
-              // Quoted phrase - use as-is for exact phrase matching
-              return term;
+              // Quoted phrase - use column filter with phrase
+              const phrase = term.slice(1, -1); // Remove quotes
+              return `search_text:"${phrase}"`;
             }
-            // No prefix wildcard - porter stemmer handles word variations
-            return term;
+            // Use column filter syntax for single terms
+            return `search_text:${term}`;
           }).join(' ')
         : '';
 
