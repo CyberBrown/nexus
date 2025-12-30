@@ -3500,7 +3500,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   );
 
   // Tool: nexus_search_notes - Search notes with FTS5 full-text search
-  // PRIMARY: Use FTS5 with AND operator for reliable multi-word matching
+  // PRIMARY: Use FTS5 with implicit AND (space-separated terms) for multi-word matching
   // FALLBACK: Full scan with decryption for notes missing from FTS index
   server.tool(
     'nexus_search_notes',
@@ -3579,12 +3579,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query using OR (implicit with space separation)
-        // D1's FTS5 has issues with explicit AND operator, so we use OR for broad matching
-        // then rely on post-filtering (matchesAllTerms) to ensure all terms match.
-        // This approach is more reliable: FTS5 finds candidates, post-filter verifies all terms.
-        // Quoted phrases (for exact matching) are already quoted in ftsTerms.
-        const ftsQuery = ftsTerms.join(' OR ');
+        // Build FTS5 query using space-separated terms (implicit AND in FTS5)
+        // SQLite FTS5 treats space-separated terms as implicit AND by default.
+        // Don't use explicit AND or OR operators - they can cause issues with D1.
+        // Post-filter ensures all terms match in case FTS behavior differs.
+        const ftsQuery = ftsTerms.join(' ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
