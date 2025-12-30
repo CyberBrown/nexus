@@ -417,6 +417,53 @@ notes.get('/', async (c) => {
           }
         }
         items = filteredResults;
+
+        // If FTS5 returned no results, try LIKE-based search on search_text column
+        // This is more reliable when search_text is populated but FTS5 index is stale
+        if (items.length === 0 && searchTerms.length > 0) {
+          try {
+            // Build LIKE conditions for each search term
+            const likeConditions = searchTerms.map(() => 'n.search_text LIKE ?').join(' AND ');
+            const likeBindings: (string | number)[] = [tenantId, userId];
+            for (const term of searchTerms) {
+              likeBindings.push(`%${term}%`);
+            }
+
+            if (category) {
+              likeBindings.push(category);
+            }
+            if (source_type) {
+              likeBindings.push(source_type);
+            }
+
+            const likeResult = await c.env.DB.prepare(`
+              SELECT n.*
+              FROM notes n
+              WHERE n.tenant_id = ?
+                AND n.user_id = ?
+                AND n.deleted_at IS NULL
+                AND n.search_text IS NOT NULL AND n.search_text != ''
+                AND (${likeConditions})
+                ${category ? 'AND n.category = ?' : ''}
+                ${archived === 'true' ? 'AND n.archived_at IS NOT NULL' : (archived === 'false' || !archived) ? 'AND n.archived_at IS NULL' : ''}
+                ${pinned === 'true' ? 'AND n.pinned = 1' : ''}
+                ${source_type ? 'AND n.source_type = ?' : ''}
+              ORDER BY n.pinned DESC, n.created_at DESC
+              LIMIT 100
+            `).bind(...likeBindings).all<Note>();
+
+            // Post-filter to verify matches against decrypted content
+            for (const note of likeResult.results) {
+              const decrypted = await decryptFields(note, ENCRYPTED_FIELDS, encryptionKey);
+              const combinedText = `${decrypted.title || ''} ${decrypted.content || ''} ${note.tags || ''}`;
+              if (matchesAllTerms(combinedText)) {
+                items.push(note);
+              }
+            }
+          } catch {
+            // LIKE search failed, continue with empty results
+          }
+        }
       } else {
         items = [];
       }
@@ -730,6 +777,134 @@ notes.post('/:id/pin', async (c) => {
   await update(c.env.DB, 'notes', id, { pinned: newPinned }, { tenantId });
 
   return c.json({ success: true, data: { id, pinned: newPinned === 1 } });
+});
+
+// Rebuild FTS5 index for all notes
+// POST /api/notes/rebuild-fts
+// Decrypts all notes and rebuilds the search_text column and FTS5 index
+notes.post('/rebuild-fts', async (c) => {
+  const { tenantId, userId } = getAuth(c);
+
+  try {
+    const key = await getEncryptionKey(c.env.KV, tenantId);
+
+    // Ensure search_text column exists
+    try {
+      const searchTextCol = await c.env.DB.prepare(
+        `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
+      ).first<{ name: string } | null>();
+
+      if (!searchTextCol) {
+        await c.env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
+      }
+    } catch {
+      // Column check failed, continue
+    }
+
+    // Ensure FTS5 table exists with correct schema
+    try {
+      const tableInfo = await c.env.DB.prepare(
+        `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
+      ).first<{ name: string } | null>();
+
+      if (!tableInfo) {
+        await c.env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+        await c.env.DB.prepare(`
+          CREATE VIRTUAL TABLE notes_fts USING fts5(
+            note_id UNINDEXED,
+            search_text,
+            tokenize='porter unicode61'
+          )
+        `).run();
+      }
+    } catch {
+      // Schema check failed
+    }
+
+    // Get all non-deleted notes for this user
+    const allNotes = await c.env.DB.prepare(`
+      SELECT id, title, content, tags
+      FROM notes
+      WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+    `).bind(tenantId, userId).all<{
+      id: string;
+      title: string | null;
+      content: string | null;
+      tags: string | null;
+    }>();
+
+    // Clear FTS index for this user's notes
+    await c.env.DB.prepare(`
+      DELETE FROM notes_fts WHERE note_id IN (
+        SELECT id FROM notes WHERE tenant_id = ? AND user_id = ?
+      )
+    `).bind(tenantId, userId).run();
+
+    let indexed = 0;
+    let errors = 0;
+
+    for (const note of allNotes.results || []) {
+      try {
+        // Decrypt fields - handle both encrypted and plaintext
+        let decryptedTitle = '';
+        let decryptedContent = '';
+
+        if (note.title) {
+          try {
+            const { decryptField } = await import('../lib/encryption.ts');
+            decryptedTitle = await decryptField(note.title, key);
+          } catch {
+            decryptedTitle = note.title; // Already plaintext
+          }
+        }
+
+        if (note.content) {
+          try {
+            const { decryptField } = await import('../lib/encryption.ts');
+            decryptedContent = await decryptField(note.content, key);
+          } catch {
+            decryptedContent = note.content; // Already plaintext
+          }
+        }
+
+        const tags = note.tags || '';
+
+        // Build search text - MUST lowercase for D1's case-sensitive FTS5
+        const searchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
+
+        if (searchText) {
+          // Update notes table search_text column
+          await c.env.DB.prepare(`
+            UPDATE notes SET search_text = ? WHERE id = ?
+          `).bind(searchText, note.id).run();
+
+          // Insert into FTS index
+          await c.env.DB.prepare(`
+            INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
+          `).bind(note.id, searchText).run();
+
+          indexed++;
+        }
+      } catch (e) {
+        console.error(`Failed to index note ${note.id}:`, e);
+        errors++;
+      }
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        total: allNotes.results?.length || 0,
+        indexed,
+        errors,
+        message: `Rebuilt FTS index for ${indexed} notes`,
+      },
+    });
+  } catch (error: unknown) {
+    console.error('FTS rebuild error:', error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return c.json({ success: false, error: `FTS rebuild failed: ${errorMessage}` }, 500);
+  }
 });
 
 export default notes;

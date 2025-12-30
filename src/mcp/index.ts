@@ -3534,6 +3534,36 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const trimmedQuery = query.trim();
         const maxLimit = limit || 20;
 
+        // CRITICAL: Ensure FTS5 schema is correct before searching
+        // Old migration (0017) created incompatible schema - this fixes it on-demand
+        try {
+          // Check if search_text column exists in notes table
+          const searchTextCol = await env.DB.prepare(
+            `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
+          ).first<{ name: string } | null>();
+          if (!searchTextCol) {
+            await env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
+          }
+
+          // Check if notes_fts has correct schema (note_id column)
+          const tableInfo = await env.DB.prepare(
+            `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
+          ).first<{ name: string } | null>();
+          if (!tableInfo) {
+            // FTS table either doesn't exist or has old schema - recreate with correct schema
+            await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+            await env.DB.prepare(`
+              CREATE VIRTUAL TABLE notes_fts USING fts5(
+                note_id UNINDEXED,
+                search_text,
+                tokenize='porter unicode61'
+              )
+            `).run();
+          }
+        } catch {
+          // Schema check failed, continue anyway - search will use fallbacks
+        }
+
         // Parse search terms - handle quoted phrases and individual words
         // Build both: searchTerms (for matching) and ftsTerms (for FTS5 query)
         const searchTerms: string[] = [];
@@ -3699,10 +3729,85 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
         }
 
-        // STEP 2: ALWAYS do full scan with decryption for reliable multi-word search
-        // FTS5 can miss results due to index staleness, porter stemming, or D1 quirks
-        // Full scan guarantees correct results by searching actual decrypted content
-        // Only skip if FTS5 already found enough results
+        // STEP 2: Try LIKE-based search on search_text column (more reliable than FTS5)
+        // This works when search_text is properly populated but FTS5 index is stale/broken
+        // Uses SQL LIKE with % wildcards for substring matching
+        if (matchingNotes.length < maxLimit && searchTerms.length > 0) {
+          try {
+            // Build LIKE conditions for each search term
+            // Each term must appear somewhere in search_text
+            const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
+            const likeBindings = searchTerms.map(term => `%${term}%`);
+
+            const likeSearchResults = await env.DB.prepare(`
+              SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
+              FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND search_text IS NOT NULL AND search_text != ''
+                AND (${likeConditions})
+                ${archivedCondition}
+              ORDER BY pinned DESC, created_at DESC
+              LIMIT ?
+            `).bind(tenantId, userId, ...likeBindings, maxLimit * 2).all();
+
+            if (likeSearchResults.results && likeSearchResults.results.length > 0) {
+              // Track IDs already found by FTS5 to avoid duplicates
+              const foundIds = new Set(matchingNotes.map(n => n.id));
+
+              for (const note of likeSearchResults.results as Array<{
+                id: string;
+                title: string | null;
+                content: string | null;
+                category: string;
+                tags: string | null;
+                source_type: string | null;
+                pinned: number;
+                archived_at: string | null;
+                created_at: string;
+                search_text: string | null;
+              }>) {
+                if (foundIds.has(note.id)) continue;
+
+                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                const tagsText = note.tags ? String(note.tags) : '';
+
+                // Double-check all terms match in decrypted content
+                const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
+                if (!matchesAllTerms(combinedText)) continue;
+
+                matchingNotes.push({
+                  id: note.id,
+                  title: decryptedTitle,
+                  content_preview: decryptedContent
+                    ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                    : '',
+                  category: note.category,
+                  tags: note.tags,
+                  source_type: note.source_type,
+                  pinned: note.pinned === 1,
+                  archived: !!note.archived_at,
+                  created_at: note.created_at,
+                });
+                foundIds.add(note.id);
+
+                if (matchingNotes.length >= maxLimit) break;
+              }
+
+              if (searchMethod === 'none' || searchMethod.startsWith('fts5_error')) {
+                searchMethod = 'like_search_text';
+              } else {
+                searchMethod = `${searchMethod}+like`;
+              }
+            }
+          } catch (err: any) {
+            console.error('LIKE search failed:', err);
+          }
+        }
+
+        // STEP 3: Full scan with decryption for notes missing search_text
+        // This is the last resort for notes without search_text populated
+        // Only runs if we still need more results
         if (matchingNotes.length < maxLimit) {
           try {
             const allNotes = await env.DB.prepare(`
@@ -3713,10 +3818,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               ORDER BY pinned DESC, created_at DESC
             `).bind(tenantId, userId).all();
 
-            // Track IDs already found by FTS5 to avoid duplicates
+            // Track IDs already found by FTS5 or LIKE search to avoid duplicates
             const foundIds = new Set(matchingNotes.map(n => n.id));
             let notesRepaired = 0;
-            const wasEmpty = matchingNotes.length === 0;
+            const foundBeforeFullScan = matchingNotes.length;
 
             for (const note of (allNotes.results || []) as Array<{
               id: string;
@@ -3730,7 +3835,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               created_at: string;
               search_text: string | null;
             }>) {
-              // Skip notes already found by FTS5
+              // Skip notes already found by FTS5 or LIKE search
               if (foundIds.has(note.id)) continue;
 
               // Decrypt title and content for matching
@@ -3784,10 +3889,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }
 
             // Update search method to reflect what happened
-            if (wasEmpty) {
-              searchMethod = notesRepaired > 0 ? `full_scan_repaired_${notesRepaired}` : 'full_scan';
-            } else if (notesRepaired > 0) {
-              searchMethod = `${searchMethod}+full_scan_repaired_${notesRepaired}`;
+            const foundInFullScan = matchingNotes.length - foundBeforeFullScan;
+            if (foundInFullScan > 0 || notesRepaired > 0) {
+              const fullScanInfo = notesRepaired > 0 ? `full_scan_repaired_${notesRepaired}` : 'full_scan';
+              if (searchMethod === 'none' || searchMethod.startsWith('fts5_error')) {
+                searchMethod = fullScanInfo;
+              } else {
+                searchMethod = `${searchMethod}+${fullScanInfo}`;
+              }
             }
           } catch (err) {
             console.error('Full scan search failed:', err);
@@ -3836,8 +3945,32 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             response.hint = 'No notes found for this user. Create some notes first.';
           } else if (ftsCount === 0 || notesWithSearchText < totalNotes) {
             response.hint = `No matching notes found. FTS index may need rebuilding. Run nexus_rebuild_notes_fts to fix. (notes: ${totalNotes}, indexed: ${ftsCount}, with_search_text: ${notesWithSearchText})`;
+            response.diagnostics = {
+              total_notes: totalNotes,
+              fts_indexed: ftsCount,
+              with_search_text: notesWithSearchText,
+              recommendation: 'Run nexus_rebuild_notes_fts with passphrase to rebuild the search index',
+            };
           } else {
+            // All notes are indexed but no matches - sample a note to check content
             response.hint = `No matching notes found. ${totalNotes} notes exist (all indexed). Try simpler search terms or check spelling.`;
+            // Sample a note's search_text to help debug
+            try {
+              const sampleNote = await env.DB.prepare(`
+                SELECT id, search_text FROM notes
+                WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                  AND search_text IS NOT NULL AND search_text != ''
+                LIMIT 1
+              `).bind(tenantId, userId).first<{ id: string; search_text: string }>();
+              if (sampleNote) {
+                response.diagnostics = {
+                  total_notes: totalNotes,
+                  sample_note_id: sampleNote.id,
+                  sample_search_text_preview: sampleNote.search_text.substring(0, 200) + (sampleNote.search_text.length > 200 ? '...' : ''),
+                  search_terms_used: searchTerms,
+                };
+              }
+            } catch { /* ignore */ }
           }
         } else if (searchMethod.startsWith('full_scan')) {
           response.hint = 'Search used full scan. Run nexus_rebuild_notes_fts to enable faster indexed search.';
