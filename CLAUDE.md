@@ -82,6 +82,49 @@ console.log(response.content);
 
 **Important:** Never call LLM providers directly. Always use the DE client.
 
+## DE Routing Architecture (Dec 2024)
+
+**CRITICAL: All code execution must go through the correct routing path.**
+
+### Correct Path
+```
+Nexus → POST /execute → PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
+       (de-workflows)
+```
+
+### How Nexus Triggers Code Execution
+
+1. **Via Intake Service Binding (preferred):**
+   - `src/scheduled/task-executor.ts` uses `IntakeClient`
+   - Calls `env.INTAKE.fetch('https://intake/intake', ...)` via service binding
+   - Intake routes to PrimeWorkflow automatically
+
+2. **Via HTTP to de-workflows (fallback):**
+   - `src/mcp/index.ts` auto_dispatch uses `${env.DE_WORKFLOWS_URL}/execute`
+   - Must always call `/execute`, NEVER `/workflows/*` endpoints
+
+### Blocked Endpoints (403)
+
+Direct calls to workflow endpoints are BLOCKED:
+- ❌ `POST /workflows/code-execution` → Returns 403 `USE_EXECUTE_ENDPOINT`
+- ❌ `POST /workflows/text-generation` → Returns 403 `USE_EXECUTE_ENDPOINT`
+- ✅ `POST /execute` → Correct single entry point
+
+### Error Indicators
+
+These errors suggest routing issues (Nexus calling wrong endpoints):
+- `ALL_RUNNERS_FAILED` - Sandbox-executor exhausted retries
+- `RUNNER_UNREACHABLE` - Both Claude and Gemini runners failed
+- `USE_EXECUTE_ENDPOINT` - Direct 403 from blocked endpoint
+
+If you see these errors, check:
+1. Nexus is calling `/execute` not `/workflows/*`
+2. DE_WORKFLOWS_URL is set correctly in wrangler.toml
+3. Intake service binding is configured
+
+### Reference
+See Nexus note `8915b506-1caa-46d7-8f42-b6ba2c282788` for full architecture details.
+
 ## Developer Guidelines (MCP Server)
 
 ### Required: Check Before Implementing
@@ -545,6 +588,33 @@ This enables continuous execution loops without polling delays.
 
 - `execution_queue` - Active queue entries with status tracking
 - `dispatch_log` - Immutable audit trail of all dispatch actions
+
+### Circuit Breaker
+
+Prevents runaway retry loops when tasks fail repeatedly. If a task has 3+ quarantined queue entries in the last 24 hours, the circuit breaker trips and the task is automatically cancelled instead of creating another queue entry.
+
+**Configuration:**
+- Threshold: 3 quarantine entries
+- Window: 24 hours
+- Action: Task status set to 'cancelled', logged to dispatch_log
+
+**When it triggers:**
+- Task fails max retries (3) and gets quarantined
+- Same task keeps getting re-dispatched by cron
+- After 3 quarantine entries, circuit breaker stops the loop
+
+**Checked at:**
+- Cron dispatch (`dispatchTasks`)
+- Manual dispatch (`nexus_dispatch_task`, `nexus_dispatch_ready`)
+- Auto-dispatch on completion (`nexus_complete_queue_task`)
+- REST API dispatch (`POST /api/tasks/:id/dispatch`)
+- Dependency promotion (`promoteDependentTasks`)
+
+**Recovery:**
+To retry a task after fixing the underlying issue:
+1. Update task status back to 'next': `nexus_update_task({ task_id, status: 'next' })`
+2. The quarantine entries will age out after 24 hours
+3. Or manually clean up with `nexus_cleanup_queue`
 
 ### Cron Configuration
 

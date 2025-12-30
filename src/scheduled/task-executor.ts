@@ -11,7 +11,7 @@
 import type { Env, Task } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
 import { createIntakeClient, IntakeClient } from '../lib/intake-client.ts';
-import { isOAuthError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
+import { isOAuthError, isRoutingError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
 import {
   type ExecutorType,
   hasUnmetDependencies,
@@ -233,6 +233,17 @@ async function failEntry(
     return;
   }
 
+  // Check if this is a routing error - these indicate configuration issues
+  // Log extensively but still allow retries (might be transient)
+  if (isRoutingError(error)) {
+    console.error(
+      `POSSIBLE ROUTING ISSUE for task ${entry.task_id}: ${error}. ` +
+      `If sandbox-executor is trying both runners, the call may be bypassing PrimeWorkflow. ` +
+      `Verify Nexus is calling /execute not /workflows/* endpoints. ` +
+      `See Nexus note 8915b506 for correct architecture.`
+    );
+  }
+
   // If we have retries left, requeue instead of failing
   if (newRetryCount < entry.max_retries) {
     await db.prepare(`
@@ -398,6 +409,15 @@ export async function promoteDependentTasks(
 
     // Determine executor type
     const executorType = determineExecutorType(title);
+
+    // Check circuit breaker - prevent runaway retry loops
+    const { checkCircuitBreaker, tripCircuitBreaker } = await import('./task-dispatcher.ts');
+    const circuitBreaker = await checkCircuitBreaker(env.DB, dep.task_id);
+    if (circuitBreaker.tripped) {
+      await tripCircuitBreaker(env.DB, dep.task_id, tenantId, circuitBreaker.reason!);
+      console.log(`Circuit breaker tripped for dependent task ${dep.task_id}, cancelling`);
+      continue;
+    }
 
     // Queue the task
     const queueId = await queueTask(env.DB, { ...task, title }, executorType, tenantId);

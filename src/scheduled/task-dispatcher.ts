@@ -12,6 +12,11 @@ const ENCRYPTED_FIELDS = ['title', 'description'];
 // - 'ai': Full AI autonomy, auto-dispatch to DE
 export type ExecutorType = 'human' | 'human-ai' | 'ai';
 
+// Circuit breaker configuration
+// If a task has this many quarantined entries in 24 hours, stop retrying
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+const CIRCUIT_BREAKER_WINDOW_HOURS = 24;
+
 // Task tag patterns and their executor mappings
 // Key principle: Nexus asks "Does a human need to be involved?"
 // - Yes, fully → human
@@ -103,6 +108,89 @@ async function isTaskQueued(db: D1Database, taskId: string): Promise<boolean> {
   `).bind(taskId).first<QueueEntry>();
 
   return existing !== null;
+}
+
+/**
+ * Circuit breaker result
+ */
+export interface CircuitBreakerResult {
+  tripped: boolean;
+  quarantineCount: number;
+  reason?: string;
+}
+
+/**
+ * Check if circuit breaker should prevent task dispatch
+ *
+ * Prevents runaway retry loops by checking if a task has too many
+ * quarantined queue entries in the past 24 hours. If the threshold
+ * is exceeded, the task should be marked as cancelled instead of
+ * creating another queue entry.
+ */
+export async function checkCircuitBreaker(
+  db: D1Database,
+  taskId: string
+): Promise<CircuitBreakerResult> {
+  const windowHours = CIRCUIT_BREAKER_WINDOW_HOURS;
+  const threshold = CIRCUIT_BREAKER_THRESHOLD;
+
+  // Count quarantined entries for this task in the last 24 hours
+  const result = await db.prepare(`
+    SELECT COUNT(*) as count FROM execution_queue
+    WHERE task_id = ?
+      AND status = 'quarantine'
+      AND created_at > datetime('now', '-${windowHours} hours')
+  `).bind(taskId).first<{ count: number }>();
+
+  const quarantineCount = result?.count || 0;
+
+  if (quarantineCount >= threshold) {
+    return {
+      tripped: true,
+      quarantineCount,
+      reason: `Circuit breaker: ${quarantineCount} quarantine entries in last ${windowHours}h (threshold: ${threshold})`,
+    };
+  }
+
+  return {
+    tripped: false,
+    quarantineCount,
+  };
+}
+
+/**
+ * Trip the circuit breaker for a task
+ * Updates the task status to 'cancelled' and logs the reason
+ */
+export async function tripCircuitBreaker(
+  db: D1Database,
+  taskId: string,
+  tenantId: string,
+  reason: string
+): Promise<void> {
+  const now = new Date().toISOString();
+
+  // Update task status to cancelled
+  await db.prepare(`
+    UPDATE tasks
+    SET status = 'cancelled',
+        updated_at = ?
+    WHERE id = ? AND tenant_id = ?
+  `).bind(now, taskId, tenantId).run();
+
+  // Log the circuit breaker trip
+  await db.prepare(`
+    INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+    VALUES (?, ?, NULL, ?, 'unknown', 'circuit_breaker', ?, ?)
+  `).bind(
+    crypto.randomUUID(),
+    tenantId,
+    taskId,
+    JSON.stringify({ reason, timestamp: now }),
+    now
+  ).run();
+
+  console.log(`Circuit breaker tripped for task ${taskId}: ${reason}`);
 }
 
 /**
@@ -228,6 +316,7 @@ export async function dispatchTasks(env: Env): Promise<{
   queued: Record<ExecutorType, number>;
   skipped: number;
   blocked: number;
+  circuit_breaker: number;
   errors: number;
 }> {
   console.log('Task dispatcher starting...');
@@ -241,6 +330,7 @@ export async function dispatchTasks(env: Env): Promise<{
     } as Record<ExecutorType, number>,
     skipped: 0,
     blocked: 0, // Tasks with unmet dependencies
+    circuit_breaker: 0, // Tasks cancelled due to circuit breaker
     errors: 0,
   };
 
@@ -286,6 +376,15 @@ export async function dispatchTasks(env: Env): Promise<{
             if (await hasUnmetDependencies(env.DB, task.id, tenantId)) {
               console.log(`Task ${task.id} has unmet dependencies, blocked`);
               stats.blocked++;
+              continue;
+            }
+
+            // Check circuit breaker - prevent runaway retry loops
+            const circuitBreaker = await checkCircuitBreaker(env.DB, task.id);
+            if (circuitBreaker.tripped) {
+              console.log(`Circuit breaker tripped for task ${task.id}: ${circuitBreaker.reason}`);
+              await tripCircuitBreaker(env.DB, task.id, tenantId, circuitBreaker.reason!);
+              stats.circuit_breaker++;
               continue;
             }
 

@@ -1065,26 +1065,45 @@ api.post('/dispatch/ready', async (c) => {
     }
 
     // Auto-detect executor patterns
+    // Uses normalized types: 'ai', 'human', 'human-ai'
+    // See task-dispatcher.ts for canonical pattern definitions
     const patterns: Array<{ pattern: RegExp; executor: string }> = [
-      { pattern: /^\[implement\]/i, executor: 'claude-code' },
-      { pattern: /^\[deploy\]/i, executor: 'claude-code' },
-      { pattern: /^\[fix\]/i, executor: 'claude-code' },
-      { pattern: /^\[refactor\]/i, executor: 'claude-code' },
-      { pattern: /^\[test\]/i, executor: 'claude-code' },
-      { pattern: /^\[debug\]/i, executor: 'claude-code' },
-      { pattern: /^\[code\]/i, executor: 'claude-code' },
-      { pattern: /^\[research\]/i, executor: 'claude-ai' },
-      { pattern: /^\[design\]/i, executor: 'claude-ai' },
-      { pattern: /^\[document\]/i, executor: 'claude-ai' },
-      { pattern: /^\[analyze\]/i, executor: 'claude-ai' },
-      { pattern: /^\[plan\]/i, executor: 'claude-ai' },
-      { pattern: /^\[write\]/i, executor: 'claude-ai' },
+      // Literal executor names (highest priority)
       { pattern: /^\[human\]/i, executor: 'human' },
-      { pattern: /^\[review\]/i, executor: 'human' },
-      { pattern: /^\[approve\]/i, executor: 'human' },
-      { pattern: /^\[decide\]/i, executor: 'human' },
+      { pattern: /^\[human-ai\]/i, executor: 'human-ai' },
+      { pattern: /^\[ai\]/i, executor: 'ai' },
+
+      // Legacy tags - map to 'ai'
+      { pattern: /^\[claude-code\]/i, executor: 'ai' },
+      { pattern: /^\[claude-ai\]/i, executor: 'ai' },
+      { pattern: /^\[de-agent\]/i, executor: 'ai' },
+      { pattern: /^\[CC\]/i, executor: 'ai' },
+      { pattern: /^\[DE\]/i, executor: 'ai' },
+
+      // Human-only tasks
       { pattern: /^\[call\]/i, executor: 'human' },
       { pattern: /^\[meeting\]/i, executor: 'human' },
+      { pattern: /^\[BLOCKED\]/i, executor: 'human' },
+
+      // Human-AI collaborative tasks
+      { pattern: /^\[review\]/i, executor: 'human-ai' },
+      { pattern: /^\[approve\]/i, executor: 'human-ai' },
+      { pattern: /^\[decide\]/i, executor: 'human-ai' },
+
+      // AI-executable tasks
+      { pattern: /^\[implement\]/i, executor: 'ai' },
+      { pattern: /^\[deploy\]/i, executor: 'ai' },
+      { pattern: /^\[fix\]/i, executor: 'ai' },
+      { pattern: /^\[refactor\]/i, executor: 'ai' },
+      { pattern: /^\[test\]/i, executor: 'ai' },
+      { pattern: /^\[debug\]/i, executor: 'ai' },
+      { pattern: /^\[code\]/i, executor: 'ai' },
+      { pattern: /^\[research\]/i, executor: 'ai' },
+      { pattern: /^\[design\]/i, executor: 'ai' },
+      { pattern: /^\[document\]/i, executor: 'ai' },
+      { pattern: /^\[analyze\]/i, executor: 'ai' },
+      { pattern: /^\[plan\]/i, executor: 'ai' },
+      { pattern: /^\[write\]/i, executor: 'ai' },
     ];
 
     // Helper to safely decrypt
@@ -1116,6 +1135,15 @@ api.post('/dispatch/ready', async (c) => {
 
       if (existing) {
         skipped.push({ task_id: task.id, reason: 'already_queued' });
+        continue;
+      }
+
+      // Check circuit breaker - prevent runaway retry loops
+      const { checkCircuitBreaker, tripCircuitBreaker } = await import('./scheduled/task-dispatcher.ts');
+      const circuitBreaker = await checkCircuitBreaker(c.env.DB, task.id);
+      if (circuitBreaker.tripped) {
+        await tripCircuitBreaker(c.env.DB, task.id, tenantId, circuitBreaker.reason!);
+        skipped.push({ task_id: task.id, reason: `circuit_breaker: ${circuitBreaker.quarantineCount} quarantines` });
         continue;
       }
 

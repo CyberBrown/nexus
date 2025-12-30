@@ -7,6 +7,11 @@
  * - Built-in retries with exponential backoff
  * - Crash recovery (resume from checkpoint)
  * - Callbacks to Nexus on completion/failure
+ *
+ * ROUTING ARCHITECTURE (Dec 2024):
+ * All code execution goes through: Nexus → Intake → PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
+ * Direct calls to /workflows/* endpoints are BLOCKED with 403.
+ * See Nexus note 8915b506 for architecture details.
  */
 
 // ========================================
@@ -70,6 +75,25 @@ export class IntakeClient {
       if (!response.ok) {
         const errorText = await response.text().catch(() => 'Unknown error');
         console.error(`Intake: Workflow trigger failed (${response.status}) in ${elapsed}ms: ${errorText}`);
+
+        // Check for routing errors (403 from DE means we're calling a blocked endpoint)
+        if (response.status === 403) {
+          let errorBody: { code?: string; error?: string } = {};
+          try {
+            errorBody = JSON.parse(errorText);
+          } catch {
+            // Not JSON, use raw text
+          }
+
+          if (errorBody.code === 'USE_EXECUTE_ENDPOINT') {
+            console.error(
+              `ROUTING ERROR: Nexus is calling a blocked DE endpoint. ` +
+              `All calls must go through POST /execute (PrimeWorkflow). ` +
+              `See Nexus note 8915b506 for correct architecture.`
+            );
+          }
+        }
+
         return {
           success: false,
           error: `Intake error (${response.status}): ${errorText}`,
@@ -77,6 +101,20 @@ export class IntakeClient {
       }
 
       const result = await response.json() as IntakeResponse;
+
+      // Check for runner errors that might indicate routing issues
+      if (!result.success && result.error) {
+        const error = result.error;
+        if (error.includes('ALL_RUNNERS_FAILED') || error.includes('RUNNER_UNREACHABLE')) {
+          console.error(
+            `POSSIBLE ROUTING ISSUE: Received ${error}. ` +
+            `If sandbox-executor is trying both runners, the call may be bypassing PrimeWorkflow. ` +
+            `Verify Nexus is calling /execute not /workflows/* endpoints. ` +
+            `See Nexus note 8915b506 for correct architecture.`
+          );
+        }
+      }
+
       console.log(`Intake: Workflow triggered in ${elapsed}ms: ${result.workflow_instance_id}`);
 
       return result;

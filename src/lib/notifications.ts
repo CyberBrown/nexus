@@ -21,11 +21,32 @@ export const OAUTH_ERROR_PATTERNS = [
 ];
 
 /**
+ * Routing-related error patterns that indicate Nexus is calling wrong DE endpoints
+ * These errors suggest architecture/configuration issues, not transient failures
+ */
+export const ROUTING_ERROR_PATTERNS = [
+  /ALL_RUNNERS_FAILED/i,
+  /RUNNER_UNREACHABLE/i,
+  /USE_EXECUTE_ENDPOINT/i,
+  /blocked.*endpoint/i,
+  /routing.*error/i,
+];
+
+/**
  * Check if an error message indicates an OAuth/auth issue
  * that requires human intervention (not retryable)
  */
 export function isOAuthError(errorMessage: string): boolean {
   return OAUTH_ERROR_PATTERNS.some(pattern => pattern.test(errorMessage));
+}
+
+/**
+ * Check if an error message indicates a routing issue
+ * (Nexus calling wrong DE endpoints). These suggest configuration problems.
+ * See Nexus note 8915b506 for correct architecture.
+ */
+export function isRoutingError(errorMessage: string): boolean {
+  return ROUTING_ERROR_PATTERNS.some(pattern => pattern.test(errorMessage));
 }
 
 /**
@@ -120,15 +141,28 @@ export async function sendQuarantineAlert(
   reason: string,
   attemptCount: number
 ): Promise<boolean> {
-  const title = '⚠️ Task Quarantined';
-  const message = [
+  // Check if this might be a routing issue
+  const routingIssue = isRoutingError(reason);
+  const title = routingIssue ? '🚨 Possible Routing Issue' : '⚠️ Task Quarantined';
+
+  const lines = [
     `Task: ${taskTitle.slice(0, 50)}`,
     `Attempts: ${attemptCount}`,
     `Reason: ${reason.slice(0, 150)}`,
-  ].join('\n');
+  ];
+
+  if (routingIssue) {
+    lines.push('');
+    lines.push('This may be a routing issue:');
+    lines.push('Verify Nexus is calling POST /execute');
+    lines.push('not /workflows/* endpoints.');
+    lines.push('See Nexus note 8915b506.');
+  }
+
+  const message = lines.join('\n');
 
   return sendNtfyNotification(NTFY_OAUTH_TOPIC, title, message, {
-    priority: 'default',
-    tags: ['warning'],
+    priority: routingIssue ? 'high' : 'default',
+    tags: routingIssue ? ['warning', 'rotating_light'] : ['warning'],
   });
 }

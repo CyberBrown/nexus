@@ -414,6 +414,19 @@ tasks.post('/:id/dispatch', async (c) => {
     }, 409);
   }
 
+  // Check circuit breaker - prevent runaway retry loops
+  const { checkCircuitBreaker, tripCircuitBreaker } = await import('../scheduled/task-dispatcher.ts');
+  const circuitBreaker = await checkCircuitBreaker(c.env.DB, taskId);
+  if (circuitBreaker.tripped) {
+    await tripCircuitBreaker(c.env.DB, taskId, tenantId, circuitBreaker.reason!);
+    return c.json({
+      success: false,
+      error: circuitBreaker.reason,
+      circuit_breaker: true,
+      quarantine_count: circuitBreaker.quarantineCount,
+    }, 429);
+  }
+
   // Get optional executor_type override from body
   const body = await c.req.json().catch(() => ({}));
   let executorType = body.executor_type as string | undefined;
