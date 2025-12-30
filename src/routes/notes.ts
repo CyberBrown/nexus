@@ -197,6 +197,9 @@ notes.get('/', async (c) => {
 
         const whereClause = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
 
+        // Get encryption key once for all search operations
+        const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
+
         // FTS5 search with try-catch to gracefully fall back to LIKE
         try {
           const result = await c.env.DB.prepare(`
@@ -214,7 +217,6 @@ notes.get('/', async (c) => {
           `).bind(...bindings).all<Note>();
 
           // Post-filter for exact term matching
-          const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
           const filteredResults: Note[] = [];
           for (const note of result.results) {
             const decrypted = await decryptFields(note, ENCRYPTED_FIELDS, encryptionKey);
@@ -268,7 +270,6 @@ notes.get('/', async (c) => {
 
         // Full scan fallback if still no results
         if (items.length === 0 && searchTerms.length > 0) {
-          const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
           const allNotes = await c.env.DB.prepare(`
             SELECT * FROM notes
             WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
