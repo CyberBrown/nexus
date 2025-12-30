@@ -128,7 +128,13 @@ notes.get('/', async (c) => {
         }
       }
 
-      const ftsQuery = ftsTerms.join(' ');
+      // Use explicit column prefix "search_text:" for proper FTS5 matching
+      const ftsQuery = ftsTerms.map(term => {
+        if (term.startsWith('"') && term.endsWith('"')) {
+          return `search_text:${term}`;
+        }
+        return `search_text:${term}`;
+      }).join(' ');
 
       if (ftsQuery) {
         // Build conditions

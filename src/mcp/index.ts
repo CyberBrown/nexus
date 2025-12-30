@@ -3458,22 +3458,24 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }
           }
 
-          // Auto-populate FTS index if empty but notes with search_text exist
-          if (ftsTableCreatedEmpty) {
-            const notesWithSearchText = await env.DB.prepare(`
-              SELECT id, search_text FROM notes
-              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL AND search_text IS NOT NULL AND search_text != ''
-            `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
+          // Auto-populate FTS index - always check for missing entries, not just when empty
+          // This handles the case where some notes exist in FTS but others are missing
+          const notesWithSearchText = await env.DB.prepare(`
+            SELECT n.id, n.search_text FROM notes n
+            LEFT JOIN notes_fts f ON n.id = f.note_id
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND n.search_text IS NOT NULL AND n.search_text != ''
+              AND f.note_id IS NULL
+          `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
 
-            if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
-              // Batch populate FTS index
-              for (const note of notesWithSearchText.results) {
-                try {
-                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                    .bind(note.id, note.search_text).run();
-                } catch {
-                  // Ignore duplicates
-                }
+          if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
+            // Batch populate FTS index for missing entries
+            for (const note of notesWithSearchText.results) {
+              try {
+                await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                  .bind(note.id, note.search_text).run();
+              } catch {
+                // Ignore duplicates
               }
             }
           }
@@ -3532,9 +3534,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // FTS5 uses implicit AND for space-separated terms
         // Note: "AND" is NOT a valid FTS5 operator - it would be treated as a literal term
-        // Simple space-separated terms work with D1/FTS5 - UNINDEXED columns are excluded from search
-        // No column prefix needed - matches REST API behavior in routes/notes.ts
-        const ftsQuery = ftsTerms.join(' ');
+        // Use explicit column prefix "search_text:" for clarity and to avoid issues with UNINDEXED columns
+        // Each term gets the column prefix to ensure proper matching
+        const ftsQuery = ftsTerms.map(term => {
+          // Quoted phrases keep their quotes, others get column prefix
+          if (term.startsWith('"') && term.endsWith('"')) {
+            return `search_text:${term}`;
+          }
+          return `search_text:${term}`;
+        }).join(' ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
