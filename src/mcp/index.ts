@@ -3676,17 +3676,23 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // PRIMARY SEARCH: FTS5 MATCH query for efficient multi-word search
         // Uses the notes_fts virtual table with porter stemming for word matching
-        // FTS5 interprets space-separated terms with implicit AND when quoted together
+        // FTS5 uses implicit AND for space-separated terms (each term with prefix wildcard)
         try {
           // Build FTS5 query: each term with prefix wildcard for partial matching
-          // Join with AND for multi-term matching (all terms must be present)
+          // FTS5 uses implicit AND for space-separated terms - do NOT use explicit AND with prefix matching
+          // For quoted phrases, keep them as exact phrase matches
           const ftsQuery = searchTerms
             .map(term => {
               const cleaned = term.replace(/["']/g, '');
+              // Check if this was originally a quoted phrase (contains space)
+              if (term.includes(' ')) {
+                // Quoted phrase - wrap in quotes for exact phrase matching
+                return `"${cleaned}"`;
+              }
               // Add prefix wildcard for partial matching (e.g., "valid" matches "validation")
               return `${cleaned}*`;
             })
-            .join(' AND ');
+            .join(' ');  // Space-separated = implicit AND in FTS5
 
           console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}"`);
 
