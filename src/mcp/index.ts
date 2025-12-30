@@ -3597,13 +3597,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query using explicit AND operators for multi-word search
-        // D1's FTS5 implementation requires explicit column targeting with parentheses
-        // for reliable multi-term AND matching. Format: search_text:(term1 AND term2)
+        // Build FTS5 query using space-separated terms for implicit AND matching
+        // SQLite FTS5 uses implicit AND for space-separated terms: "mcp validation"
+        // matches rows containing BOTH terms. This is more reliable than explicit AND syntax.
         // Post-filter still ensures all terms match after decryption.
-        const ftsQuery = ftsTerms.length > 1
-          ? `search_text:(${ftsTerms.join(' AND ')})`
-          : ftsTerms[0] || '';
+        const ftsQuery = ftsTerms.join(' ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
