@@ -261,7 +261,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         ).run();
 
         // Handle auto_dispatch if task is ready (status = 'next')
-        let dispatchResult = null;
+        let dispatchResult: {
+          dispatched: boolean;
+          queue_id?: string;
+          executor_type?: string;
+          priority?: number;
+          workflow_triggered?: boolean;
+          workflow_error?: string;
+          circuit_breaker?: boolean;
+          reason?: string;
+          quarantine_count?: number;
+        } | null = null;
         if (args.auto_dispatch && status === 'next') {
           // Determine executor type
           let executorType = args.executor_type;
@@ -430,16 +440,24 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           } // Close else block for circuit breaker check
         }
 
+        // Build message based on dispatch result
+        let message: string;
+        if (dispatchResult?.circuit_breaker) {
+          message = `Task created but not queued: circuit breaker tripped (${dispatchResult.reason}). ${dispatchResult.quarantine_count} quarantine(s) recorded.`;
+        } else if (dispatchResult?.dispatched && dispatchResult.executor_type) {
+          message = `Task created and queued for ${dispatchResult.executor_type} executor. ${getRoutingNote(dispatchResult.executor_type)} Use nexus_task_status to track progress.`;
+        } else if (status === 'next') {
+          message = `Task created with status "next". Use nexus_dispatch_task to queue it, or wait for the 15-minute cron.`;
+        } else {
+          message = `Task created successfully.`;
+        }
+
         const response: Record<string, unknown> = {
           success: true,
           task_id: taskId,
           title: args.title,
           status,
-          message: dispatchResult
-            ? `Task created and queued for ${dispatchResult.executor_type} executor. ${getRoutingNote(dispatchResult.executor_type)} Use nexus_task_status to track progress.`
-            : status === 'next'
-              ? `Task created with status "next". Use nexus_dispatch_task to queue it, or wait for the 15-minute cron.`
-              : `Task created successfully.`,
+          message,
         };
 
         if (dispatchResult) {

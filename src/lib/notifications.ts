@@ -63,10 +63,16 @@ export async function sendNtfyNotification(
     click?: string;
   }
 ): Promise<boolean> {
-  // DISABLED: Uncomment to re-enable notifications
+  // DISABLED: Notifications temporarily disabled to reduce noise
+  // To re-enable: uncomment the fetch code below and remove this early return
   console.log(`[NTFY DISABLED] Would send: ${title}`);
+  // Suppress unused variable warnings
+  void topic;
+  void message;
+  void options;
   return true;
 
+  /*
   try {
     const headers: Record<string, string> = {
       'Title': title,
@@ -101,6 +107,7 @@ export async function sendNtfyNotification(
     console.error('Failed to send ntfy notification:', error);
     return false;
   }
+  */
 }
 
 /**
