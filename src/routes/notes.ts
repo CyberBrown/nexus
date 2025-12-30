@@ -198,8 +198,8 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // D1's FTS5 requires explicit column prefix for reliable matching
-      // Space-separated terms are implicitly ANDed in FTS5
+      // D1's FTS5 works best with explicit AND operator for multi-word matching
+      // Terms are joined with AND for reliable matching
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -245,8 +245,9 @@ notes.get('/', async (c) => {
         }
       }
 
-      // Join with spaces - FTS5 implicitly ANDs space-separated terms
-      const ftsQuery = ftsTerms.join(' ');
+      // Join with explicit AND operator for reliable multi-word matching in D1's FTS5
+      // This is more reliable than implicit space-separated ANDing
+      const ftsQuery = ftsTerms.join(' AND ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
