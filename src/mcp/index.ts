@@ -3427,6 +3427,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Ensure FTS5 table exists with correct schema before searching
         // This fixes schema mismatch if old migration (0017) was applied
+        let ftsTableCreatedEmpty = false;
         try {
           // Check if table exists and has correct schema by looking for note_id column
           const tableInfo = await env.DB.prepare(
@@ -3443,6 +3444,38 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 tokenize='porter unicode61'
               )
             `).run();
+            ftsTableCreatedEmpty = true;
+          } else {
+            // Check if FTS table has entries for this user
+            const ftsCount = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes_fts
+              WHERE note_id IN (SELECT id FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL)
+            `).bind(tenantId, userId).first<{ cnt: number }>();
+
+            if (!ftsCount || ftsCount.cnt === 0) {
+              // FTS table exists but is empty - need to populate
+              ftsTableCreatedEmpty = true;
+            }
+          }
+
+          // Auto-populate FTS index if empty but notes with search_text exist
+          if (ftsTableCreatedEmpty) {
+            const notesWithSearchText = await env.DB.prepare(`
+              SELECT id, search_text FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL AND search_text IS NOT NULL AND search_text != ''
+            `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
+
+            if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
+              // Batch populate FTS index
+              for (const note of notesWithSearchText.results) {
+                try {
+                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                    .bind(note.id, note.search_text).run();
+                } catch {
+                  // Ignore duplicates
+                }
+              }
+            }
           }
         } catch {
           // Table check/creation failed, will fall back to search_text column
