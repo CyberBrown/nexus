@@ -198,8 +198,8 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // FTS5 uses implicit AND - space-separated terms must all match
-      // No column prefix needed - we only have one indexed column (search_text)
+      // Use column prefix 'search_text:' for D1 FTS5 compatibility
+      // Implicit AND (space-separated) works reliably in D1's FTS5 implementation
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -216,7 +216,8 @@ notes.get('/', async (c) => {
             // Escape special FTS5 characters and lowercase for porter tokenizer
             const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              ftsTerms.push(escaped);
+              // Use column prefix for D1 compatibility
+              ftsTerms.push(`search_text:${escaped}`);
             }
           }
         }
@@ -225,7 +226,8 @@ notes.get('/', async (c) => {
         if (phrase.length > 0) {
           // Escape any quotes within the phrase and lowercase for porter tokenizer
           const escapedPhrase = phrase.replace(/"/g, '').toLowerCase();
-          ftsTerms.push(`"${escapedPhrase}"`);
+          // Use column prefix for D1 compatibility
+          ftsTerms.push(`search_text:"${escapedPhrase}"`);
         }
         lastIndex = match.index + match[0].length;
       }
@@ -237,12 +239,14 @@ notes.get('/', async (c) => {
           // Escape special FTS5 characters and lowercase for porter tokenizer
           const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            ftsTerms.push(escaped);
+            // Use column prefix for D1 compatibility
+            ftsTerms.push(`search_text:${escaped}`);
           }
         }
       }
 
-      // Space-separated = implicit AND in FTS5 (all terms must match)
+      // Use space-separated terms (implicit AND) - D1's FTS5 treats this as requiring all terms
+      // This is more reliable than explicit AND keyword in D1
       const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
