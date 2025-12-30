@@ -3779,6 +3779,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         let searchMethod = 'none';
         const archivedCondition = include_archived ? '' : 'AND archived_at IS NULL';
+        let fullScanSamples: Array<{ id: string; title: string; missingTerms: string[] }> = [];
 
         // STEP 1: Try FTS5 search (fast path when index is populated)
         // NOTE: Full-scan in STEP 2 will catch any notes missed by FTS5
@@ -3946,10 +3947,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               ORDER BY pinned DESC, created_at DESC
             `).bind(tenantId, userId).all();
 
+            console.log(`[nexus_search_notes] Full scan fetched ${allNotes.results?.length || 0} notes`);
+
             // Track IDs already found by FTS5 or LIKE search to avoid duplicates
             const foundIds = new Set(matchingNotes.map(n => n.id));
             let notesRepaired = 0;
+            let notesScanned = 0;
+            let notesSkippedAlreadyFound = 0;
+            let notesNotMatching = 0;
             const foundBeforeFullScan = matchingNotes.length;
+            const sampleNonMatching: Array<{ id: string; title: string; missingTerms: string[] }> = [];
 
             for (const note of (allNotes.results || []) as Array<{
               id: string;
@@ -3963,8 +3970,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               created_at: string;
               search_text: string | null;
             }>) {
+              notesScanned++;
+
               // Skip notes already found by FTS5 or LIKE search
-              if (foundIds.has(note.id)) continue;
+              if (foundIds.has(note.id)) {
+                notesSkippedAlreadyFound++;
+                continue;
+              }
 
               // Decrypt title and content for matching
               const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
@@ -3976,6 +3988,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
               // Check if all search terms match
               if (!matchesAllTerms(searchableText)) {
+                notesNotMatching++;
+                // Collect sample of non-matching notes for diagnostics (first 3)
+                if (sampleNonMatching.length < 3) {
+                  const missingTerms = searchTerms.filter(term => !searchableText.includes(term));
+                  sampleNonMatching.push({
+                    id: note.id,
+                    title: decryptedTitle.substring(0, 50),
+                    missingTerms,
+                  });
+                }
                 continue;
               }
 
@@ -4016,15 +4038,27 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               if (matchingNotes.length >= maxLimit) break;
             }
 
-            // Update search method to reflect what happened
+            // Log full scan results
             const foundInFullScan = matchingNotes.length - foundBeforeFullScan;
-            if (foundInFullScan > 0 || notesRepaired > 0) {
-              const fullScanInfo = notesRepaired > 0 ? `full_scan_repaired_${notesRepaired}` : 'full_scan';
+            console.log(`[nexus_search_notes] Full scan complete: scanned=${notesScanned}, skipped=${notesSkippedAlreadyFound}, notMatching=${notesNotMatching}, found=${foundInFullScan}, repaired=${notesRepaired}`);
+
+            // Update search method to reflect what happened
+            if (foundInFullScan > 0 || notesRepaired > 0 || notesScanned > 0) {
+              const fullScanInfo = notesRepaired > 0
+                ? `full_scan_repaired_${notesRepaired}`
+                : foundInFullScan > 0
+                  ? 'full_scan'
+                  : `full_scan_no_match(scanned=${notesScanned})`;
               if (searchMethod === 'none' || searchMethod.startsWith('fts5_error')) {
                 searchMethod = fullScanInfo;
               } else {
                 searchMethod = `${searchMethod}+${fullScanInfo}`;
               }
+            }
+
+            // Store sample non-matching for diagnostics
+            if (sampleNonMatching.length > 0 && matchingNotes.length === 0) {
+              fullScanSamples = sampleNonMatching;
             }
           } catch (err) {
             console.error('Full scan search failed:', err);
@@ -4096,6 +4130,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                   sample_note_id: sampleNote.id,
                   sample_search_text_preview: sampleNote.search_text.substring(0, 200) + (sampleNote.search_text.length > 200 ? '...' : ''),
                   search_terms_used: searchTerms,
+                  full_scan_samples: fullScanSamples.length > 0 ? fullScanSamples : undefined,
                 };
               }
             } catch { /* ignore */ }
