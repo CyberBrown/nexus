@@ -217,8 +217,8 @@ notes.get('/', async (c) => {
             // Escape special FTS5 characters and lowercase for porter tokenizer
             const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              // No column prefix needed - notes_fts only has one searchable column
-              ftsTerms.push(escaped);
+              // Quote single terms for reliable matching (avoids porter stemmer issues)
+              ftsTerms.push(`"${escaped}"`);
               searchTerms.push(escaped);
             }
           }
@@ -242,8 +242,8 @@ notes.get('/', async (c) => {
           // Escape special FTS5 characters and lowercase for porter tokenizer
           const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            // No column prefix needed - notes_fts only has one searchable column
-            ftsTerms.push(escaped);
+            // Quote single terms for reliable matching (avoids porter stemmer issues)
+            ftsTerms.push(`"${escaped}"`);
             searchTerms.push(escaped);
           }
         }

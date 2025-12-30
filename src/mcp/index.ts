@@ -3531,10 +3531,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
               const lowerWord = word.toLowerCase();
               searchTerms.push(lowerWord);
-              // Escape special FTS5 characters
+              // Escape special FTS5 characters and quote single terms for reliable matching
               const escaped = lowerWord.replace(/[*^"():'"]/g, '');
               if (escaped.length > 0) {
-                ftsTerms.push(escaped);
+                // Quote single terms to ensure literal matching (avoids porter stemmer issues)
+                ftsTerms.push(`"${escaped}"`);
               }
             }
           }
@@ -3555,10 +3556,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
             const lowerWord = word.toLowerCase();
             searchTerms.push(lowerWord);
-            // Escape special FTS5 characters
+            // Escape special FTS5 characters and quote single terms for reliable matching
             const escaped = lowerWord.replace(/[*^"():'"]/g, '');
             if (escaped.length > 0) {
-              ftsTerms.push(escaped);
+              // Quote single terms to ensure literal matching (avoids porter stemmer issues)
+              ftsTerms.push(`"${escaped}"`);
             }
           }
         }
