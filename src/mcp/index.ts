@@ -3752,6 +3752,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // (both implicit space-separated and explicit AND). Some queries work, others silently return 0 results.
         // By using OR, we reliably get all notes containing ANY term, then filter in code.
         // This matches the working implementation in REST API routes/notes.ts
+        //
+        // FTS5 query format: Use simple terms joined with OR
+        // Example: "mcp OR validation" for query "MCP validation"
         const ftsQuery = ftsTerms.length > 0
           ? ftsTerms.join(' OR ')
           : '';
@@ -3798,6 +3801,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               LIMIT ?
             `).bind(ftsQuery, tenantId, userId, ftsLimit).all();
 
+            console.log(`[nexus_search_notes] FTS5 returned ${ftsSearchResults.results?.length || 0} raw results`);
             if (ftsSearchResults.results && ftsSearchResults.results.length > 0) {
               searchMethod = 'fts5';
               for (const note of ftsSearchResults.results as Array<{
@@ -3851,11 +3855,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // STEP 2: Try LIKE-based search on search_text column (more reliable than FTS5)
         // This works when search_text is properly populated but FTS5 index is stale/broken
         // Uses SQL LIKE with % wildcards for substring matching
+        // IMPORTANT: This step is critical for multi-word search when FTS5 fails
         if (matchingNotes.length < maxLimit && searchTerms.length > 0) {
           try {
             // Build LIKE conditions for each search term
             // Each term must appear somewhere in search_text
-            const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
+            // Use LOWER() for case-insensitive matching (search_text should already be lowercase, but be safe)
+            const likeConditions = searchTerms.map(() => 'LOWER(search_text) LIKE LOWER(?)').join(' AND ');
             const likeBindings = searchTerms.map(term => `%${term}%`);
 
             const likeSearchResults = await env.DB.prepare(`
@@ -3869,6 +3875,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               LIMIT ?
             `).bind(tenantId, userId, ...likeBindings, maxLimit * 2).all();
 
+            console.log(`[nexus_search_notes] LIKE search returned ${likeSearchResults.results?.length || 0} raw results`);
             if (likeSearchResults.results && likeSearchResults.results.length > 0) {
               // Track IDs already found by FTS5 to avoid duplicates
               const foundIds = new Set(matchingNotes.map(n => n.id));
@@ -3925,10 +3932,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // STEP 3: Full scan with decryption for notes missing search_text
-        // This is the last resort for notes without search_text populated
-        // Only runs if we still need more results
+        // This is the last resort - it decrypts all notes and matches against actual content
+        // CRITICAL: This catches notes where search_text contains encrypted garbage from old migrations
+        // Always runs if we haven't found enough results (which includes finding 0 results)
         if (matchingNotes.length < maxLimit) {
           try {
+            console.log(`[nexus_search_notes] Running full scan (found ${matchingNotes.length} so far, need ${maxLimit})`);
             const allNotes = await env.DB.prepare(`
               SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
               FROM notes

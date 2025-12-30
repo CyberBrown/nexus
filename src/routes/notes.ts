@@ -420,10 +420,12 @@ notes.get('/', async (c) => {
 
         // If FTS5 returned no results, try LIKE-based search on search_text column
         // This is more reliable when search_text is populated but FTS5 index is stale
+        // IMPORTANT: This is critical for multi-word search when FTS5 fails
         if (items.length === 0 && searchTerms.length > 0) {
           try {
             // Build LIKE conditions for each search term
-            const likeConditions = searchTerms.map(() => 'n.search_text LIKE ?').join(' AND ');
+            // Use LOWER() for case-insensitive matching
+            const likeConditions = searchTerms.map(() => 'LOWER(n.search_text) LIKE LOWER(?)').join(' AND ');
             const likeBindings: (string | number)[] = [tenantId, userId];
             for (const term of searchTerms) {
               likeBindings.push(`%${term}%`);
