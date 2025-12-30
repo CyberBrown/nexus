@@ -2516,7 +2516,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // This prevents marking tasks complete when AI says "I couldn't find..." or similar
         // IMPORTANT: Keep this in sync with TaskExecutorWorkflow.ts and /workflow-callback handler
         if (notes) {
-          const notesLower = notes.toLowerCase();
+          // Normalize quotes to handle typographic apostrophes (e.g., ' vs ')
+          const normalizeQuotes = (text: string): string => text
+            .replace(/[\u2018\u2019\u201A\u201B]/g, "'")  // Single curly quotes → '
+            .replace(/[\u201C\u201D\u201E\u201F]/g, '"'); // Double curly quotes → "
+
+          const notesLower = normalizeQuotes(notes.toLowerCase());
           const failureIndicators = [
             // Resource not found patterns
             "couldn't find", "could not find", "can't find", "cannot find",
@@ -3601,10 +3606,72 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               )
             `).run();
             ftsSchemaFixed = true;
-            // Note: FTS will be empty, fallback scan will auto-populate it
           }
         } catch {
           // Schema check failed, FTS may not be available
+        }
+
+        // Auto-populate FTS index BEFORE searching (same as notes route)
+        // This ensures notes are searchable even if they weren't indexed when created
+        try {
+          // Find notes that have search_text but are missing from FTS
+          const notesWithSearchText = await env.DB.prepare(`
+            SELECT n.id, n.search_text FROM notes n
+            LEFT JOIN notes_fts f ON n.id = f.note_id
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND n.search_text IS NOT NULL AND n.search_text != ''
+              AND f.note_id IS NULL
+            LIMIT 100
+          `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
+
+          if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
+            for (const note of notesWithSearchText.results) {
+              try {
+                await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                  .bind(note.id, note.search_text).run();
+              } catch {
+                // Ignore duplicates or FTS errors
+              }
+            }
+          }
+
+          // Find notes WITHOUT search_text - decrypt and populate both columns
+          const notesWithoutSearchText = await env.DB.prepare(`
+            SELECT n.id, n.title, n.content, n.tags FROM notes n
+            LEFT JOIN notes_fts f ON n.id = f.note_id
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND (n.search_text IS NULL OR n.search_text = '')
+              AND f.note_id IS NULL
+            LIMIT 50
+          `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
+
+          if (notesWithoutSearchText.results && notesWithoutSearchText.results.length > 0) {
+            for (const note of notesWithoutSearchText.results) {
+              try {
+                // Decrypt title and content
+                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                const tagsText = note.tags ? String(note.tags) : '';
+
+                // Build search_text (lowercase for FTS case sensitivity)
+                const searchText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.trim().toLowerCase();
+
+                if (searchText) {
+                  // Update notes table with search_text
+                  await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                    .bind(searchText, note.id).run();
+
+                  // Insert into FTS index
+                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                    .bind(note.id, searchText).run();
+                }
+              } catch {
+                // Ignore individual note errors
+              }
+            }
+          }
+        } catch {
+          // Auto-populate failed, search will still work via fallback
         }
 
         // Try FTS5 search first

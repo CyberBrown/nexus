@@ -151,12 +151,33 @@ const FAILURE_INDICATORS = [
 ];
 
 /**
+ * Normalize text for comparison by replacing curly quotes with straight quotes
+ * This handles cases where AI outputs use typographic quotes instead of standard ASCII
+ */
+function normalizeQuotes(text: string): string {
+  return text
+    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")  // Single curly quotes → '
+    .replace(/[\u201C\u201D\u201E\u201F]/g, '"'); // Double curly quotes → "
+}
+
+/**
  * Check if an AI response contains failure indicators
  * Returns true if the response suggests the task wasn't actually completed
+ *
+ * This function normalizes quotes to handle typographic apostrophes (e.g., ' vs ')
+ * and logs the first matched indicator for debugging
  */
 function containsFailureIndicators(text: string): boolean {
-  const lowerText = text.toLowerCase();
-  return FAILURE_INDICATORS.some(indicator => lowerText.includes(indicator));
+  // Normalize quotes and convert to lowercase for comparison
+  const normalizedText = normalizeQuotes(text.toLowerCase());
+
+  for (const indicator of FAILURE_INDICATORS) {
+    if (normalizedText.includes(indicator)) {
+      console.log(`[TaskExecutor] Failure indicator matched: "${indicator}" in text (first 200 chars): ${text.substring(0, 200)}`);
+      return true;
+    }
+  }
+  return false;
 }
 
 export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorParams> {

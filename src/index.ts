@@ -1609,7 +1609,13 @@ app.post('/workflow-callback', async (c) => {
           // Validate that work was actually done - check for failure indicators
           // This comprehensive list catches cases where AI says "success" but didn't actually complete work
           // IMPORTANT: Keep this in sync with DE's nexus-callback.ts FAILURE_INDICATORS
-          const resultLower = (resultText || '').toLowerCase();
+
+          // Normalize quotes to handle typographic apostrophes (e.g., ' vs ')
+          const normalizeQuotes = (text: string): string => text
+            .replace(/[\u2018\u2019\u201A\u201B]/g, "'")  // Single curly quotes → '
+            .replace(/[\u201C\u201D\u201E\u201F]/g, '"'); // Double curly quotes → "
+
+          const resultLower = normalizeQuotes((resultText || '').toLowerCase());
           const failureIndicators = [
             // Resource not found patterns
             "couldn't find",
