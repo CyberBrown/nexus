@@ -3679,6 +3679,60 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               }
             }
           }
+
+          // CRITICAL FIX: Detect and repair notes with corrupted/encrypted search_text
+          // This handles notes where search_text was populated with encrypted garbage
+          // from old migration 0017 before encryption was disabled
+          // We check if the decrypted title appears in search_text - if not, it's corrupted
+          const notesWithPotentiallyCorruptedSearchText = await env.DB.prepare(`
+            SELECT n.id, n.title, n.content, n.tags, n.search_text
+            FROM notes n
+            WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+              AND n.search_text IS NOT NULL AND n.search_text != ''
+            LIMIT 100
+          `).bind(tenantId, userId).all<{
+            id: string;
+            title: string | null;
+            content: string | null;
+            tags: string | null;
+            search_text: string;
+          }>();
+
+          if (notesWithPotentiallyCorruptedSearchText.results && notesWithPotentiallyCorruptedSearchText.results.length > 0) {
+            for (const note of notesWithPotentiallyCorruptedSearchText.results) {
+              try {
+                // Decrypt the title to get actual content
+                const decTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+
+                if (decTitle) {
+                  // Check if first 15 chars of decrypted title appear in search_text
+                  // If not, search_text is likely corrupted with encrypted garbage
+                  const titlePrefix = decTitle.toLowerCase().substring(0, 15);
+                  const searchTextLower = note.search_text.toLowerCase();
+
+                  if (!searchTextLower.includes(titlePrefix)) {
+                    // search_text is corrupted - rebuild it
+                    const decContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                    const tagsText = note.tags ? String(note.tags) : '';
+                    const newSearchText = `${decTitle} ${decContent} ${tagsText}`.trim().toLowerCase();
+
+                    if (newSearchText) {
+                      // Update notes table with correct search_text
+                      await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                        .bind(newSearchText, note.id).run();
+
+                      // Update FTS index
+                      await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                      await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                        .bind(note.id, newSearchText).run();
+                    }
+                  }
+                }
+              } catch {
+                // Ignore errors for individual notes
+              }
+            }
+          }
         } catch {
           // Index population failed, continue with search - fallbacks will handle it
         }
