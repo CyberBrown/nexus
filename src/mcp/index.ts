@@ -3579,9 +3579,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
             `).bind(tenantId, userId).first<{ cnt: number }>();
 
-            // If FTS has significantly fewer entries than notes, trigger rebuild
-            if ((ftsCount?.cnt || 0) < (notesCount?.cnt || 0) * 0.8) {
+            // If FTS has ANY fewer entries than notes, trigger rebuild
+            // Changed from 80% threshold to exact match - ensures all notes are searchable
+            if ((ftsCount?.cnt || 0) < (notesCount?.cnt || 0)) {
               ftsNeedsRebuild = true;
+              console.log(`[nexus_search_notes] FTS index incomplete: ${ftsCount?.cnt || 0}/${notesCount?.cnt || 0} notes indexed`);
             }
           }
 
@@ -3711,14 +3713,21 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let searchMethod = 'none';
         const archivedCondition = include_archived ? '' : 'AND archived_at IS NULL';
 
-        // Build FTS5 query with OR operator
-        // CRITICAL: Use OR to get broad results, then post-filter for AND semantics
-        // D1's FTS5 has INCONSISTENT behavior with implicit AND (space-separated terms)
-        // Some queries work, others silently return 0 results. Using OR is reliable.
-        const ftsQuery = ftsTerms.join(' OR ');
+        // Build FTS5 query with proper AND semantics
+        // FTS5 supports: term1 AND term2 (explicit AND) or term1 term2 (implicit AND)
+        // We use explicit AND for clarity and wrap each term for safety
+        // For quoted phrases, we keep them quoted for exact phrase matching
+        const ftsQuery = ftsTerms.map(term => {
+          // Already quoted phrases stay as-is
+          if (term.startsWith('"') && term.endsWith('"')) {
+            return term;
+          }
+          // Single terms don't need wrapping
+          return term;
+        }).join(' AND ');
 
         // STEP 1: FTS5 search (PRIMARY method)
-        // Uses OR operator for broad matching, then post-filters for AND semantics
+        // Uses explicit AND operator for multi-word search
         try {
           console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}", terms=[${searchTerms.join(', ')}]`);
 

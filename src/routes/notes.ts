@@ -63,7 +63,8 @@ notes.get('/', async (c) => {
             SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
           `).bind(tenantId, userId).first<{ cnt: number }>();
 
-          if ((ftsCount?.cnt || 0) < (notesCount?.cnt || 0) * 0.8) {
+          // If FTS has ANY fewer entries than notes, trigger rebuild
+          if ((ftsCount?.cnt || 0) < (notesCount?.cnt || 0)) {
             ftsNeedsRebuild = true;
           }
         }
@@ -153,8 +154,9 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query with OR (then post-filter for AND)
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' OR ') : '';
+      // Build FTS5 query with AND for multi-word search
+      // FTS5 supports: term1 AND term2 (explicit AND)
+      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' AND ') : '';
 
       if (ftsQuery) {
         // Build conditions
