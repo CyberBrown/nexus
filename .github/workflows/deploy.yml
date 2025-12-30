@@ -33,6 +33,7 @@ jobs:
         run: npx wrangler --version
 
       - name: Deploy Nexus MCP Worker
-        run: npx wrangler deploy --config wrangler.nexus-mcp.toml
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: deploy --config wrangler.nexus-mcp.toml
