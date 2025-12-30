@@ -198,9 +198,8 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // Use explicit AND operators for reliability across SQLite/D1 implementations
-      // For phrases: quote them to require exact sequence match
-      // Note: Column prefix is NOT needed - our FTS table has only one indexed column (search_text)
+      // FTS5 uses implicit AND - space-separated terms must all match
+      // No column prefix needed - we only have one indexed column (search_text)
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -214,11 +213,9 @@ notes.get('/', async (c) => {
         const before = trimmedSearch.slice(lastIndex, match.index).trim();
         if (before) {
           for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
-            // Escape special FTS5 characters
-            // MUST lowercase because porter tokenizer normalizes to lowercase
+            // Escape special FTS5 characters and lowercase for porter tokenizer
             const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              // Just the term - no column prefix needed for single-column FTS
               ftsTerms.push(escaped);
             }
           }
@@ -237,19 +234,16 @@ notes.get('/', async (c) => {
       const remaining = trimmedSearch.slice(lastIndex).trim();
       if (remaining) {
         for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
-          // Escape special FTS5 characters
-          // MUST lowercase because porter tokenizer normalizes to lowercase
+          // Escape special FTS5 characters and lowercase for porter tokenizer
           const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            // Just the term - no column prefix needed for single-column FTS
             ftsTerms.push(escaped);
           }
         }
       }
 
-      // Use explicit AND for multi-word queries to ensure all terms must match
-      // This is more reliable than implicit AND (space-separated) in some SQLite implementations
-      const ftsQuery = ftsTerms.length > 1 ? ftsTerms.join(' AND ') : (ftsTerms[0] || '');
+      // Space-separated = implicit AND in FTS5 (all terms must match)
+      const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
