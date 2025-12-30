@@ -181,6 +181,27 @@ notes.get('/', async (c) => {
       const ftsQuery = ftsTerms.length > 0 ? `search_text:(${ftsTerms.join(' ')})` : '';
 
       if (ftsQuery) {
+        // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
+        try {
+          const tableInfo = await c.env.DB.prepare(
+            `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
+          ).first<{ name: string } | null>();
+
+          if (!tableInfo) {
+            // FTS table either doesn't exist or has old schema - recreate with correct schema
+            await c.env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+            await c.env.DB.prepare(`
+              CREATE VIRTUAL TABLE notes_fts USING fts5(
+                note_id UNINDEXED,
+                search_text,
+                tokenize='porter unicode61'
+              )
+            `).run();
+          }
+        } catch {
+          // Schema check failed, FTS may not be available - will fall back to in-memory search
+        }
+
         // Build conditions
         const conditions: string[] = [];
         const bindings: (string | number)[] = [ftsQuery, tenantId, userId];

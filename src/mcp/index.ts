@@ -3522,7 +3522,31 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let usedFts = false;
         let ftsMatchCount = 0;
         let fallbackMatchCount = 0;
+        let ftsSchemaFixed = false;
         const maxLimit = limit || 20;
+
+        // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
+        try {
+          const tableInfo = await env.DB.prepare(
+            `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
+          ).first<{ name: string } | null>();
+
+          if (!tableInfo) {
+            // FTS table either doesn't exist or has old schema - recreate with correct schema
+            await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+            await env.DB.prepare(`
+              CREATE VIRTUAL TABLE notes_fts USING fts5(
+                note_id UNINDEXED,
+                search_text,
+                tokenize='porter unicode61'
+              )
+            `).run();
+            ftsSchemaFixed = true;
+            // Note: FTS will be empty, fallback scan will auto-populate it
+          }
+        } catch {
+          // Schema check failed, FTS may not be available
+        }
 
         // Try FTS5 search first
         try {
@@ -3658,7 +3682,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           response.search_method = 'fts5';
         } else if (fallbackMatchCount > 0) {
           response.search_method = 'fallback_scan';
-          response.hint = 'Run nexus_rebuild_notes_fts to enable faster FTS5 search.';
+          if (ftsSchemaFixed) {
+            response.hint = 'FTS5 schema was auto-repaired. Run nexus_rebuild_notes_fts to populate the full-text index for faster searches.';
+          } else {
+            response.hint = 'Run nexus_rebuild_notes_fts to enable faster FTS5 search.';
+          }
         }
 
         return {
