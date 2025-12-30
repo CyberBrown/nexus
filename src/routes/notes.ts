@@ -155,18 +155,17 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query with AND semantics (FTS5 default for space-separated terms)
-      // Use column filter syntax "search_text:term" for reliable matching in D1
+      // Use plain terms - FTS5 searches the indexed column (search_text) by default
       // Porter stemmer handles word variations (e.g., "validate" matches "validation")
       // Post-filter with matchesAllTerms() ensures exact term presence in decrypted content
       const ftsQuery = ftsTerms.length > 0
         ? ftsTerms.map(term => {
             if (term.startsWith('"') && term.endsWith('"')) {
-              // Quoted phrase - use column filter with phrase
-              const phrase = term.slice(1, -1); // Remove quotes
-              return `search_text:"${phrase}"`;
+              // Quoted phrase - keep quotes for phrase matching
+              return term;
             }
-            // Use column filter syntax for single terms
-            return `search_text:${term}`;
+            // Plain term - FTS5 will apply porter stemmer
+            return term;
           }).join(' ')
         : '';
 

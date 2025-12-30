@@ -3681,8 +3681,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Uses the notes_fts virtual table with porter stemming for word matching
         // FTS5 uses implicit AND for space-separated terms
         try {
-          // Build FTS5 query: explicitly target the search_text column
-          // Use column filter syntax "search_text:term" for reliable matching in D1
+          // Build FTS5 query using plain terms (no column filter prefix needed)
+          // Since notes_fts only has one indexed column (search_text), FTS5 searches it by default
           // Space-separated terms = implicit AND in FTS5
           // Porter stemmer handles word variations (e.g., "validate" matches "validation")
           const ftsQuery = searchTerms
@@ -3691,10 +3691,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               // Check if this was originally a quoted phrase (contains space)
               if (term.includes(' ')) {
                 // Quoted phrase - wrap in quotes for exact phrase matching
-                return `search_text:"${cleaned}"`;
+                return `"${cleaned}"`;
               }
-              // Use column filter syntax for single terms
-              return `search_text:${cleaned}`;
+              // Plain term - FTS5 will apply porter stemmer
+              return cleaned;
             })
             .join(' ');  // Space-separated = implicit AND in FTS5
 
