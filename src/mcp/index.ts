@@ -19,7 +19,6 @@ import { getEncryptionKey, encryptField, decryptField, decryptFields } from '../
 import { executeQueueEntry, promoteDependentTasks } from '../scheduled/task-executor.ts';
 import { hasUnmetDependencies, determineExecutorType } from '../scheduled/task-dispatcher.ts';
 import { archiveQueueEntry, archiveQueueEntriesByTask } from '../lib/queue-archive.ts';
-import { createIntakeClient } from '../lib/intake-client.ts';
 import { findFailureIndicator } from '../lib/validation.ts';
 
 // ========================================
@@ -266,8 +265,6 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           queue_id?: string;
           executor_type?: string;
           priority?: number;
-          workflow_triggered?: boolean;
-          workflow_error?: string;
           circuit_breaker?: boolean;
           reason?: string;
           quarantine_count?: number;
@@ -391,52 +388,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             queue_id: queueId,
             executor_type: executorType,
             priority,
-            workflow_triggered: false as boolean,
-            workflow_error: undefined as string | undefined,
           };
-
-          // Trigger workflow for 'ai' tasks via INTAKE service binding
-          // INTAKE routes to PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
-          const intakeClient = createIntakeClient(env);
-          if (executorType === 'ai' && intakeClient) {
-            try {
-              const intakeResult = await intakeClient.triggerWorkflow({
-                query: `Execute task: ${args.title}`,
-                task_type: 'code',
-                task_id: taskId,
-                prompt: args.description || args.title,
-                callback_url: `${env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev'}/workflow-callback`,
-                timeout_ms: 300000, // 5 minutes
-                metadata: {
-                  source: 'nexus_create_task',
-                  queue_id: queueId,
-                },
-              });
-
-              if (intakeResult.success) {
-                // Update queue status to 'dispatched' since workflow is triggered
-                await env.DB.prepare(`
-                  UPDATE execution_queue SET status = 'dispatched', updated_at = ? WHERE id = ?
-                `).bind(now, queueId).run();
-
-                // Update task status to 'scheduled' since workflow is running
-                await env.DB.prepare(`
-                  UPDATE tasks SET status = 'scheduled', updated_at = ? WHERE id = ?
-                `).bind(now, taskId).run();
-
-                dispatchResult.workflow_triggered = true;
-                console.log(`[nexus_create_task] Workflow triggered via INTAKE for task ${taskId}: ${intakeResult.workflow_instance_id}`);
-              } else {
-                throw new Error(intakeResult.error || 'Unknown INTAKE error');
-              }
-            } catch (workflowError: any) {
-              // Log but don't fail - task is still queued even if workflow trigger fails
-              // Cron will pick it up as a fallback
-              console.warn(`[nexus_create_task] Failed to trigger workflow: ${workflowError.message}`);
-              dispatchResult.workflow_triggered = false;
-              dispatchResult.workflow_error = workflowError.message;
-            }
-          }
           } // Close else block for circuit breaker check
         }
 
@@ -5272,10 +5224,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_execute_task
+  // Tool: nexus_execute_task - DEPRECATED
   server.tool(
     'nexus_execute_task',
-    'Execute a queued task immediately via sandbox-executor. Routes AI tasks to /execute endpoint (uses OAuth credentials). Use this for immediate task execution instead of waiting for the 15-minute cron.',
+    'DEPRECATED - Nexus is now queue-only. Use nexus_check_queue to poll for tasks, nexus_claim_queue_task to claim them, and nexus_complete_queue_task to report results. This tool now returns an error.',
     {
       queue_id: z.string().uuid().describe('Queue entry ID to execute (from nexus_check_queue)'),
       repo: z.string().optional().describe('GitHub repo in owner/repo format (e.g., "CyberBrown/nexus"). Overrides any repo in task context. For AI tasks only.'),
@@ -5335,10 +5287,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_run_executor
+  // Tool: nexus_run_executor - DEPRECATED
   server.tool(
     'nexus_run_executor',
-    'Run the task executor immediately to process all queued AI tasks. This is the same as what the 15-minute cron does, but triggered manually. Only processes "ai" executor_type tasks.',
+    'DEPRECATED - Nexus is now queue-only and does NOT execute tasks. The cron only queues tasks. External executors poll the queue using nexus_check_queue. This tool is now a no-op.',
     {
       executor_type: z.enum(['ai', 'all']).optional()
         .describe('Filter to only execute tasks of this type. Default: all (which only runs ai tasks)'),

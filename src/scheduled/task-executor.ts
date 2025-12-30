@@ -1,17 +1,19 @@
-// Task Executor - Execute queued tasks via DE Intake
-// Runs after dispatchTasks() to process queued work items
+// Task Executor - Queue management only
+// Nexus is now a pure queue manager - external executors poll the queue via MCP tools
 //
-// Simplified executor types:
-// - 'ai': Full AI autonomy, auto-dispatch via intake (DE workflow execution)
-// - 'human-ai': Human leads with AI assist (human pulls from queue)
-// - 'human': Human only, never auto-dispatch
+// Executor types:
+// - 'ai': Full AI autonomy (external executors like Claude Code, Claude AI)
+// - 'human-ai': Human leads with AI assist
+// - 'human': Human only
 //
-// Only 'ai' tasks are auto-executed via intake. No fallback paths.
+// External executors use:
+// - nexus_check_queue: Poll for queued tasks
+// - nexus_claim_queue_task: Claim a task to work on
+// - nexus_complete_queue_task: Report completion
 
 import type { Env, Task } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
-import { createIntakeClient, IntakeClient } from '../lib/intake-client.ts';
-import { isOAuthError, isRoutingError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
+import { isOAuthError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
 import {
   type ExecutorType,
   hasUnmetDependencies,
@@ -49,18 +51,6 @@ interface QueueEntry {
   max_retries: number;
 }
 
-interface TaskRow {
-  id: string;
-  title: string;
-  description: string | null;
-  project_id: string | null;
-  domain: string;
-  due_date: string | null;
-  energy_required: string;
-  source_type: string | null;
-  source_reference: string | null;
-}
-
 interface ExecutionStats {
   processed: number;
   completed: number;
@@ -72,20 +62,6 @@ interface ExecutionStats {
 // ========================================
 // Helper Functions
 // ========================================
-
-/**
- * Safely decrypt a field, returning original value if decryption fails
- */
-async function safeDecrypt(value: unknown, key: CryptoKey | null): Promise<string> {
-  if (!value || typeof value !== 'string') {
-    return '';
-  }
-  try {
-    return await decryptField(value, key);
-  } catch {
-    return value;
-  }
-}
 
 /**
  * Claim a queue entry for execution
@@ -310,41 +286,10 @@ async function failEntry(
   }
 }
 
-/**
- * Mark queue entry as dispatched to workflow
- * Used when triggering parallel workflows via intake - we don't wait for completion
- */
-async function markEntryAsDispatched(
-  db: D1Database,
-  entry: QueueEntry,
-  workflowInstanceId: string
-): Promise<void> {
-  const now = new Date().toISOString();
-
-  await db.prepare(`
-    UPDATE execution_queue
-    SET status = 'dispatched', claimed_at = ?, claimed_by = ?, updated_at = ?
-    WHERE id = ?
-  `).bind(now, `workflow:${workflowInstanceId}`, now, entry.id).run();
-
-  // Log dispatch
-  await db.prepare(`
-    INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
-    VALUES (?, ?, ?, ?, ?, 'dispatched', ?, ?)
-  `).bind(
-    crypto.randomUUID(),
-    entry.tenant_id,
-    entry.id,
-    entry.task_id,
-    entry.executor_type,
-    JSON.stringify({ workflow_instance_id: workflowInstanceId, source: 'task_executor_parallel' }),
-    now
-  ).run();
-}
 
 /**
  * Promote dependent tasks when a task completes
- * Finds tasks that depend on the completed task and auto-dispatches them if all deps are now met
+ * Finds tasks that depend on the completed task and queues them if all deps are now met
  */
 export async function promoteDependentTasks(
   env: Env,
@@ -353,7 +298,6 @@ export async function promoteDependentTasks(
 ): Promise<{ promoted: number; dispatched: number }> {
   const now = new Date().toISOString();
   let promoted = 0;
-  let dispatched = 0;
 
   // Find tasks that depend on the completed task
   const dependents = await env.DB.prepare(`
@@ -375,8 +319,6 @@ export async function promoteDependentTasks(
 
   // Get encryption key for decrypting task titles
   const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-  const intakeClient = createIntakeClient(env);
-  const callbackBaseUrl = env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev';
 
   for (const dep of dependents.results) {
     // Check if ALL dependencies are now met
@@ -423,36 +365,6 @@ export async function promoteDependentTasks(
     const queueId = await queueTask(env.DB, { ...task, title }, executorType, tenantId);
     console.log(`Queued unblocked task ${dep.task_id} as ${executorType} (queue_id: ${queueId})`);
 
-    // For 'ai' tasks, trigger workflow immediately
-    if (executorType === 'ai' && intakeClient) {
-      const intakeAvailable = await intakeClient.healthCheck();
-      if (intakeAvailable) {
-        // Get the queue entry we just created
-        const entry = await env.DB.prepare(`
-          SELECT eq.*, t.title, t.description, t.project_id, t.domain,
-                 t.due_date, t.energy_required, t.source_type, t.source_reference
-          FROM execution_queue eq
-          JOIN tasks t ON eq.task_id = t.id
-          WHERE eq.id = ? AND eq.tenant_id = ?
-        `).bind(queueId, tenantId).first<QueueEntry & TaskRow>();
-
-        if (entry) {
-          // Claim and trigger workflow
-          const claimed = await claimEntry(env.DB, entry, `dependency-promotion-${Date.now()}`);
-          if (claimed) {
-            const result = await triggerWorkflowForEntry(intakeClient, entry, encryptionKey, callbackBaseUrl);
-            if (result.success && result.workflowInstanceId) {
-              await markEntryAsDispatched(env.DB, entry, result.workflowInstanceId);
-              dispatched++;
-              console.log(`Auto-dispatched unblocked task ${dep.task_id} (workflow: ${result.workflowInstanceId})`);
-            } else {
-              console.warn(`Failed to dispatch unblocked task ${dep.task_id}: ${result.error}`);
-            }
-          }
-        }
-      }
-    }
-
     // Log the dependency promotion
     await env.DB.prepare(`
       INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
@@ -465,358 +377,61 @@ export async function promoteDependentTasks(
       executorType,
       JSON.stringify({
         unblocked_by: completedTaskId,
-        auto_dispatched: dispatched > 0,
       }),
       now
     ).run();
   }
 
-  return { promoted, dispatched };
+  return { promoted, dispatched: 0 };
 }
 
-/**
- * Trigger a workflow for a task via intake service
- * Returns immediately after workflow is created - callbacks handle completion
- */
-async function triggerWorkflowForEntry(
-  intakeClient: IntakeClient,
-  entry: QueueEntry & TaskRow,
-  encryptionKey: CryptoKey | null,
-  callbackBaseUrl: string
-): Promise<{ success: boolean; workflowInstanceId?: string; error?: string }> {
-  try {
-    // Decrypt task fields
-    const title = await safeDecrypt(entry.title, encryptionKey);
-    const description = await safeDecrypt(entry.description, encryptionKey);
-
-    // Parse context for repo/branch info
-    let context: Record<string, unknown> | null = null;
-    if (entry.context) {
-      try {
-        context = JSON.parse(entry.context);
-      } catch {
-        const decryptedContext = await safeDecrypt(entry.context, encryptionKey);
-        if (decryptedContext) {
-          try {
-            context = JSON.parse(decryptedContext);
-          } catch {
-            // Ignore parse errors
-          }
-        }
-      }
-    }
-
-    // Build task description
-    let taskDescription = `## Task: ${title}`;
-    if (description) {
-      taskDescription += `\n\n## Description\n${description}`;
-    }
-    if (context) {
-      if (context.domain) {
-        taskDescription += `\n\n## Domain: ${context.domain}`;
-      }
-      if (context.source_reference) {
-        taskDescription += `\n## Reference: ${context.source_reference}`;
-      }
-    }
-
-    // Extract repo info from context (for code tasks)
-    const repo = context?.repo as string | undefined;
-    const repoUrl = repo ? `https://github.com/${repo}` : undefined;
-
-    // Trigger workflow via intake
-    const response = await intakeClient.triggerWorkflow({
-      query: taskDescription,
-      task_type: 'code',
-      app_id: 'nexus',
-      task_id: entry.task_id,
-      prompt: taskDescription,
-      repo_url: repoUrl,
-      executor: 'claude', // Prefer Claude, workflow will fallover to Gemini if needed
-      callback_url: `${callbackBaseUrl}/workflow-callback`,
-      metadata: {
-        queue_entry_id: entry.id,
-        tenant_id: entry.tenant_id,
-        executor_type: entry.executor_type,
-        title: title,
-      },
-      timeout_ms: 600000, // 10 minutes for AI tasks
-    });
-
-    if (response.success && response.workflow_instance_id) {
-      return {
-        success: true,
-        workflowInstanceId: response.workflow_instance_id,
-      };
-    } else {
-      return {
-        success: false,
-        error: response.error || response.message || 'Unknown intake error',
-      };
-    }
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
 
 // ========================================
 // Main Executor Function
 // ========================================
 
 /**
- * Execute queued tasks via DE Workflows (intake service)
+ * Execute queued tasks - NO-OP
  *
- * Routes ALL 'ai' tasks through intake service for parallel workflow execution.
- * No fallback to sandbox or DE direct - intake is the single entry point.
+ * Nexus is now a pure queue manager. External executors (Claude Code, Claude AI via MCP, humans)
+ * poll the queue using nexus_check_queue and claim tasks using nexus_claim_queue_task.
  *
- * Features:
- * - Triggers CodeExecutionWorkflow via intake service binding
- * - Workflows run in parallel with automatic fallover (Claude -> Gemini)
- * - Built-in retries, crash recovery, callbacks to Nexus
- * - No batch limit - all tasks triggered immediately
+ * This function is kept for backward compatibility but does nothing.
+ * The cron should only call dispatchTasks() to queue tasks with status='next'.
  */
-export async function executeTasks(env: Env): Promise<ExecutionStats> {
-  console.log('Task executor starting (intake-only mode)...');
+export async function executeTasks(_env: Env): Promise<ExecutionStats> {
+  console.log('executeTasks called - Nexus is now queue-only, external executors poll the queue');
 
-  const stats: ExecutionStats = {
+  return {
     processed: 0,
     completed: 0,
     failed: 0,
     skipped: 0,
     errors: [],
   };
-
-  // Initialize intake client - this is the ONLY execution path
-  const intakeClient = createIntakeClient(env);
-  if (!intakeClient) {
-    console.error('Intake service not configured - INTAKE service binding missing');
-    stats.errors.push('Intake service not configured');
-    return stats;
-  }
-
-  // Check intake availability - no fallback if unavailable
-  const intakeAvailable = await intakeClient.healthCheck();
-  if (!intakeAvailable) {
-    console.error('Intake service unavailable - cannot execute tasks');
-    stats.errors.push('Intake service unavailable');
-    return stats;
-  }
-
-  console.log('Intake available - parallel workflow execution enabled');
-
-  const executorId = `nexus-executor-${Date.now()}`;
-
-  try {
-    // Get all tenants
-    const tenants = await env.DB.prepare(`
-      SELECT id FROM tenants WHERE deleted_at IS NULL
-    `).all<{ id: string }>();
-
-    if (!tenants.results || tenants.results.length === 0) {
-      console.log('No tenants found');
-      return stats;
-    }
-
-    // Only process 'ai' executor type (human and human-ai stay in queue for humans)
-    const taskLimit = 100; // High limit for parallel workflow execution
-
-    // Get callback base URL for workflow callbacks
-    const callbackBaseUrl = env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev';
-
-    // Process each tenant
-    for (const tenant of tenants.results) {
-      const tenantId = tenant.id;
-
-      try {
-        // Get queued 'ai' tasks that can be executed
-        const entries = await env.DB.prepare(`
-          SELECT eq.*, t.title, t.description, t.project_id, t.domain,
-                 t.due_date, t.energy_required, t.source_type, t.source_reference
-          FROM execution_queue eq
-          JOIN tasks t ON eq.task_id = t.id
-          WHERE eq.tenant_id = ?
-            AND eq.status = 'queued'
-            AND eq.executor_type = 'ai'
-          ORDER BY eq.priority DESC, eq.queued_at ASC
-          LIMIT ?
-        `).bind(tenantId, taskLimit).all<QueueEntry & TaskRow>();
-
-        if (!entries.results || entries.results.length === 0) {
-          continue;
-        }
-
-        console.log(`Found ${entries.results.length} queued AI tasks for tenant ${tenantId}`);
-
-        // Get encryption key for this tenant
-        const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-
-        // Trigger all workflows in parallel via intake
-        console.log(`Triggering ${entries.results.length} workflows in parallel via intake`);
-
-        const workflowPromises = entries.results.map(async (entry) => {
-          stats.processed++;
-
-          try {
-            // Try to claim the entry first
-            const claimed = await claimEntry(env.DB, entry, executorId);
-            if (!claimed) {
-              console.log(`Entry ${entry.id} already claimed, skipping`);
-              stats.skipped++;
-              return { entry, status: 'skipped' as const };
-            }
-
-            console.log(`Triggering workflow for task: ${entry.task_id}`);
-
-            // Trigger workflow via intake
-            const result = await triggerWorkflowForEntry(intakeClient, entry, encryptionKey, callbackBaseUrl);
-
-            if (result.success && result.workflowInstanceId) {
-              // Mark as dispatched - workflow callbacks will handle completion
-              await markEntryAsDispatched(env.DB, entry, result.workflowInstanceId);
-              console.log(`Workflow triggered for task ${entry.task_id}: ${result.workflowInstanceId}`);
-              return { entry, status: 'dispatched' as const, workflowInstanceId: result.workflowInstanceId };
-            } else {
-              // Workflow trigger failed - use failEntry for retry logic
-              const error = result.error || 'Unknown workflow trigger error';
-              await failEntry(env.DB, entry, error);
-              stats.failed++;
-              stats.errors.push(`Task ${entry.task_id}: ${error}`);
-              console.error(`Workflow trigger failed for task ${entry.task_id}:`, error);
-              return { entry, status: 'failed' as const, error };
-            }
-          } catch (err) {
-            const error = err instanceof Error ? err.message : String(err);
-            console.error(`Error triggering workflow for entry ${entry.id}:`, error);
-            try {
-              await failEntry(env.DB, entry, error);
-            } catch {
-              // Ignore failure logging errors
-            }
-            stats.failed++;
-            stats.errors.push(`Entry ${entry.id}: ${error}`);
-            return { entry, status: 'error' as const, error };
-          }
-        });
-
-        // Wait for all workflow triggers to complete
-        const workflowResults = await Promise.allSettled(workflowPromises);
-
-        // Count dispatched (successful workflow triggers count as "in progress", not completed)
-        let dispatched = 0;
-        for (const result of workflowResults) {
-          if (result.status === 'fulfilled' && result.value.status === 'dispatched') {
-            dispatched++;
-          }
-        }
-        console.log(`Workflow dispatch complete: ${dispatched} dispatched, ${stats.failed} failed`);
-
-      } catch (tenantError) {
-        const error = tenantError instanceof Error ? tenantError.message : String(tenantError);
-        console.error(`Error processing tenant ${tenantId}:`, error);
-        stats.errors.push(`Tenant ${tenantId}: ${error}`);
-      }
-    }
-
-    console.log('Task executor complete:', JSON.stringify(stats));
-    return stats;
-
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error('Fatal error in task executor:', error);
-    stats.errors.push(`Fatal: ${errorMessage}`);
-    return stats;
-  }
 }
 
 /**
- * Execute a single task by queue entry ID
- * Used for manual triggering via MCP tool
+ * Execute a single task by queue entry ID - DEPRECATED
  *
- * Routes ALL 'ai' tasks through intake service (DE workflow execution).
- * No fallback to sandbox or DE direct - intake is the single entry point.
+ * Nexus is now a pure queue manager and does NOT execute tasks.
+ * External executors should:
+ * 1. Poll the queue: nexus_check_queue({ executor_type: 'ai' })
+ * 2. Claim a task: nexus_claim_queue_task({ queue_id, executor_id })
+ * 3. Get context: nexus_trigger_task({ task_id })
+ * 4. Do the work
+ * 5. Report back: nexus_complete_queue_task({ queue_id, result })
+ *
+ * This function is kept for backward compatibility but returns an error.
  */
 export async function executeQueueEntry(
-  env: Env,
-  queueId: string,
-  tenantId: string,
+  _env: Env,
+  _queueId: string,
+  _tenantId: string,
   _overrideOptions?: ExecuteOverrideOptions
 ): Promise<{ success: boolean; result?: string; error?: string }> {
-  const executorId = `nexus-manual-${Date.now()}`;
-
-  // Get the queue entry with task data
-  const entry = await env.DB.prepare(`
-    SELECT eq.*, t.title, t.description, t.project_id, t.domain,
-           t.due_date, t.energy_required, t.source_type, t.source_reference
-    FROM execution_queue eq
-    JOIN tasks t ON eq.task_id = t.id
-    WHERE eq.id = ? AND eq.tenant_id = ?
-  `).bind(queueId, tenantId).first<QueueEntry & TaskRow>();
-
-  if (!entry) {
-    return { success: false, error: 'Queue entry not found' };
-  }
-
-  // Validate executor type - only 'ai' tasks are auto-executable
-  if (entry.executor_type !== 'ai') {
-    return {
-      success: false,
-      error: `Cannot execute '${entry.executor_type}' tasks automatically. Only 'ai' tasks are auto-executable. Use the queue to view and manually handle human/human-ai tasks.`,
-    };
-  }
-
-  // Check status
-  if (entry.status !== 'queued' && entry.status !== 'claimed') {
-    return {
-      success: false,
-      error: `Queue entry has status '${entry.status}', expected 'queued' or 'claimed'`,
-    };
-  }
-
-  // Initialize intake client - this is the ONLY execution path
-  const intakeClient = createIntakeClient(env);
-  if (!intakeClient) {
-    return { success: false, error: 'Intake service not configured - INTAKE service binding missing' };
-  }
-
-  // Check intake health - no fallback if unavailable
-  const intakeAvailable = await intakeClient.healthCheck();
-  if (!intakeAvailable) {
-    return { success: false, error: 'Intake service unavailable - cannot execute task' };
-  }
-
-  // Claim if not already claimed
-  if (entry.status === 'queued') {
-    const claimed = await claimEntry(env.DB, entry, executorId);
-    if (!claimed) {
-      return { success: false, error: 'Failed to claim queue entry' };
-    }
-  }
-
-  // Get encryption key for decrypting task fields
-  const encryptionKey = await getEncryptionKey(env.KV, tenantId);
-
-  // Get callback URL for workflow completion
-  const callbackBaseUrl = env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev';
-
-  console.log(`Executing task via intake: ${entry.task_id}`);
-
-  // Trigger workflow via intake
-  const result = await triggerWorkflowForEntry(intakeClient, entry, encryptionKey, callbackBaseUrl);
-
-  if (result.success && result.workflowInstanceId) {
-    // Mark as dispatched - workflow callbacks will handle completion
-    await markEntryAsDispatched(env.DB, entry, result.workflowInstanceId);
-    console.log(`Workflow triggered for task ${entry.task_id}: ${result.workflowInstanceId}`);
-    return {
-      success: true,
-      result: `Workflow triggered: ${result.workflowInstanceId}. Task will complete asynchronously via callback.`,
-    };
-  } else {
-    const error = result.error || 'Unknown workflow trigger error';
-    await failEntry(env.DB, entry, error);
-    return { success: false, error };
-  }
+  return {
+    success: false,
+    error: 'Nexus is now queue-only. External executors should poll the queue using nexus_check_queue, claim tasks with nexus_claim_queue_task, and report results with nexus_complete_queue_task.',
+  };
 }
