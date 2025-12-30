@@ -255,12 +255,12 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query for multi-word search
-      // Uses explicit AND operators for D1 FTS5 to match ALL terms
-      // D1 FTS5 works best with simple terms without column prefixes
-      // Example: "mcp AND validation" matches docs with BOTH terms
-      // Example: '"exact phrase" AND term' matches phrase AND term
+      // Uses implicit AND (space-separated terms) - SQLite FTS5 treats space-separated
+      // terms as implicitly ANDed together. This is more reliable than explicit AND.
+      // Example: "mcp validation" matches docs with BOTH terms (implicit AND)
+      // Example: '"exact phrase" term' matches phrase AND term
       const ftsQuery = ftsTerms.length > 0
-        ? ftsTerms.join(' AND ')
+        ? ftsTerms.join(' ')
         : '';
 
       if (ftsQuery) {
