@@ -255,11 +255,11 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query using explicit AND operators for multi-word search
-      // SQLite FTS5 supports explicit AND for reliable multi-term matching.
-      // Using explicit AND is more reliable than implicit (space-separated) in D1.
+      // D1's FTS5 implementation requires explicit column targeting with parentheses
+      // for reliable multi-term AND matching. Format: search_text:(term1 AND term2)
       // Post-filter ensures all terms match in case FTS behavior differs.
       const ftsQuery = ftsTerms.length > 1
-        ? ftsTerms.join(' AND ')
+        ? `search_text:(${ftsTerms.join(' AND ')})`
         : ftsTerms[0] || '';
 
       if (ftsQuery) {
