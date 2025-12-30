@@ -3088,25 +3088,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           now
         ).run();
 
-        // Insert into FTS5 index for full-text search
-        // Create table if it doesn't exist (ensures FTS works even if schema not fully migrated)
-        try {
-          await env.DB.prepare(`
-            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-              note_id UNINDEXED,
-              search_text,
-              tokenize='porter unicode61'
-            )
-          `).run();
-          // Use DELETE + INSERT to ensure clean entry (avoids duplicates)
-          await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
-          await env.DB.prepare(`
-            INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
-          `).bind(id, searchText).run();
-        } catch (ftsError) {
-          // Log FTS error but don't fail the note creation
-          console.error(`FTS insert failed for note ${id}:`, ftsError);
-        }
+        // FTS5 index is automatically updated by the notes_fts_sync_insert trigger
+        // (see migration 0020_add_notes_fts_triggers.sql)
 
         return {
           content: [{
@@ -3344,21 +3327,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           updates.push('search_text = ?');
           bindings.push(searchText);
 
-          // Update FTS index
-          try {
-            await env.DB.prepare(`
-              CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-                note_id UNINDEXED,
-                search_text,
-                tokenize='porter unicode61'
-              )
-            `).run();
-            await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
-            await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(note_id, searchText).run();
-          } catch (ftsError) {
-            // Log FTS error but don't fail the update
-            console.error(`FTS update failed for note ${note_id}:`, ftsError);
-          }
+          // FTS5 index is automatically updated by the notes_fts_sync_update trigger
+          // (see migration 0020_add_notes_fts_triggers.sql)
         }
 
         bindings.push(note_id, tenantId);
@@ -3417,8 +3387,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ?
         `).bind(now, now, note_id, tenantId).run();
 
-        // Remove from FTS index on delete
-        await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
+        // FTS5 index is automatically updated by the notes_fts_sync_update trigger
+        // (soft delete sets deleted_at, which triggers removal from FTS)
 
         return {
           content: [{
@@ -4209,14 +4179,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           tags: string | null;
         }>();
 
-        // Clear existing FTS entries for this user's notes
-        await env.DB.prepare(`
-          DELETE FROM notes_fts WHERE note_id IN (
-            SELECT id FROM notes WHERE tenant_id = ? AND user_id = ?
-          )
-        `).bind(tenantId, userId).run();
-
         // Rebuild FTS index
+        // With migration 0020+, triggers automatically sync search_text to notes_fts
+        // So we just need to update search_text and the trigger handles the rest
         let indexed = 0;
         let errors = 0;
         const errorDetails: string[] = [];
@@ -4232,14 +4197,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             const searchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
 
             // Update notes table search_text column
+            // The UPDATE trigger (notes_fts_sync_update) will sync to notes_fts
             await env.DB.prepare(`
               UPDATE notes SET search_text = ? WHERE id = ?
             `).bind(searchText, note.id).run();
-
-            // Insert into FTS index
-            await env.DB.prepare(`
-              INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
-            `).bind(note.id, searchText).run();
 
             indexed++;
           } catch (err: any) {

@@ -470,19 +470,8 @@ notes.post('/', async (c) => {
   const encrypted = await encryptFields(note, ENCRYPTED_FIELDS, key);
   await insert(c.env.DB, 'notes', encrypted);
 
-  // Insert into FTS5 index for full-text search
-  try {
-    await c.env.DB.prepare(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-        note_id UNINDEXED,
-        search_text,
-        tokenize='porter unicode61'
-      )
-    `).run();
-    await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(id, searchText).run();
-  } catch {
-    // FTS insert is non-critical
-  }
+  // FTS5 index is automatically updated by the notes_fts_sync_insert trigger
+  // (see migration 0020_add_notes_fts_triggers.sql)
 
   return c.json({ success: true, data: { id } }, 201);
 });
@@ -534,20 +523,8 @@ notes.patch('/:id', async (c) => {
     const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim().toLowerCase();
     updates.search_text = searchText;
 
-    // Update FTS index
-    try {
-      await c.env.DB.prepare(`
-        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-          note_id UNINDEXED,
-          search_text,
-          tokenize='porter unicode61'
-        )
-      `).run();
-      await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
-      await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(id, searchText).run();
-    } catch {
-      // FTS update is non-critical
-    }
+    // FTS5 index is automatically updated by the notes_fts_sync_update trigger
+    // (see migration 0020_add_notes_fts_triggers.sql)
   }
 
   if (Object.keys(updates).length > 0) {
@@ -571,8 +548,8 @@ notes.delete('/:id', async (c) => {
 
   await softDelete(c.env.DB, 'notes', id, { tenantId });
 
-  // Remove from FTS index on delete
-  await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
+  // FTS5 index is automatically updated by the notes_fts_sync_update trigger
+  // (soft delete sets deleted_at, which triggers removal from FTS)
 
   return c.json({ success: true, data: { id } });
 });
