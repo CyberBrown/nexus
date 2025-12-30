@@ -3,7 +3,7 @@ import type { AppType, Task } from '../types/index.ts';
 import { getAuth } from '../lib/auth.ts';
 import { findAll, findById, insert, update, softDelete, count } from '../lib/db.ts';
 import { getEncryptionKey, encryptFields, decryptFields } from '../lib/encryption.ts';
-import { validate, createTaskSchema, updateTaskSchema } from '../lib/validation.ts';
+import { validate, createTaskSchema, updateTaskSchema, findFailureIndicator } from '../lib/validation.ts';
 import { NotFoundError, AppError } from '../lib/errors.ts';
 import {
   calculateNextOccurrence,
@@ -221,13 +221,34 @@ tasks.patch('/:id', async (c) => {
   const body = await c.req.json();
   const validated = validate(updateTaskSchema, body);
 
+  const key = await getEncryptionKey(c.env.KV, tenantId);
+
   // Handle task completion
   const isBeingCompleted = validated.status === 'completed' && existing.status !== 'completed';
   if (isBeingCompleted) {
+    // Validate that the task description/notes don't contain failure indicators
+    // This prevents marking tasks complete when the work wasn't actually done
+    // e.g., "The idea reference doesn't have a corresponding file I can find..."
+    const decryptedExisting = await decryptFields(existing, ENCRYPTED_FIELDS, key);
+    const textToCheck = [
+      decryptedExisting.description,
+      validated.description,
+    ].filter(Boolean).join('\n');
+
+    const matchedIndicator = findFailureIndicator(textToCheck);
+    if (matchedIndicator) {
+      throw new AppError(
+        `Cannot mark task as complete - description contains failure indicator: "${matchedIndicator}". ` +
+        `This suggests the task was not actually completed. Either update the description to reflect actual work done, ` +
+        `or use a different status (e.g., 'cancelled' or keep as 'next' for retry).`,
+        400,
+        'FALSE_COMPLETION_DETECTED'
+      );
+    }
+
     validated.completed_at = new Date().toISOString();
   }
 
-  const key = await getEncryptionKey(c.env.KV, tenantId);
   const encrypted = await encryptFields(validated, ENCRYPTED_FIELDS, key);
 
   const updated = await update(c.env.DB, 'tasks', id, encrypted, { tenantId });
