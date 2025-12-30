@@ -102,7 +102,7 @@ notes.get('/', async (c) => {
         const result = await c.env.DB.prepare(`
           SELECT n.*
           FROM notes n
-          INNER JOIN notes_fts fts ON n.id = fts.note_id
+          INNER JOIN notes_fts ON n.id = notes_fts.note_id
           WHERE notes_fts MATCH ?
             AND n.tenant_id = ?
             AND n.user_id = ?
@@ -170,10 +170,18 @@ notes.get('/', async (c) => {
               // Use plaintext search_text column
               searchableText = String((item as any).search_text).toLowerCase();
             } else {
-              // search_text is NULL - decrypt and search
-              const decrypted = await decryptFields(item, ENCRYPTED_FIELDS, encryptionKey);
-              const tagsText = decrypted.tags ? String(decrypted.tags).toLowerCase() : '';
-              searchableText = `${decrypted.title || ''} ${decrypted.content || ''} ${tagsText}`.toLowerCase();
+              // search_text is NULL - try raw values first (encryption is now disabled)
+              const rawTitle = item.title ? String(item.title) : '';
+              const rawContent = item.content ? String(item.content) : '';
+              const tagsText = item.tags ? String(item.tags) : '';
+
+              // First, try matching against raw values (for notes created after encryption was disabled)
+              searchableText = `${rawTitle} ${rawContent} ${tagsText}`.toLowerCase();
+              if (!searchTerms.every((term) => searchableText.includes(term))) {
+                // If raw values don't match, try decryption (for older encrypted notes)
+                const decrypted = await decryptFields(item, ENCRYPTED_FIELDS, encryptionKey);
+                searchableText = `${decrypted.title || ''} ${decrypted.content || ''} ${tagsText}`.toLowerCase();
+              }
             }
 
             if (searchTerms.every((term) => searchableText.includes(term))) {

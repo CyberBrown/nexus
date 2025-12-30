@@ -3421,7 +3421,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Convert search query to FTS5 format
         // FTS5 uses implicit AND when terms are space-separated
-        // Use word* for prefix matching (no quotes around individual terms)
+        // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
+        // Prefix queries use raw (pre-tokenized) form, so "validation*" won't match
+        // the stemmed "valid" in the index. Let FTS5 handle stemming naturally.
         const ftsTerms: string[] = [];
         const trimmedQuery = query.trim();
 
@@ -3435,16 +3437,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           const before = trimmedQuery.slice(lastIndex, match.index).trim();
           if (before) {
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
-              // Escape special FTS5 characters and use prefix matching
-              // FTS5 prefix syntax: word* (no quotes for prefix search)
+              // Escape special FTS5 characters, no prefix matching
               // MUST lowercase because porter tokenizer normalizes to lowercase
               const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
               if (escaped.length > 0) {
-                ftsTerms.push(`${escaped}*`);
+                ftsTerms.push(escaped);
               }
             }
           }
-          // Add the quoted phrase (exact match, no prefix)
+          // Add the quoted phrase (exact match)
           const phrase = match[1]!.trim();
           if (phrase.length > 0) {
             // Escape any quotes within the phrase and lowercase for porter tokenizer
@@ -3458,12 +3459,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const remaining = trimmedQuery.slice(lastIndex).trim();
         if (remaining) {
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
-            // Escape special FTS5 characters and use prefix matching
-            // FTS5 prefix syntax: word* (no quotes for prefix search)
+            // Escape special FTS5 characters, no prefix matching
             // MUST lowercase because porter tokenizer normalizes to lowercase
             const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              ftsTerms.push(`${escaped}*`);
+              ftsTerms.push(escaped);
             }
           }
         }
@@ -3533,8 +3533,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           // Parse search terms - handle quoted phrases and individual words differently
           const searchTerms: Array<{ term: string; isPhrase: boolean }> = ftsTerms.map(t => {
             const isQuoted = t.startsWith('"') && t.endsWith('"');
-            // Remove * suffix for prefix terms, and quotes for phrases
-            const cleaned = t.replace(/\*$/, '').replace(/^"/, '').replace(/"$/, '').toLowerCase();
+            // Remove quotes for phrases (terms no longer have * suffix)
+            const cleaned = t.replace(/^"/, '').replace(/"$/, '').toLowerCase();
             return { term: cleaned, isPhrase: isQuoted };
           });
 
@@ -3580,13 +3580,25 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
             } else {
               notesWithoutSearchText++;
-              // search_text is NULL - decrypt and search against actual content
-              decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
-              decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
-              const tagsText = note.tags ? String(note.tags).toLowerCase() : '';
-              searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
-              if (!matchesAllTerms(searchableText)) {
-                continue;
+              // search_text is NULL - try raw values first (encryption is now disabled)
+              // Note: title/content should be plaintext now, but older notes may have encrypted data
+              const rawTitle = note.title ? String(note.title) : '';
+              const rawContent = note.content ? String(note.content) : '';
+              const tagsText = note.tags ? String(note.tags) : '';
+
+              // First, try matching against raw values (for notes created after encryption was disabled)
+              searchableText = `${rawTitle} ${rawContent} ${tagsText}`.toLowerCase();
+              if (matchesAllTerms(searchableText)) {
+                decryptedTitle = rawTitle;
+                decryptedContent = rawContent;
+              } else {
+                // If raw values don't match, try decryption (for older encrypted notes)
+                decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
+                decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
+                searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
+                if (!matchesAllTerms(searchableText)) {
+                  continue;
+                }
               }
             }
 
@@ -3727,13 +3739,24 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
               decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
             } else {
-              // search_text is NULL - decrypt and search against actual content
-              decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
-              decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
-              const tagsText = note.tags ? String(note.tags).toLowerCase() : '';
-              searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
-              if (!matchesAllTerms(searchableText)) {
-                continue;
+              // search_text is NULL - try raw values first (encryption is now disabled)
+              const rawTitle = note.title ? String(note.title) : '';
+              const rawContent = note.content ? String(note.content) : '';
+              const tagsText = note.tags ? String(note.tags) : '';
+
+              // First, try matching against raw values (for notes created after encryption was disabled)
+              searchableText = `${rawTitle} ${rawContent} ${tagsText}`.toLowerCase();
+              if (matchesAllTerms(searchableText)) {
+                decryptedTitle = rawTitle;
+                decryptedContent = rawContent;
+              } else {
+                // If raw values don't match, try decryption (for older encrypted notes)
+                decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
+                decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
+                searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
+                if (!matchesAllTerms(searchableText)) {
+                  continue;
+                }
               }
             }
 
