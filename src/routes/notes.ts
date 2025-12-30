@@ -198,8 +198,8 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // IMPORTANT: FTS5 with space-separated terms uses OR by default, not AND
-      // We must use explicit AND operator to require all terms to match
+      // FTS5 uses implicit AND for space-separated terms
+      // Removed column prefix (search_text:) since it's the only indexed column
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -242,9 +242,8 @@ notes.get('/', async (c) => {
         }
       }
 
-      // Use explicit AND operator between terms to require all terms to match
-      // This is the correct FTS5 syntax for multi-word search
-      const ftsQuery = ftsTerms.join(' AND ');
+      // Space-separated terms are implicitly ANDed in FTS5
+      const ftsQuery = ftsTerms.join(' ');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
