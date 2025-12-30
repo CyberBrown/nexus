@@ -32,9 +32,18 @@ jobs:
       - name: Verify wrangler installation
         run: npx wrangler --version
 
+      - name: Check Cloudflare Token
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "ERROR: CLOUDFLARE_API_TOKEN secret is not set!"
+            exit 1
+          fi
+          echo "Token is set (first 10 chars): ${CLOUDFLARE_API_TOKEN:0:10}..."
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
       - name: Deploy Nexus MCP Worker
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          wranglerVersion: "4.16.0"
           command: deploy --config wrangler.nexus-mcp.toml
