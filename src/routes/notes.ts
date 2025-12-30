@@ -293,13 +293,16 @@ notes.get('/', async (c) => {
 
         const whereClause = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
 
-        // Use table-valued function syntax for FTS5 query
-        // This is the most reliable way to query FTS5 in D1/SQLite
+        // Use subquery with MATCH for FTS5 query
+        // This approach is more compatible with D1's FTS5 implementation
+        // than the table-valued function syntax which can have issues with AND operator
         const result = await c.env.DB.prepare(`
           SELECT n.*
           FROM notes n
-          INNER JOIN notes_fts(?) fts ON n.id = fts.note_id
-          WHERE n.tenant_id = ?
+          WHERE n.id IN (
+            SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
+          )
+            AND n.tenant_id = ?
             AND n.user_id = ?
             AND n.deleted_at IS NULL
             ${whereClause}
