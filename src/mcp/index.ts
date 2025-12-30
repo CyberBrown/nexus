@@ -3485,13 +3485,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
         // Prefix queries use raw (pre-tokenized) form, so "validation*" won't match
         // the stemmed "valid" in the index. Let FTS5 handle stemming naturally.
+        // IMPORTANT: Use explicit column prefix "search_text:" for proper FTS5 matching
+        // since the table has note_id (UNINDEXED) and search_text columns
         const ftsQuery = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match exactly in sequence
-            return `"${term}"`;
+            return `search_text:"${term}"`;
           } else {
             // Single word - let FTS5 porter stemmer handle matching
-            return term;
+            return `search_text:${term}`;
           }
         }).join(' ');
 
@@ -3523,16 +3525,18 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Try FTS5 search first
         try {
+          // Note: Use same query structure as notes route for consistency
+          // FTS5 MATCH uses the table name directly (notes_fts), not an alias
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
-            FROM notes_fts fts
-            JOIN notes n ON fts.note_id = n.id
+            FROM notes n
+            INNER JOIN notes_fts ON n.id = notes_fts.note_id
             WHERE notes_fts MATCH ?
               AND n.tenant_id = ?
               AND n.user_id = ?
               AND n.deleted_at IS NULL
               ${archivedCondition}
-            ORDER BY n.pinned DESC, n.created_at DESC
+            ORDER BY n.pinned DESC, bm25(notes_fts) ASC, n.created_at DESC
             LIMIT ?
           `).bind(ftsQuery, tenantId, userId, maxLimit).all();
 
