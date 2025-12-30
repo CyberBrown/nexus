@@ -431,6 +431,20 @@ export const FAILURE_INDICATORS = [
   "project structure", "folder structure", "directory structure",
   "does not have any", "doesn't have any", "don't have any",
   "nothing has been", "nothing was", "nothing is",
+  // Additional patterns added 2024-12-30 after further investigation
+  "no action taken", "no changes made", "nothing to do",
+  "can not proceed", "cannot proceed", "couldn't proceed", "could not proceed",
+  "doesn't point to", "does not point to", "not pointing to",
+  "no valid", "invalid path", "path does not exist",
+  "no work done", "no work performed", "no work completed",
+  "unable to locate", "unable to access", "unable to read",
+  "nothing to commit", "nothing to deploy", "nothing to execute",
+  "empty project", "empty directory", "empty folder",
+  "does not contain", "doesn't contain", "not containing",
+  "outside of", "not within", "not part of",
+  "requires setup", "requires configuration", "requires initialization",
+  "not yet implemented", "not implemented", "to be implemented",
+  "placeholder", "stub", "todo:",
 ] as const;
 
 /**
