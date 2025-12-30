@@ -3550,6 +3550,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
+        let ftsNeedsRebuild = false;
         try {
           const ftsTable = await env.DB.prepare(
             `SELECT name, sql FROM sqlite_master WHERE type='table' AND name='notes_fts'`
@@ -3565,16 +3566,71 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 tokenize='porter unicode61'
               )
             `).run();
+            ftsNeedsRebuild = true;
+          } else {
+            // Check if FTS index is empty or incomplete
+            const ftsCount = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes_fts WHERE note_id IN (
+                SELECT id FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+              )
+            `).bind(tenantId, userId).first<{ cnt: number }>();
 
-            // Immediately populate FTS index when table is recreated
+            const notesCount = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+            `).bind(tenantId, userId).first<{ cnt: number }>();
+
+            // If FTS has significantly fewer entries than notes, trigger rebuild
+            if ((ftsCount?.cnt || 0) < (notesCount?.cnt || 0) * 0.8) {
+              ftsNeedsRebuild = true;
+            }
+          }
+
+          // If FTS needs rebuild, populate it from notes
+          if (ftsNeedsRebuild) {
+            console.log('[nexus_search_notes] Rebuilding FTS5 index...');
+
+            // First, ensure all notes have search_text populated
+            const notesWithoutSearchText = await env.DB.prepare(`
+              SELECT id, title, content, tags FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND (search_text IS NULL OR search_text = '' OR TRIM(search_text) = '')
+              LIMIT 100
+            `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
+
+            // Populate search_text for notes that don't have it (data is already plaintext)
+            for (const note of notesWithoutSearchText.results || []) {
+              const searchText = [
+                note.title || '',
+                note.content || '',
+                note.tags || ''
+              ].join(' ').trim().toLowerCase();
+
+              if (searchText) {
+                try {
+                  await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                    .bind(searchText, note.id).run();
+                } catch { /* ignore */ }
+              }
+            }
+
+            // Clear and repopulate FTS index for this user's notes
+            await env.DB.prepare(`
+              DELETE FROM notes_fts WHERE note_id IN (
+                SELECT id FROM notes WHERE tenant_id = ? AND user_id = ?
+              )
+            `).bind(tenantId, userId).run();
+
             await env.DB.prepare(`
               INSERT INTO notes_fts (note_id, search_text)
               SELECT id, search_text FROM notes
               WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-                AND search_text IS NOT NULL AND search_text != ''
+                AND search_text IS NOT NULL AND search_text != '' AND TRIM(search_text) != ''
             `).bind(tenantId, userId).run();
+
+            console.log('[nexus_search_notes] FTS5 index rebuilt');
           }
-        } catch {
+        } catch (err) {
+          console.error('[nexus_search_notes] FTS setup error:', err);
           // Schema check failed, FTS may not be available - will fall back to LIKE/full scan
         }
 
