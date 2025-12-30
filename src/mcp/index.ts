@@ -3578,8 +3578,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query with explicit AND operator
-        const ftsQuery = ftsTerms.join(' AND ');
+        // Build FTS5 query with column prefix for D1 FTS5 compatibility
+        // Format: "search_text:term1 search_text:term2" - terms are implicitly ANDed
+        const ftsQuery = ftsTerms.map(term => `search_text:${term}`).join(' ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
@@ -3761,6 +3762,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           success: true,
           query: query,
           search_terms: searchTerms,
+          fts_query: ftsQuery,
           count: matchingNotes.length,
           notes: matchingNotes,
           search_method: searchMethod,
