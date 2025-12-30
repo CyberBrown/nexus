@@ -19,6 +19,7 @@ import { processRecurringTasks } from './scheduled/recurring-tasks.ts';
 import { dispatchTasks } from './scheduled/task-dispatcher.ts';
 import { executeTasks, promoteDependentTasks } from './scheduled/task-executor.ts';
 import { archiveQueueEntry, archiveQueueEntriesByTask } from './lib/queue-archive.ts';
+import { findFailureIndicator } from './lib/validation.ts';
 
 // Re-export Durable Objects
 export { InboxManager } from './durable-objects/InboxManager.ts';
@@ -1387,37 +1388,12 @@ app.post('/api/tasks/:id/complete', async (c) => {
 
     // Validate that work was actually done - check for failure indicators in notes/output
     // This is a defense-in-depth check; DE's nexus-callback.ts should also check this
-    // IMPORTANT: Keep this in sync with DE's nexus-callback.ts FAILURE_INDICATORS
+    // Uses shared utility from lib/validation.ts that handles curly quote normalization
     const resultText = body.notes || body.output || '';
-    const resultLower = resultText.toLowerCase();
-    const failureIndicators = [
-      // Resource not found patterns
-      "couldn't find", "could not find", "can't find", "cannot find",
-      "doesn't have", "does not have", "not found", "no such file",
-      "doesn't exist", "does not exist", "file not found", "directory not found",
-      "repo not found", "repository not found", "project not found",
-      "reference not found", "idea not found",
-      // Failure action patterns
-      "failed to", "unable to", "i can't", "i cannot",
-      "i'm unable", "i am unable", "cannot locate", "couldn't locate",
-      "couldn't create", "could not create", "wasn't able", "was not able",
-      // Empty/missing result patterns
-      "no matching", "nothing found", "no results", "empty result", "no data",
-      // Explicit error indicators
-      "error:", "error occurred", "exception:",
-      // Task incomplete patterns
-      "task incomplete", "could not complete", "couldn't complete",
-      "unable to complete", "did not complete", "didn't complete",
-      // Missing reference patterns (for idea-based tasks)
-      "reference doesn't have", "reference does not have",
-      "doesn't have a corresponding", "does not have a corresponding",
-      "no corresponding file", "no corresponding project",
-      "missing reference", "invalid reference",
-    ];
-    const isActualFailure = failureIndicators.some(indicator => resultLower.includes(indicator));
+    const matchedIndicator = findFailureIndicator(resultText);
 
-    if (isActualFailure) {
-      console.log(`Task ${taskId} complete callback rejected - notes contain failure indicators`);
+    if (matchedIndicator) {
+      console.log(`Task ${taskId} complete callback rejected - notes contain failure indicator: "${matchedIndicator}"`);
       console.log(`Notes preview: ${resultText.substring(0, 200)}`);
 
       // Update task to failed instead of completed
@@ -1430,7 +1406,7 @@ app.post('/api/tasks/:id/complete', async (c) => {
         error: 'Task completion rejected - output indicates failure',
         task_id: taskId,
         status: 'next',
-        detected_indicator: failureIndicators.find(i => resultLower.includes(i)),
+        detected_indicator: matchedIndicator,
       }, 400);
     }
 
@@ -1607,78 +1583,11 @@ app.post('/workflow-callback', async (c) => {
 
         if (isSuccess) {
           // Validate that work was actually done - check for failure indicators
-          // This comprehensive list catches cases where AI says "success" but didn't actually complete work
-          // IMPORTANT: Keep this in sync with DE's nexus-callback.ts FAILURE_INDICATORS
+          // Uses shared utility from lib/validation.ts that handles curly quote normalization
+          const matchedIndicator = findFailureIndicator(resultText);
 
-          // Normalize quotes to handle typographic apostrophes (e.g., ' vs ')
-          const normalizeQuotes = (text: string): string => text
-            .replace(/[\u2018\u2019\u201A\u201B]/g, "'")  // Single curly quotes → '
-            .replace(/[\u201C\u201D\u201E\u201F]/g, '"'); // Double curly quotes → "
-
-          const resultLower = normalizeQuotes((resultText || '').toLowerCase());
-          const failureIndicators = [
-            // Resource not found patterns
-            "couldn't find",
-            "could not find",
-            "can't find",
-            "cannot find",
-            "doesn't have",
-            "does not have",
-            "not found",
-            "no such file",
-            "doesn't exist",
-            "does not exist",
-            "file not found",
-            "directory not found",
-            "repo not found",
-            "repository not found",
-            "project not found",
-            "reference not found",
-            "idea not found",
-            // Failure action patterns
-            "failed to",
-            "unable to",
-            "i can't",
-            "i cannot",
-            "i'm unable",
-            "i am unable",
-            "cannot locate",
-            "couldn't locate",
-            "couldn't create",
-            "could not create",
-            "wasn't able",
-            "was not able",
-            // Empty/missing result patterns
-            "no matching",
-            "nothing found",
-            "no results",
-            "empty result",
-            "no data",
-            // Explicit error indicators
-            "error:",
-            "error occurred",
-            "exception:",
-            // Task incomplete patterns
-            "task incomplete",
-            "could not complete",
-            "couldn't complete",
-            "unable to complete",
-            "did not complete",
-            "didn't complete",
-            // Missing reference patterns (for idea-based tasks)
-            "reference doesn't have",
-            "reference does not have",
-            "doesn't have a corresponding",
-            "does not have a corresponding",
-            "no corresponding file",
-            "no corresponding project",
-            "missing reference",
-            "invalid reference",
-          ];
-          const isActualFailure = failureIndicators.some(indicator => resultLower.includes(indicator));
-
-          if (isActualFailure) {
-            console.log(`Workflow callback: idea_task ${ideaTask.id} result contains failure indicators, marking as failed`);
+          if (matchedIndicator) {
+            console.log(`Workflow callback: idea_task ${ideaTask.id} result contains failure indicator: "${matchedIndicator}", marking as failed`);
             // Mark as failed - the result indicates no actual work was done
             await c.env.DB.prepare(`
               UPDATE idea_tasks
@@ -1795,72 +1704,11 @@ app.post('/workflow-callback', async (c) => {
 
     if (isSuccess) {
       // Validate that work was actually done - check for failure indicators in "success" responses
-      // IMPORTANT: Keep this in sync with the idea_tasks check above (lines 1613-1671)
-      // and DE's nexus-callback.ts FAILURE_INDICATORS
-      const resultLower = (resultText || '').toLowerCase();
-      const failureIndicators = [
-        // Resource not found patterns
-        "couldn't find",
-        "could not find",
-        "can't find",
-        "cannot find",
-        "doesn't have",
-        "does not have",
-        "not found",
-        "no such file",
-        "doesn't exist",
-        "does not exist",
-        "file not found",
-        "directory not found",
-        "repo not found",
-        "repository not found",
-        "project not found",
-        "reference not found",
-        "idea not found",
-        // Failure action patterns
-        "failed to",
-        "unable to",
-        "i can't",
-        "i cannot",
-        "i'm unable",
-        "i am unable",
-        "cannot locate",
-        "couldn't locate",
-        "couldn't create",
-        "could not create",
-        "wasn't able",
-        "was not able",
-        // Empty/missing result patterns
-        "no matching",
-        "nothing found",
-        "no results",
-        "empty result",
-        "no data",
-        // Explicit error indicators
-        "error:",
-        "error occurred",
-        "exception:",
-        // Task incomplete patterns
-        "task incomplete",
-        "could not complete",
-        "couldn't complete",
-        "unable to complete",
-        "did not complete",
-        "didn't complete",
-        // Missing reference patterns (for idea-based tasks)
-        "reference doesn't have",
-        "reference does not have",
-        "doesn't have a corresponding",
-        "does not have a corresponding",
-        "no corresponding file",
-        "no corresponding project",
-        "missing reference",
-        "invalid reference",
-      ];
-      const isActualFailure = failureIndicators.some(indicator => resultLower.includes(indicator));
+      // Uses shared utility from lib/validation.ts that handles curly quote normalization
+      const execMatchedIndicator = findFailureIndicator(resultText);
 
-      if (isActualFailure) {
-        console.log(`Workflow callback: task ${entry.task_id} result contains failure indicators, marking as failed`);
+      if (execMatchedIndicator) {
+        console.log(`Workflow callback: task ${entry.task_id} result contains failure indicator: "${execMatchedIndicator}", marking as failed`);
         // Treat as failure - the AI said "success" but the content indicates failure
         const error = resultText || 'Execution reported success but no deliverables were produced';
 
@@ -1883,6 +1731,7 @@ app.post('/workflow-callback', async (c) => {
             source: 'workflow_callback',
             error: error.substring(0, 500),
             reason: 'false_positive_success',
+            matched_indicator: execMatchedIndicator,
           }),
           now
         ).run();

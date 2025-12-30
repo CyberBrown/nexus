@@ -20,6 +20,7 @@ import { executeQueueEntry, promoteDependentTasks } from '../scheduled/task-exec
 import { hasUnmetDependencies, determineExecutorType } from '../scheduled/task-dispatcher.ts';
 import { archiveQueueEntry, archiveQueueEntriesByTask } from '../lib/queue-archive.ts';
 import { createIntakeClient } from '../lib/intake-client.ts';
+import { findFailureIndicator } from '../lib/validation.ts';
 
 // ========================================
 // SAFE DECRYPT HELPER
@@ -2060,6 +2061,26 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
+        // Check for failure indicators in resolution text
+        if (resolution) {
+          const matchedIndicator = findFailureIndicator(resolution);
+          if (matchedIndicator) {
+            console.log(`nexus_complete_idea rejected - resolution contains failure indicator: "${matchedIndicator}"`);
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: 'Idea completion rejected - resolution indicates idea was not actually completed',
+                  detected_indicator: matchedIndicator,
+                  hint: 'Do not mark as completed unless work was actually done.',
+                }, null, 2)
+              }],
+              isError: true
+            };
+          }
+        }
+
         // Check idea exists
         const idea = await env.DB.prepare(`
           SELECT id, title FROM ideas
@@ -2359,6 +2380,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       title: z.string().optional().describe('New title for the task'),
       description: z.string().optional().describe('New description'),
       status: z.enum(['inbox', 'next', 'scheduled', 'waiting', 'someday', 'completed', 'cancelled']).optional().describe('New status'),
+      completion_notes: z.string().optional().describe('Required when setting status to completed - describe what was done. Rejected if notes indicate failure.'),
       urgency: z.number().min(1).max(5).optional().describe('Urgency level (1-5)'),
       importance: z.number().min(1).max(5).optional().describe('Importance level (1-5)'),
       due_date: z.string().optional().describe('Due date in ISO format (YYYY-MM-DD)'),
@@ -2369,9 +2391,31 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       const authError = validatePassphrase('nexus_update_task', args, env.WRITE_PASSPHRASE);
       if (authError) return authError;
 
-      const { task_id, title, description, status, urgency, importance, due_date, executor_type } = args;
+      const { task_id, title, description, status, completion_notes, urgency, importance, due_date, executor_type } = args;
 
       try {
+        // Validate completion_notes when marking as completed
+        if (status === 'completed') {
+          if (completion_notes) {
+            const matchedIndicator = findFailureIndicator(completion_notes);
+            if (matchedIndicator) {
+              console.log(`nexus_update_task rejected - completion_notes contain failure indicator: "${matchedIndicator}"`);
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: false,
+                    error: 'Task update rejected - completion notes indicate task was not actually completed',
+                    detected_indicator: matchedIndicator,
+                    hint: 'Do not mark as completed unless work was actually done. Use status "cancelled" if the task cannot be done.',
+                  }, null, 2)
+                }],
+                isError: true
+              };
+            }
+          }
+        }
+
         const existing = await env.DB.prepare(`
           SELECT id FROM tasks WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
         `).bind(task_id, tenantId).first();
@@ -2513,40 +2557,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const now = new Date().toISOString();
 
         // Check for failure indicators in the completion notes
-        // This prevents marking tasks complete when AI says "I couldn't find..." or similar
-        // IMPORTANT: Keep this in sync with TaskExecutorWorkflow.ts and /workflow-callback handler
+        // Uses shared utility from lib/validation.ts that handles curly quote normalization
         if (notes) {
-          // Normalize quotes to handle typographic apostrophes (e.g., ' vs ')
-          const normalizeQuotes = (text: string): string => text
-            .replace(/[\u2018\u2019\u201A\u201B]/g, "'")  // Single curly quotes → '
-            .replace(/[\u201C\u201D\u201E\u201F]/g, '"'); // Double curly quotes → "
-
-          const notesLower = normalizeQuotes(notes.toLowerCase());
-          const failureIndicators = [
-            // Resource not found patterns
-            "couldn't find", "could not find", "can't find", "cannot find",
-            "doesn't have", "does not have", "not found", "no such file",
-            "doesn't exist", "does not exist", "file not found", "directory not found",
-            "repo not found", "repository not found", "project not found",
-            "reference not found", "idea not found",
-            // Failure action patterns
-            "failed to", "unable to", "i can't", "i cannot",
-            "i'm unable", "i am unable", "cannot locate", "couldn't locate",
-            "couldn't create", "could not create", "wasn't able", "was not able",
-            // Empty/missing result patterns
-            "no matching", "nothing found", "no results", "empty result", "no data",
-            // Explicit error indicators
-            "error:", "error occurred", "exception:",
-            // Task incomplete patterns
-            "task incomplete", "could not complete", "couldn't complete",
-            "unable to complete", "did not complete", "didn't complete",
-            // Missing reference patterns (for idea-based tasks)
-            "reference doesn't have", "reference does not have",
-            "doesn't have a corresponding", "does not have a corresponding",
-            "no corresponding file", "no corresponding project",
-            "missing reference", "invalid reference",
-          ];
-          const matchedIndicator = failureIndicators.find(indicator => notesLower.includes(indicator));
+          const matchedIndicator = findFailureIndicator(notes);
           if (matchedIndicator) {
             console.log(`nexus_complete_task rejected - notes contain failure indicator: "${matchedIndicator}"`);
             console.log(`Notes preview: ${notes.substring(0, 200)}`);
@@ -4196,15 +4209,28 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         const executorType = existing.executor_type;
 
+        // Check for false positive success - AI reported success but result contains failure indicators
+        // This prevents tasks being marked complete when the result says "I couldn't find..." or similar
+        let actualStatus = newStatus;
+        let actualError = args.error || null;
+        const resultMatchedIndicator = !hasError ? findFailureIndicator(args.result) : null;
+
+        if (resultMatchedIndicator) {
+          console.log(`nexus_complete_queue_task: false positive detected for queue ${queueId} - matched indicator: "${resultMatchedIndicator}"`);
+          console.log(`Result preview: ${(args.result || '').substring(0, 200)}`);
+          actualStatus = 'failed';
+          actualError = `False positive detected (matched: "${resultMatchedIndicator}"): ${(args.result || '').substring(0, 500)}`;
+        }
+
         // Update the queue entry
         await env.DB.prepare(`
           UPDATE execution_queue
           SET status = ?, completed_at = ?, result = ?, error = ?, updated_at = ?
           WHERE id = ? AND tenant_id = ?
-        `).bind(newStatus, now, args.result || null, args.error || null, now, queueId, tenantId).run();
+        `).bind(actualStatus, now, args.result || null, actualError, now, queueId, tenantId).run();
 
-        // Also update the task status if completed successfully
-        if (!hasError) {
+        // Also update the task status if completed successfully (and not a false positive)
+        if (!hasError && !resultMatchedIndicator) {
           await env.DB.prepare(`
             UPDATE tasks
             SET status = 'completed', completed_at = ?, updated_at = ?
@@ -4221,8 +4247,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         `).bind(
           logId,
           tenantId,
-          newStatus,
-          JSON.stringify({ result: args.result, error: args.error }),
+          actualStatus,
+          JSON.stringify({
+            result: args.result,
+            error: actualError,
+            false_positive: resultMatchedIndicator ? true : undefined,
+            matched_indicator: resultMatchedIndicator || undefined,
+          }),
           now,
           queueId
         ).run();
