@@ -359,11 +359,17 @@ export type UpdateNoteInput = z.infer<typeof updateNoteSchema>;
  * IMPORTANT: These are checked case-insensitively against the full output.
  * Add new patterns when you see tasks marked complete without actual work.
  *
- * Keep this in sync with:
- * - DE's nexus-callback.ts FAILURE_INDICATORS
+ * THIS IS THE CANONICAL SOURCE - other files import from here:
+ * - TaskExecutorWorkflow.ts (imports this)
+ * - DE's nexus-callback.ts (MUST be manually synced)
+ *
+ * Used by:
  * - nexus_complete_task MCP tool
  * - /workflow-callback endpoint
  * - /api/tasks/:id/complete endpoint
+ * - TaskExecutorWorkflow containsFailureIndicators()
+ *
+ * Last synced with DE: 2024-12-30
  */
 export const FAILURE_INDICATORS = [
   // Resource not found patterns
@@ -388,7 +394,7 @@ export const FAILURE_INDICATORS = [
   "doesn't have a corresponding", "does not have a corresponding",
   "no corresponding file", "no corresponding project",
   "missing reference", "invalid reference",
-  // Additional patterns for edge cases (added 2024-12)
+  // Additional patterns for edge cases (synced from DE nexus-callback.ts 2024-12)
   "i can find", // catches "file I can find" negation patterns
   "no repo", "no repository", "no project",
   "couldn't access", "could not access", "can't access", "cannot access",

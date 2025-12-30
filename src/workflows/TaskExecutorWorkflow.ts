@@ -80,135 +80,23 @@ const CODE_TASK_PATTERNS = [
 
 // Failure indicators in AI responses that indicate the task wasn't actually completed
 // These phrases suggest the AI couldn't accomplish the task even if it responded successfully
-// IMPORTANT: Keep this in sync with nexus-callback.ts and /workflow-callback handler in index.ts
-const FAILURE_INDICATORS = [
-  // Resource not found patterns
-  "couldn't find",
-  "could not find",
-  "can't find",
-  "cannot find",
-  "doesn't have",
-  "does not have",
-  "not found",
-  "no such file",
-  "doesn't exist",
-  "does not exist",
-  "file not found",
-  "directory not found",
-  "repo not found",
-  "repository not found",
-  "project not found",
-  "reference not found",
-  "idea not found",
-  // Failure action patterns
-  "failed to",
-  "unable to",
-  "i can't",
-  "i cannot",
-  "i'm unable",
-  "i am unable",
-  "cannot locate",
-  "couldn't locate",
-  "couldn't create",
-  "could not create",
-  "wasn't able",
-  "was not able",
-  // Empty/missing result patterns
-  "no matching",
-  "nothing found",
-  "no results",
-  "empty result",
-  "no data",
-  // Explicit error indicators
-  "error:",
-  "error occurred",
-  "exception:",
-  // Access/permission patterns
-  "missing",
-  "not available",
-  "no access",
-  "permission denied",
-  "i don't have access",
-  "i cannot access",
-  "isn't available",
-  "is not available",
-  // Task incomplete patterns
-  "task incomplete",
-  "could not complete",
-  "couldn't complete",
-  "unable to complete",
-  "did not complete",
-  "didn't complete",
-  // Missing reference patterns (for idea-based tasks)
-  "reference doesn't have",
-  "reference does not have",
-  "doesn't have a corresponding",
-  "does not have a corresponding",
-  "no corresponding file",
-  "no corresponding project",
-  "missing reference",
-  "invalid reference",
-  // Additional patterns for edge cases (added 2024-12)
-  "i can find", // catches "file I can find" negation patterns
-  "no repo",
-  "no repository",
-  "no project",
-  "couldn't access",
-  "could not access",
-  "can't access",
-  "cannot access",
-  "no idea file",
-  "idea file not",
-  "idea reference not",
-  "there is no",
-  "there are no",
-  "there isn't",
-  "there aren't",
-  "without a",
-  "missing a",
-  "lack of",
-  "lacking",
-  "haven't been created",
-  "hasn't been created",
-  "has not been created",
-  "wasn't created",
-  "were not created",
-  "weren't created",
-  "no github",
-  "no cloudflare",
-  "no d1",
-  "no worker",
-  "the task cannot",
-  "the task could not",
-  "this task cannot",
-];
-
-/**
- * Normalize text for comparison by replacing curly quotes with straight quotes
- * This handles cases where AI outputs use typographic quotes instead of standard ASCII
- */
-function normalizeQuotes(text: string): string {
-  return text
-    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")  // Single curly quotes → '
-    .replace(/[\u201C\u201D\u201E\u201F]/g, '"'); // Double curly quotes → "
-}
+// IMPORTANT: Keep this in sync with:
+// - lib/validation.ts FAILURE_INDICATORS
+// - DE's nexus-callback.ts FAILURE_INDICATORS
+// - /workflow-callback handler in index.ts
+import { FAILURE_INDICATORS, findFailureIndicator, containsFailureIndicators as _containsFailureIndicators } from '../lib/validation.ts';
 
 /**
  * Check if an AI response contains failure indicators
  * Returns true if the response suggests the task wasn't actually completed
  *
- * This function normalizes quotes to handle typographic apostrophes (e.g., ' vs ')
- * and logs the first matched indicator for debugging
+ * Uses the shared validation utility from lib/validation.ts
  */
 function containsFailureIndicators(text: string): boolean {
-  // Normalize quotes and convert to lowercase for comparison
-  const normalizedText = normalizeQuotes(text.toLowerCase());
-
-  for (const indicator of FAILURE_INDICATORS) {
-    if (normalizedText.includes(indicator)) {
-      console.log(`[TaskExecutor] Failure indicator matched: "${indicator}" in text (first 200 chars): ${text.substring(0, 200)}`);
-      return true;
-    }
+  const indicator = findFailureIndicator(text);
+  if (indicator) {
+    console.log(`[TaskExecutor] Failure indicator matched: "${indicator}" in text (first 200 chars): ${text.substring(0, 200)}`);
+    return true;
   }
   return false;
 }
