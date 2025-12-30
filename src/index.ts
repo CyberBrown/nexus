@@ -1658,6 +1658,7 @@ app.post('/workflow-callback', async (c) => {
       logs?: string;
       notes?: string;  // nexus-callback.ts sends output in notes field
       metadata?: Record<string, unknown>;
+      quarantine?: boolean;  // Boolean flag to indicate task should be quarantined
     };
 
     // Normalize success from status field if not provided
@@ -1949,25 +1950,45 @@ app.post('/workflow-callback', async (c) => {
       // Mark as failed
       const error = body.error || 'Workflow execution failed';
 
+      // Determine if this is a quarantine situation
+      // Quarantine means we should stop retrying - set task to 'cancelled'
+      // Check both body.status === 'quarantined' and body.quarantine boolean flag
+      const isQuarantine = body.status === 'quarantined' || body.quarantine === true;
+      const queueStatus = isQuarantine ? 'quarantine' : 'failed';
+
       await c.env.DB.prepare(`
         UPDATE execution_queue
-        SET status = 'failed', error = ?, updated_at = ?
+        SET status = ?, error = ?, updated_at = ?
         WHERE id = ?
-      `).bind(error.substring(0, 2000), now, entry.id).run();
+      `).bind(queueStatus, error.substring(0, 2000), now, entry.id).run();
+
+      // If quarantined, update the task status to prevent re-dispatch
+      // Setting to 'cancelled' stops the dispatcher from picking it up again
+      if (isQuarantine) {
+        await c.env.DB.prepare(`
+          UPDATE tasks
+          SET status = 'cancelled', completion_notes = ?, updated_at = ?
+          WHERE id = ?
+        `).bind(`Quarantined via workflow callback: ${error.substring(0, 500)}`, now, entry.task_id).run();
+
+        console.log(`Workflow callback: task ${entry.task_id} quarantined - task status set to 'cancelled'`);
+      }
 
       // Log failure
       await c.env.DB.prepare(`
         INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
-        VALUES (?, ?, ?, ?, 'workflow', 'failed', ?, ?)
+        VALUES (?, ?, ?, ?, 'workflow', ?, ?, ?)
       `).bind(
         crypto.randomUUID(),
         entry.tenant_id,
         entry.id,
         entry.task_id,
+        isQuarantine ? 'quarantined' : 'failed',
         JSON.stringify({
           workflow_instance_id: body.workflow_instance_id,
           source: 'workflow_callback',
           error: error.substring(0, 500),
+          quarantine: isQuarantine,
         }),
         now
       ).run();
@@ -1975,7 +1996,7 @@ app.post('/workflow-callback', async (c) => {
       // Archive the failed queue entry
       await archiveQueueEntry(c.env.DB, entry.id, entry.tenant_id);
 
-      console.log(`Workflow callback: task ${entry.task_id} failed: ${error}`);
+      console.log(`Workflow callback: task ${entry.task_id} ${queueStatus}: ${error}`);
     }
 
     return c.json({ success: true });
