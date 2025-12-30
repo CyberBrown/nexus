@@ -3574,7 +3574,18 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const maxLimit = limit || 20;
 
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
+        // Also ensure search_text column exists in notes table (added in migration 0018)
         try {
+          // Check if search_text column exists in notes table
+          const searchTextCol = await env.DB.prepare(
+            `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
+          ).first<{ name: string } | null>();
+
+          if (!searchTextCol) {
+            // Add search_text column if it doesn't exist
+            await env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
+          }
+
           const tableInfo = await env.DB.prepare(
             `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
           ).first<{ name: string } | null>();
@@ -3639,22 +3650,45 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           console.error('FTS5 search failed, falling back to scan:', ftsError);
         }
 
-        // If FTS returned no results or failed, fall back to scanning search_text column
+        // If FTS returned no results or failed, fall back to scanning notes directly
         if (matchingNotes.length === 0) {
-          const allNotes = await env.DB.prepare(`
-            SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
-            FROM notes
-            WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
-            ORDER BY pinned DESC, created_at DESC
-          `).bind(tenantId, userId).all();
+          // Query notes - try with search_text column first, fall back without it
+          let allNotes: { results: unknown[] | null };
+          try {
+            allNotes = await env.DB.prepare(`
+              SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
+              FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
+              ORDER BY pinned DESC, created_at DESC
+            `).bind(tenantId, userId).all();
+          } catch {
+            // search_text column might not exist, query without it
+            allNotes = await env.DB.prepare(`
+              SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, NULL as search_text
+              FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL ${include_archived ? '' : 'AND archived_at IS NULL'}
+              ORDER BY pinned DESC, created_at DESC
+            `).bind(tenantId, userId).all();
+          }
 
-          for (const note of allNotes.results || []) {
+          for (const note of (allNotes.results || []) as Array<{
+            id: string;
+            title: string | null;
+            content: string | null;
+            category: string;
+            tags: string | null;
+            source_type: string | null;
+            pinned: number;
+            archived_at: string | null;
+            created_at: string;
+            search_text: string | null;
+          }>) {
             let searchableText: string;
             let decryptedTitle: string;
             let decryptedContent: string;
 
             if (note.search_text && typeof note.search_text === 'string' && note.search_text.length > 0) {
-              searchableText = note.search_text as string;
+              searchableText = note.search_text;
 
               // Check if all search terms match
               if (!matchesAllTerms(searchableText)) {
@@ -3662,12 +3696,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               }
 
               // Decrypt for display (only if we match)
-              decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
-              decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
+              decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+              decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
             } else {
               // No search_text - decrypt and build it on-the-fly
-              decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
-              decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
+              decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+              decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
               const tagsText = note.tags ? String(note.tags) : '';
               searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
 
@@ -3694,7 +3728,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
             // Match found - add to results
             matchingNotes.push({
-              id: note.id as string,
+              id: note.id,
               title: decryptedTitle,
               content_preview: decryptedContent
                 ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
@@ -3765,6 +3799,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
       try {
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
+        // Ensure search_text column exists in notes table (added in migration 0018)
+        const searchTextCol = await env.DB.prepare(
+          `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
+        ).first<{ name: string } | null>();
+
+        if (!searchTextCol) {
+          await env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
+        }
 
         // Ensure FTS5 table exists with correct schema
         // This fixes schema mismatch if old migration (0017) was applied
