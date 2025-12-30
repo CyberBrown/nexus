@@ -2299,6 +2299,644 @@ The architecture workshop is complete when:
 
 ---
 
-*Workshop Complete: 2025-12-30*
-*All architectural decisions finalized and documented.*
-*Implementation roadmap ready for execution.*
+## 12. Final Architecture Design Session: 2025-12-30 (Session 5)
+
+### Session Objective: Implementation Gap Validation & Concrete Task Creation
+
+This session validates the final implementation state and creates specific, actionable tasks for remaining work.
+
+---
+
+### 12.1 Implementation Audit Results
+
+#### Fully Implemented Components
+
+| Component | Evidence | Status |
+|-----------|----------|--------|
+| **Notes FTS5 with search_text** | Migration 0018, `src/routes/notes.ts:25-109` | ✅ Production |
+| **Notes FTS MCP Tool** | `nexus_search_notes` in MCP index | ✅ Production |
+| **Executor Type Simplification** | Migration 0011, values: `ai`, `human`, `human-ai` | ✅ Production |
+| **Memory Items Schema** | Migration 0016 with full schema | ✅ Production |
+| **Task Dependencies** | Migration 0012 with promotion logic | ✅ Production |
+| **Dual Execution Paths** | IntakeClient + HTTP both operational | ✅ Production |
+| **40+ MCP Tools** | Comprehensive toolset in `src/mcp/index.ts` | ✅ Production |
+| **Workflow Callbacks** | `/workflow-callback` endpoint | ✅ Production |
+
+#### Confirmed Implementation Gaps
+
+| Gap | Current State | Priority | Effort |
+|-----|---------------|----------|--------|
+| **Unified `/api/search` endpoint** | Only notes search exists | P1 | 4h |
+| **Cross-entity `nexus_search` MCP tool** | Only `nexus_search_notes` exists | P1 | 2h |
+| **Tasks FTS5 table** | No FTS table for tasks | P2 | 2h |
+| **Ideas FTS5 table** | No FTS table for ideas | P2 | 2h |
+| **Projects FTS5 table** | No FTS table for projects | P2 | 2h |
+| **`task_type` field in tasks** | Field not in schema | P2 | 2h |
+| **Classifier `task_type` output** | Only outputs executor hints | P3 | 3h |
+| **Memory items CRUD API** | Schema exists, no endpoints | P3 | 4h |
+| **Memory MCP tools** | None (`nexus_remember`, `nexus_recall`) | P3 | 3h |
+
+---
+
+### 12.2 Notes FTS Implementation Pattern (Reference)
+
+The notes implementation provides the proven pattern for FTS5 with encryption:
+
+```typescript
+// Pattern from src/routes/notes.ts
+
+// 1. Store plaintext in search_text column (not encrypted)
+const searchText = [validated.title, validated.content || '', validated.tags || ''].join(' ').trim();
+const note = { ...fields, search_text: searchText };
+
+// 2. Insert into FTS5 index
+await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+  .bind(id, searchText).run();
+
+// 3. Query using FTS5 MATCH with BM25 ranking
+const result = await c.env.DB.prepare(`
+  SELECT n.*
+  FROM notes n
+  INNER JOIN notes_fts fts ON n.id = fts.note_id
+  WHERE notes_fts MATCH ?
+    AND n.tenant_id = ? AND n.user_id = ?
+  ORDER BY bm25(notes_fts) ASC
+`).bind(ftsQuery, tenantId, userId).all();
+```
+
+This pattern should be applied to tasks, ideas, and projects.
+
+---
+
+### 12.3 Concrete Implementation Tasks
+
+#### Task 1: Create Entity FTS Migration (P2)
+
+**File:** `migrations/0019_add_entity_fts.sql`
+
+```sql
+-- Tasks FTS (using search_text pattern from notes)
+ALTER TABLE tasks ADD COLUMN search_text TEXT;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+    task_id UNINDEXED,
+    search_text,
+    tokenize='porter unicode61'
+);
+
+-- Ideas FTS
+ALTER TABLE ideas ADD COLUMN search_text TEXT;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS ideas_fts USING fts5(
+    idea_id UNINDEXED,
+    search_text,
+    tokenize='porter unicode61'
+);
+
+-- Projects FTS
+ALTER TABLE projects ADD COLUMN search_text TEXT;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS projects_fts USING fts5(
+    project_id UNINDEXED,
+    search_text,
+    tokenize='porter unicode61'
+);
+```
+
+#### Task 2: Implement Unified Search Endpoint (P1)
+
+**File:** `src/routes/search.ts`
+
+```typescript
+// GET /api/search
+interface SearchParams {
+  q: string;              // Required search query
+  types?: string;         // Comma-separated: task,idea,note,project
+  mode?: 'fast' | 'full'; // fast = metadata only, full = with content
+  domain?: string;        // Filter by domain
+  limit?: number;         // Default: 20
+  offset?: number;        // Pagination
+}
+
+// Response format
+interface SearchResponse {
+  success: true;
+  data: SearchResult[];
+  meta: {
+    query: string;
+    types: string[];
+    mode: string;
+    total: number;
+    took_ms: number;
+  };
+}
+
+interface SearchResult {
+  entity_type: 'task' | 'idea' | 'note' | 'project';
+  id: string;
+  title: string;
+  snippet?: string;
+  relevance: number;
+  metadata: Record<string, unknown>;
+}
+```
+
+#### Task 3: Add `nexus_search` MCP Tool (P1)
+
+**Add to:** `src/mcp/index.ts`
+
+```typescript
+// Tool: nexus_search - Cross-entity search
+{
+  name: 'nexus_search',
+  description: 'Search across tasks, ideas, notes, and projects. Returns ranked results with snippets.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Search query' },
+      types: {
+        type: 'array',
+        items: { type: 'string', enum: ['task', 'idea', 'note', 'project'] },
+        description: 'Entity types to search (default: all)'
+      },
+      limit: { type: 'number', default: 20, maximum: 100 }
+    },
+    required: ['query']
+  }
+}
+```
+
+#### Task 4: Add `task_type` Field (P2)
+
+**File:** `migrations/0020_add_task_type.sql`
+
+```sql
+ALTER TABLE tasks ADD COLUMN task_type TEXT;
+-- Valid: 'code', 'research', 'content', 'outreach', 'review', 'decision'
+
+CREATE INDEX IF NOT EXISTS idx_tasks_task_type ON tasks(tenant_id, task_type);
+```
+
+#### Task 5: Memory API Endpoints (P3)
+
+**File:** `src/routes/memory.ts`
+
+```typescript
+// GET /api/memory - List memory items
+// POST /api/memory - Create memory item
+// GET /api/memory/:id - Get single memory item
+// PATCH /api/memory/:id - Update memory item
+// DELETE /api/memory/:id - Soft delete memory item
+// GET /api/memory/search?q= - Search memories
+```
+
+#### Task 6: Memory MCP Tools (P3)
+
+**Add to:** `src/mcp/index.ts`
+
+```typescript
+// nexus_remember - Store a memory
+// nexus_recall - Search/retrieve memories
+// nexus_forget - Delete a memory
+// nexus_list_memories - List with filters
+```
+
+---
+
+### 12.4 Implementation Sequence
+
+```
+Week 1: Search Foundation
+├── Day 1-2: Migration 0019 (Entity FTS tables)
+├── Day 3: Update routes/tasks.ts for search_text
+├── Day 4: Update routes/ideas.ts for search_text
+├── Day 5: Update routes/projects.ts for search_text
+
+Week 2: Unified Search
+├── Day 1-2: Create routes/search.ts
+├── Day 3: Add nexus_search MCP tool
+├── Day 4: Testing and deployment
+├── Day 5: Buffer/fixes
+
+Week 3: Task Classification
+├── Day 1: Migration 0020 (task_type field)
+├── Day 2: Update classifier for task_type
+├── Day 3-4: Update routing logic
+├── Day 5: Testing
+
+Week 4: Memory System
+├── Day 1-2: Memory API endpoints
+├── Day 3: Memory MCP tools
+├── Day 4-5: Testing and integration
+```
+
+---
+
+### 12.5 Architecture Workshop Deliverables Summary
+
+#### Completed Documentation
+
+1. **ARCHITECTURE_DESIGN_WORKSHOP.md** (this file)
+   - 12 sections covering all architectural aspects
+   - 8 Architecture Decision Records (ADRs)
+   - Complete data flow diagrams
+   - Implementation roadmap
+
+2. **ROUTING_BYPASS_REPORT.md**
+   - Status: RESOLVED
+   - Dual paths validated as intentional design
+
+#### Architecture Decisions Finalized
+
+| ADR | Decision | Status |
+|-----|----------|--------|
+| ADR-001 | Dual Execution Paths | ✅ Accepted |
+| ADR-002 | Hybrid Search (FTS5 + Vectorize future) | ✅ Accepted |
+| ADR-003 | Simplified Executor Types | ✅ Implemented |
+| ADR-004 | Task Type Taxonomy | ⏳ Ready for Implementation |
+| ADR-005 | Callback-Based Workflows | ✅ Implemented |
+| ADR-006 | D1 FTS5 as Primary Search | ✅ Accepted |
+| ADR-007 | Nexus Controls Memory Loading | ✅ Accepted |
+| ADR-008 | Search on Encrypted Data | ✅ Implemented (Notes) |
+
+#### Implementation Priorities
+
+| Priority | Component | Status | Effort |
+|----------|-----------|--------|--------|
+| P1 | Unified Search Endpoint | 🔴 Not Started | 4h |
+| P1 | Cross-entity MCP Search | 🔴 Not Started | 2h |
+| P2 | Tasks/Ideas/Projects FTS | 🔴 Not Started | 6h |
+| P2 | task_type Field | 🔴 Not Started | 2h |
+| P3 | Memory API | 🔴 Not Started | 4h |
+| P3 | Memory MCP Tools | 🔴 Not Started | 3h |
+
+**Total Remaining Effort:** ~21 hours
+
+---
+
+### 12.6 Workshop Completion Checklist
+
+- [x] Current architecture documented
+- [x] Integration strategy finalized (dual execution paths)
+- [x] Data flow patterns validated against code
+- [x] Service contracts defined
+- [x] Search routing logic designed
+- [x] Encryption-aware search strategy validated
+- [x] All 8 ADRs documented and accepted
+- [x] Implementation gaps identified with effort estimates
+- [x] Concrete implementation tasks created
+- [x] Implementation sequence defined
+
+---
+
+## 13. Architecture Workshop Finalization: 2025-12-30 (Session 6)
+
+### Session Objective: Final Validation & Implementation Handoff
+
+This session provides the conclusive validation of all architectural decisions and produces the definitive implementation specification.
+
+---
+
+### 13.1 Integration Strategy - FINALIZED
+
+**Decision: Dual Execution Paths (Confirmed)**
+
+After comprehensive codebase analysis, the dual execution paths are confirmed as the correct architectural approach:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FINALIZED EXECUTION ARCHITECTURE                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+PATH A: Cron-Based Batch Execution
+┌───────────────┐     ┌──────────────────┐     ┌────────────────┐
+│ Cron Trigger  │ ──▶ │ Task Dispatcher  │ ──▶ │ IntakeClient   │
+│ */15 * * * *  │     │ (Nexus Worker)   │     │ (svc binding)  │
+└───────────────┘     └──────────────────┘     └───────┬────────┘
+                                                       │
+                                                       ▼
+                                               ┌────────────────┐
+                                               │ Intake Worker  │
+                                               │ → PrimeWorkflow│
+                                               └────────────────┘
+
+PATH B: Real-Time MCP Execution
+┌───────────────┐     ┌──────────────────┐     ┌────────────────┐
+│ MCP Request   │ ──▶ │ Nexus MCP Server │ ──▶ │ HTTP POST      │
+│ (Claude Code) │     │ auto_dispatch    │     │ /execute       │
+└───────────────┘     └──────────────────┘     └───────┬────────┘
+                                                       │
+                                                       ▼
+                                               ┌────────────────┐
+                                               │ DE Workflows   │
+                                               │ → PrimeWorkflow│
+                                               │ + callback_url │
+                                               └────────────────┘
+```
+
+**Rationale:**
+- Path A (IntakeClient) is zero-cost via service binding, ideal for batch operations
+- Path B (HTTP) enables callback URLs for real-time status updates to MCP clients
+- Both paths ultimately converge to PrimeWorkflow for consistent execution routing
+- This is intentional design, not a bug to be fixed
+
+---
+
+### 13.2 Search Routing Logic - FINALIZED
+
+**Decision: Encryption-Aware Hybrid Search**
+
+The search architecture must account for app-layer encryption on sensitive fields:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FINALIZED SEARCH ARCHITECTURE                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────┐
+                    │   Search Request    │
+                    │   GET /api/search   │
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┴────────────────┐
+              │                                  │
+              ▼                                  ▼
+    ┌─────────────────────┐          ┌─────────────────────────┐
+    │ FTS5 on search_text │          │ Metadata Filters        │
+    │ (Plaintext column)  │          │ (tags, domain, status)  │
+    │                     │          │                         │
+    │ - notes_fts ✅      │          │ Direct SQL queries      │
+    │ - tasks_fts ⏳      │          │                         │
+    │ - ideas_fts ⏳      │          │                         │
+    │ - projects_fts ⏳   │          │                         │
+    └─────────┬───────────┘          └────────────┬────────────┘
+              │                                    │
+              └────────────────┬───────────────────┘
+                               │
+                        ┌──────┴──────┐
+                        │   Merger    │
+                        │  & Ranker   │
+                        │  (BM25)     │
+                        └──────┬──────┘
+                               │
+                        ┌──────┴──────┐
+                        │  Response   │
+                        │  + snippets │
+                        └─────────────┘
+```
+
+**Implementation Pattern (from notes.ts):**
+```typescript
+// 1. Store plaintext in search_text column (not encrypted)
+const searchText = [title, description, tags].join(' ').trim();
+
+// 2. Insert into FTS5 index
+await DB.prepare(`INSERT INTO entity_fts (entity_id, search_text) VALUES (?, ?)`)
+  .bind(id, searchText).run();
+
+// 3. Query with BM25 ranking
+const results = await DB.prepare(`
+  SELECT e.* FROM entities e
+  INNER JOIN entity_fts fts ON e.id = fts.entity_id
+  WHERE entity_fts MATCH ?
+  ORDER BY bm25(entity_fts) ASC
+`).bind(ftsQuery).all();
+```
+
+---
+
+### 13.3 Data Flow Patterns - VALIDATED
+
+All major data flows have been validated against the current implementation:
+
+| Flow | Status | Evidence |
+|------|--------|----------|
+| Capture → Classification → Entity | ✅ Working | `CaptureBuffer DO`, classifier.ts |
+| Idea → Planning → Task Generation | ✅ Working | IdeaToPlanWorkflow, execution routes |
+| Task Dispatch → IntakeClient → PrimeWorkflow | ✅ Working | task-dispatcher.ts, IntakeClient |
+| MCP Dispatch → HTTP → PrimeWorkflow | ✅ Working | mcp/index.ts auto_dispatch |
+| Workflow Callback → Task Update | ✅ Working | workflow-callback endpoint |
+| Dependent Task Promotion | ✅ Working | promoteDependentTasks() |
+| Notes FTS5 Search | ✅ Working | notes_fts, notes.ts |
+
+---
+
+### 13.4 Final Implementation Specifications
+
+#### Migration 0019: Entity FTS Tables
+
+```sql
+-- File: migrations/0019_add_entity_fts.sql
+
+-- Add search_text column to tasks
+ALTER TABLE tasks ADD COLUMN search_text TEXT;
+
+-- Create tasks FTS5 virtual table
+CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+    task_id UNINDEXED,
+    search_text,
+    tokenize='porter unicode61'
+);
+
+-- Add search_text column to ideas
+ALTER TABLE ideas ADD COLUMN search_text TEXT;
+
+-- Create ideas FTS5 virtual table
+CREATE VIRTUAL TABLE IF NOT EXISTS ideas_fts USING fts5(
+    idea_id UNINDEXED,
+    search_text,
+    tokenize='porter unicode61'
+);
+
+-- Add search_text column to projects
+ALTER TABLE projects ADD COLUMN search_text TEXT;
+
+-- Create projects FTS5 virtual table
+CREATE VIRTUAL TABLE IF NOT EXISTS projects_fts USING fts5(
+    project_id UNINDEXED,
+    search_text,
+    tokenize='porter unicode61'
+);
+```
+
+#### Migration 0020: Task Type Field
+
+```sql
+-- File: migrations/0020_add_task_type.sql
+
+ALTER TABLE tasks ADD COLUMN task_type TEXT;
+-- Valid values: 'code', 'research', 'content', 'outreach', 'review', 'decision'
+
+CREATE INDEX IF NOT EXISTS idx_tasks_task_type ON tasks(tenant_id, task_type);
+```
+
+#### Unified Search Endpoint Specification
+
+```typescript
+// File: src/routes/search.ts
+
+// GET /api/search
+interface SearchRequest {
+  q: string;              // Required search query (min 2 chars)
+  types?: string;         // Comma-separated: task,idea,note,project (default: all)
+  domain?: string;        // Filter by domain
+  status?: string;        // Filter by status
+  limit?: number;         // Default: 20, max: 100
+  offset?: number;        // Pagination offset
+}
+
+interface SearchResponse {
+  success: true;
+  data: SearchResult[];
+  meta: {
+    query: string;
+    types: string[];
+    total: number;
+    took_ms: number;
+  };
+}
+
+interface SearchResult {
+  entity_type: 'task' | 'idea' | 'note' | 'project';
+  id: string;
+  title: string;          // Decrypted
+  snippet?: string;       // From FTS5 snippet()
+  relevance: number;      // BM25 score
+  metadata: {
+    status?: string;
+    domain?: string;
+    tags?: string;
+  };
+}
+```
+
+#### MCP Search Tool Specification
+
+```typescript
+// Add to: src/mcp/index.ts
+
+// Tool: nexus_search - Cross-entity search
+{
+  name: 'nexus_search',
+  description: 'Search across tasks, ideas, notes, and projects. Returns ranked results.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: {
+        type: 'string',
+        description: 'Search query (use quotes for exact phrases)'
+      },
+      types: {
+        type: 'array',
+        items: { type: 'string', enum: ['task', 'idea', 'note', 'project'] },
+        description: 'Entity types to search (default: all)'
+      },
+      domain: {
+        type: 'string',
+        description: 'Filter by domain'
+      },
+      limit: {
+        type: 'number',
+        default: 20,
+        maximum: 100
+      }
+    },
+    required: ['query']
+  }
+}
+```
+
+---
+
+### 13.5 Task Type Routing Logic
+
+```typescript
+// File: src/lib/routing.ts
+
+export type TaskType = 'code' | 'research' | 'content' | 'outreach' | 'review' | 'decision';
+export type ExecutorType = 'ai' | 'human' | 'human-ai';
+
+const TASK_TYPE_ROUTING: Record<TaskType, ExecutorType> = {
+  'code': 'ai',           // → CodeExecution workflow
+  'research': 'ai',       // → Research workflow (future)
+  'content': 'ai',        // → Content workflow (future)
+  'outreach': 'human-ai', // → Human dashboard with AI assist
+  'review': 'human',      // → Human review queue
+  'decision': 'human'     // → CEO decision queue
+};
+
+export function getExecutorType(task: Task): ExecutorType {
+  // 1. Explicit override takes precedence
+  if (task.executor_type) return task.executor_type as ExecutorType;
+
+  // 2. Route by task_type
+  if (task.task_type && TASK_TYPE_ROUTING[task.task_type as TaskType]) {
+    return TASK_TYPE_ROUTING[task.task_type as TaskType];
+  }
+
+  // 3. Fallback to content-based classification
+  return classifyFromContent(task.title, task.description);
+}
+```
+
+---
+
+### 13.6 Implementation Roadmap - Final
+
+| Phase | Tasks | Effort | Status |
+|-------|-------|--------|--------|
+| **Sprint 1: Search** | | **10h** | |
+| 1.1 | Create migration 0019 (entity FTS tables) | 2h | Ready |
+| 1.2 | Update tasks.ts for search_text | 2h | Ready |
+| 1.3 | Update ideas.ts for search_text | 2h | Ready |
+| 1.4 | Update projects.ts for search_text | 2h | Ready |
+| 1.5 | Implement `/api/search` endpoint | 4h | Ready |
+| 1.6 | Add `nexus_search` MCP tool | 2h | Ready |
+| **Sprint 2: Classification** | | **6h** | |
+| 2.1 | Create migration 0020 (task_type field) | 1h | Ready |
+| 2.2 | Update classifier for task_type output | 3h | Ready |
+| 2.3 | Update routing logic | 2h | Ready |
+| **Sprint 3: Memory** | | **7h** | |
+| 3.1 | Create memory API routes | 4h | Ready |
+| 3.2 | Add memory MCP tools | 3h | Ready |
+
+**Total Remaining Effort:** ~23 hours
+
+---
+
+### 13.7 Architecture Decision Records - Final Status
+
+| ADR | Decision | Status |
+|-----|----------|--------|
+| ADR-001 | Dual Execution Paths (IntakeClient + HTTP) | ✅ **ACCEPTED** |
+| ADR-002 | Hybrid Search (FTS5 metadata + search_text) | ✅ **ACCEPTED** |
+| ADR-003 | Simplified Executor Types (ai/human/human-ai) | ✅ **IMPLEMENTED** |
+| ADR-004 | Task Type Taxonomy (6 types) | ⏳ **READY** |
+| ADR-005 | Callback-Based Workflows | ✅ **IMPLEMENTED** |
+| ADR-006 | D1 FTS5 as Primary Search | ✅ **ACCEPTED** |
+| ADR-007 | Nexus Controls Memory Loading | ✅ **ACCEPTED** |
+| ADR-008 | Search on Encrypted Data (search_text pattern) | ✅ **ACCEPTED** |
+
+---
+
+### 13.8 Workshop Completion Summary
+
+**Deliverables Produced:**
+1. ✅ Complete architecture documentation (2600+ lines)
+2. ✅ 8 Architecture Decision Records
+3. ✅ Integration strategy finalized (dual paths validated)
+4. ✅ Search routing logic designed (encryption-aware)
+5. ✅ Data flow patterns validated against code
+6. ✅ Implementation specifications created
+7. ✅ Prioritized implementation roadmap
+
+**Architecture Confidence Level:** HIGH
+
+All architectural decisions have been validated against the current codebase. The implementation gaps are well-defined with clear specifications and effort estimates.
+
+---
+
+*Architecture Design Workshop Complete: 2025-12-30*
+*Session 6 (Final Validation): Integration strategy, data flow, and search routing finalized*
+*Next Step: Begin Sprint 1 - Search Foundation*
+*Reference: e99b8670-5074-4c9a-93fe-60dd263fc807 | Idea: 1c8fb1ed-d4da-42ff-8376-443179d680af*
