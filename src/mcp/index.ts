@@ -3213,9 +3213,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Track plaintext values for rebuilding search_text
         // Decrypt existing values if not being updated
-        let plaintextTitle = title;
-        let plaintextContent = content;
-        let plaintextTags = tags;
+        let plaintextTitle: string | null | undefined = title;
+        let plaintextContent: string | null | undefined = content;
+        let plaintextTags: string | null | undefined = tags;
 
         if (title !== undefined) {
           updates.push('title = ?');
