@@ -1567,15 +1567,21 @@ app.post('/workflow-callback', async (c) => {
       workflow_instance_id?: string;
       result?: string;
       logs?: string;
+      notes?: string;  // nexus-callback.ts sends output in notes field
       metadata?: Record<string, unknown>;
     };
 
     // Normalize success from status field if not provided
     const isSuccess = body.success ?? (body.status === 'completed');
     // Check ALL possible text fields for failure indicators - not just the "happy path" fields
-    // DE might send the actual output in different fields depending on the execution path
-    const resultText = body.result || body.output || body.logs || '';
-    const allTextToCheck = [body.result, body.output, body.logs, body.error].filter(Boolean).join('\n');
+    // DE might send the actual output in different fields depending on the execution path:
+    // - output: from CodeExecutionWorkflow sendCallback
+    // - logs: from sandbox-executor response
+    // - result: from some legacy paths
+    // - notes: from nexus-callback.ts reportToNexus (sends to /api/tasks/:id/complete, but check here too)
+    // - error: error messages that might contain failure info
+    const resultText = body.result || body.output || body.logs || body.notes || '';
+    const allTextToCheck = [body.result, body.output, body.logs, body.notes, body.error].filter(Boolean).join('\n');
 
     console.log(`Workflow callback received: task_id=${body.task_id}, status=${body.status}, success=${isSuccess}`);
     console.log(`Workflow callback: resultText length=${resultText.length}, allTextToCheck length=${allTextToCheck.length}`);
