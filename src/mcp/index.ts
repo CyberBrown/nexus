@@ -3969,8 +3969,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         };
 
         // If no results found, check if notes exist and try auto-rebuild of FTS
+        // NOTE: We trigger rebuild even if FTS was used but returned 0 results,
+        // because the FTS index may be stale/corrupted or have mismatched content
         let autoRebuilt = false;
-        if (matchingNotes.length === 0 && !usedFts) {
+        if (matchingNotes.length === 0) {
           // Count total notes for this user
           let totalNotes = 0;
           try {
@@ -3981,7 +3983,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           } catch { /* ignore count error */ }
 
           // If notes exist but weren't found, do an aggressive FTS rebuild
-          if (totalNotes > 0 && ftsIndexCount < totalNotes) {
+          // Also rebuild if FTS count matches but search returned nothing (stale index)
+          if (totalNotes > 0 && (ftsIndexCount < totalNotes || usedFts)) {
             try {
               // Rebuild FTS for ALL notes (not batched)
               const allNotesForFts = await env.DB.prepare(`
