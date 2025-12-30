@@ -3614,16 +3614,19 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const archivedCondition = include_archived ? '' : 'AND archived_at IS NULL';
 
         // PRIMARY SEARCH: FTS5 full-text search
-        // Space-separated terms in FTS5 use implicit AND semantics
-        // Each term gets prefix matching with * for flexibility
+        // D1's FTS5 has known issues with AND operator - it can silently fail
+        // We use OR to get all potentially matching results, then post-filter
+        // with matchesAllTerms() to enforce AND semantics in application code
         try {
-          // Build FTS5 query: each term becomes "term*" for prefix matching
-          // Multiple terms are space-separated which means AND in FTS5
-          const ftsQuery = ftsTerms.map(term =>
-            term.startsWith('"') ? term : `${term}*`
-          ).join(' ');
+          // Build FTS5 query: use OR between terms for broad matching
+          // Post-filter enforces AND semantics after decryption
+          const ftsQuery = ftsTerms.length === 1
+            ? (ftsTerms[0]!.startsWith('"') ? ftsTerms[0] : `${ftsTerms[0]}*`)
+            : '(' + ftsTerms.map(term =>
+                term.startsWith('"') ? term : `${term}*`
+              ).join(' OR ') + ')';
 
-          console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}", terms=[${searchTerms.join(', ')}]`);
+          console.log(`[nexus_search_notes] FTS5 search (OR query, AND post-filter): query="${ftsQuery}", terms=[${searchTerms.join(', ')}]`);
 
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
