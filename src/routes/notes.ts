@@ -52,6 +52,7 @@ notes.get('/', async (c) => {
 
   // Search filter (after decryption)
   // Supports multi-word search with AND logic and quoted phrases
+  // Searches across title, content, and tags
   let filteredItems = decryptedItems;
   if (search) {
     // Parse search query: extract quoted phrases and individual words
@@ -62,19 +63,21 @@ notes.get('/', async (c) => {
 
     // Extract quoted phrases
     while ((match = quotedRegex.exec(search)) !== null) {
-      searchTerms.push(match[1]!.toLowerCase());
+      searchTerms.push(match[1]!.toLowerCase().trim());
     }
     queryWithoutQuotes = search.replace(quotedRegex, '').trim();
 
     // Extract individual words (non-quoted)
     const words = queryWithoutQuotes.split(/\s+/).filter((w: string) => w.length > 0);
     for (const word of words) {
-      searchTerms.push(word.toLowerCase());
+      searchTerms.push(word.toLowerCase().trim());
     }
 
     if (searchTerms.length > 0) {
       filteredItems = decryptedItems.filter((item) => {
-        const searchableText = `${item.title || ''} ${item.content || ''}`.toLowerCase();
+        // Build searchable text from title, content, and tags
+        const tagsText = item.tags ? String(item.tags).toLowerCase() : '';
+        const searchableText = `${item.title || ''} ${item.content || ''} ${tagsText}`.toLowerCase();
         return searchTerms.every((term) => searchableText.includes(term));
       });
     }

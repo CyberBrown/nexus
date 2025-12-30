@@ -3352,15 +3352,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
   );
 
   // Tool: nexus_search_notes - Search notes by content (in-memory after decryption)
-  // Note: FTS5 can't be used because notes are stored encrypted
+  // Note: FTS5 can't be used directly because notes are stored encrypted.
+  // We fetch all notes, decrypt, then search in memory.
   server.tool(
     'nexus_search_notes',
-    'Search notes by title or content. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
+    'Search notes by title, content, or tags. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
     {
       query: z.string().describe('Search query. Multiple words are ANDed together. Use quotes for exact phrases, e.g. "MCP validation" or MCP validation'),
       limit: z.number().optional().default(20).describe('Maximum results'),
+      include_archived: z.boolean().optional().default(false).describe('Include archived notes in search'),
     },
-    async ({ query, limit }): Promise<CallToolResult> => {
+    async ({ query, limit, include_archived }): Promise<CallToolResult> => {
       try {
         // Parse search query: extract quoted phrases and individual words
         // e.g., 'MCP "validation error" test' -> ['MCP', 'validation error', 'test']
@@ -3371,14 +3373,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Extract quoted phrases
         while ((match = quotedRegex.exec(query)) !== null) {
-          searchTerms.push(match[1]!.toLowerCase());
+          searchTerms.push(match[1]!.toLowerCase().trim());
         }
         queryWithoutQuotes = query.replace(quotedRegex, '').trim();
 
         // Extract individual words (non-quoted)
         const words = queryWithoutQuotes.split(/\s+/).filter(w => w.length > 0);
         for (const word of words) {
-          searchTerms.push(word.toLowerCase());
+          searchTerms.push(word.toLowerCase().trim());
         }
 
         // If no valid search terms, return empty results
@@ -3391,32 +3393,43 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 query: query,
                 count: 0,
                 notes: [],
+                debug: { search_terms: [], total_notes_checked: 0 }
               }, null, 2)
             }]
           };
         }
 
-        // Fetch all non-archived, non-deleted notes for this user
-        const notes = await env.DB.prepare(`
-          SELECT id, title, content, category, tags, source_type, pinned, created_at
+        // Build query - optionally include archived notes
+        let sqlQuery = `
+          SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at
           FROM notes
           WHERE tenant_id = ?
             AND user_id = ?
             AND deleted_at IS NULL
-            AND archived_at IS NULL
-          ORDER BY pinned DESC, created_at DESC
-        `).bind(tenantId, userId).all();
+        `;
+        if (!include_archived) {
+          sqlQuery += ` AND archived_at IS NULL`;
+        }
+        sqlQuery += ` ORDER BY pinned DESC, created_at DESC`;
+
+        const notes = await env.DB.prepare(sqlQuery).bind(tenantId, userId).all();
 
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
         // Decrypt and filter notes in memory
         const matchingNotes = [];
+        let totalChecked = 0;
         for (const note of notes.results) {
+          totalChecked++;
           const decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
           const decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
+          // Also search in tags (stored as JSON array or comma-separated string)
+          const tagsText = note.tags ? String(note.tags).toLowerCase() : '';
 
-          // Search in decrypted content (case-insensitive, all terms must match)
-          const searchableText = `${decryptedTitle} ${decryptedContent}`.toLowerCase();
+          // Build searchable text from title, content, and tags
+          const searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
+
+          // Check if ALL search terms are found in the searchable text
           const matches = searchTerms.every(term => searchableText.includes(term));
 
           if (matches) {
@@ -3426,7 +3439,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               content_preview: decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : ''),
               category: note.category,
               tags: note.tags,
+              source_type: note.source_type,
               pinned: note.pinned === 1,
+              archived: !!note.archived_at,
               created_at: note.created_at,
             });
 
@@ -3446,12 +3461,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               search_terms: searchTerms,
               count: matchingNotes.length,
               notes: matchingNotes,
+              debug: {
+                total_notes_checked: totalChecked,
+                include_archived: include_archived || false,
+              }
             }, null, 2)
           }]
         };
       } catch (error: any) {
         return {
-          content: [{ type: 'text', text: `Error: ${error.message}` }],
+          content: [{ type: 'text', text: `Error searching notes: ${error.message}` }],
           isError: true
         };
       }
