@@ -3546,7 +3546,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // FTS5 uses implicit AND for space-separated terms: "word1 word2" matches docs with both
+        // Use explicit AND operators for reliability across SQLite/D1 implementations
         // For phrases: quote them to require exact sequence match
         // Note: Column prefix is NOT needed - our FTS table has only one indexed column (search_text)
         const terms = searchTerms.map(({ term, isPhrase }) => {
@@ -3558,9 +3558,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             return term;
           }
         });
-        // Space-separated terms use implicit AND (all terms must match)
-        // Per SQLite FTS5 docs: "sequences separated by whitespace have implicit AND"
-        const ftsQuery = terms.join(' ');
+        // Use explicit AND for multi-word queries to ensure all terms must match
+        // This is more reliable than implicit AND (space-separated) in some SQLite implementations
+        const ftsQuery = terms.length > 1 ? terms.join(' AND ') : terms[0] || '';
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {
@@ -3628,13 +3628,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // This ensures notes are searchable even if they weren't indexed when created
         try {
           // Find notes that have search_text but are missing from FTS
+          // Increased limit to 500 to ensure more notes get indexed in one pass
           const notesWithSearchText = await env.DB.prepare(`
             SELECT n.id, n.search_text FROM notes n
             LEFT JOIN notes_fts f ON n.id = f.note_id
             WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
               AND n.search_text IS NOT NULL AND n.search_text != ''
               AND f.note_id IS NULL
-            LIMIT 100
+            LIMIT 500
           `).bind(tenantId, userId).all<{ id: string; search_text: string }>();
 
           if (notesWithSearchText.results && notesWithSearchText.results.length > 0) {
@@ -3656,7 +3657,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
               AND n.search_text IS NOT NULL AND n.search_text != ''
               AND f.search_text != n.search_text
-            LIMIT 50
+            LIMIT 200
           `).bind(tenantId, userId).all<{ id: string; search_text: string; fts_text: string }>();
 
           if (notesWithMismatchedFts.results && notesWithMismatchedFts.results.length > 0) {
@@ -3673,13 +3674,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
 
           // Find notes WITHOUT search_text - decrypt and populate both columns
+          // Increased limit to 200 for more aggressive population
           const notesWithoutSearchText = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.tags FROM notes n
             LEFT JOIN notes_fts f ON n.id = f.note_id
             WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
               AND (n.search_text IS NULL OR n.search_text = '')
               AND f.note_id IS NULL
-            LIMIT 50
+            LIMIT 200
           `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
 
           if (notesWithoutSearchText.results && notesWithoutSearchText.results.length > 0) {
@@ -3715,7 +3717,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             INNER JOIN notes_fts f ON n.id = f.note_id
             WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
               AND (n.search_text IS NULL OR n.search_text = '')
-            LIMIT 50
+            LIMIT 200
           `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null }>();
 
           if (notesInFtsWithoutSearchText.results && notesInFtsWithoutSearchText.results.length > 0) {

@@ -198,7 +198,7 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // FTS5 uses implicit AND for space-separated terms: "word1 word2" matches docs with both
+      // Use explicit AND operators for reliability across SQLite/D1 implementations
       // For phrases: quote them to require exact sequence match
       // Note: Column prefix is NOT needed - our FTS table has only one indexed column (search_text)
       const ftsTerms: string[] = [];
@@ -247,9 +247,9 @@ notes.get('/', async (c) => {
         }
       }
 
-      // Space-separated terms use implicit AND (all terms must match)
-      // Per SQLite FTS5 docs: "sequences separated by whitespace have implicit AND"
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' ') : '';
+      // Use explicit AND for multi-word queries to ensure all terms must match
+      // This is more reliable than implicit AND (space-separated) in some SQLite implementations
+      const ftsQuery = ftsTerms.length > 1 ? ftsTerms.join(' AND ') : (ftsTerms[0] || '');
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
