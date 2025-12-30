@@ -3545,20 +3545,22 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query with explicit AND operator for multi-word search
-        // D1's FTS5 implementation requires explicit AND for reliable multi-term matching
-        // Space-separated terms (implicit AND) does not work reliably in D1
+        // Build FTS5 query for multi-word search
+        // Use implicit AND (space-separated quoted terms) for D1 FTS5 compatibility
+        // Each term is quoted to ensure proper tokenization with porter stemmer
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match exactly in sequence
             return `"${term}"`;
           } else {
-            // Single word - let FTS5 porter stemmer handle matching
-            return term;
+            // Single word - quote it to ensure it's treated as a phrase
+            // This ensures AND is treated as an operator, not a search term
+            return `"${term}"`;
           }
         });
-        // Use explicit AND operator between terms for D1 FTS5 compatibility
-        const ftsQuery = terms.join(' AND ');
+        // Use implicit AND (space-separated) for FTS5 multi-word search
+        // Each term is quoted to ensure proper parsing
+        const ftsQuery = terms.join(' ');
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {

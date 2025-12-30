@@ -197,9 +197,8 @@ notes.get('/', async (c) => {
         // Table check/creation failed, will fall back to in-memory search
       }
 
-      // Convert search query to FTS5 format with explicit AND operator
-      // D1's FTS5 implementation may not reliably handle implicit AND with space-separated terms
-      // Using explicit AND ensures all terms must match
+      // Convert search query to FTS5 format with implicit AND (space-separated quoted terms)
+      // Each term is quoted to ensure proper tokenization with porter stemmer
       // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
@@ -218,7 +217,8 @@ notes.get('/', async (c) => {
             // MUST lowercase because porter tokenizer normalizes to lowercase
             const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              ftsTerms.push(escaped);
+              // Quote single terms to ensure proper parsing
+              ftsTerms.push(`"${escaped}"`);
             }
           }
         }
@@ -240,13 +240,14 @@ notes.get('/', async (c) => {
           // MUST lowercase because porter tokenizer normalizes to lowercase
           const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            ftsTerms.push(escaped);
+            // Quote single terms to ensure proper parsing
+            ftsTerms.push(`"${escaped}"`);
           }
         }
       }
 
-      // FTS5 query with explicit AND operator for reliable multi-word search
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' AND ') : '';
+      // FTS5 query with implicit AND (space-separated quoted terms)
+      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' ') : '';
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
