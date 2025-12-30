@@ -154,9 +154,11 @@ notes.get('/', async (c) => {
         return searchTerms.every(term => lowerText.includes(term));
       };
 
-      // Build FTS5 query with AND for multi-word search
-      // FTS5 supports: term1 AND term2 (explicit AND)
-      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' AND ') : '';
+      // Build FTS5 query with OR for broad matching
+      // D1's FTS5 has known issues with AND operator - it can silently fail
+      // We use OR to get all potentially matching results, then post-filter
+      // with matchesAllTerms() to enforce AND semantics in application code
+      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' OR ') : '';
 
       if (ftsQuery) {
         // Build conditions

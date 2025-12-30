@@ -3713,9 +3713,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let searchMethod = 'none';
         const archivedCondition = include_archived ? '' : 'AND archived_at IS NULL';
 
-        // Build FTS5 query with proper AND semantics
-        // FTS5 supports: term1 AND term2 (explicit AND) or term1 term2 (implicit AND)
-        // We use explicit AND for clarity and wrap each term for safety
+        // Build FTS5 query with OR operator for broad matching
+        // D1's FTS5 has known issues with AND operator - it can silently fail
+        // We use OR to get all potentially matching results, then post-filter
+        // with matchesAllTerms() to enforce AND semantics in application code
         // For quoted phrases, we keep them quoted for exact phrase matching
         const ftsQuery = ftsTerms.map(term => {
           // Already quoted phrases stay as-is
@@ -3724,10 +3725,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
           // Single terms don't need wrapping
           return term;
-        }).join(' AND ');
+        }).join(' OR ');
 
         // STEP 1: FTS5 search (PRIMARY method)
-        // Uses explicit AND operator for multi-word search
+        // Uses OR operator for broad matching, then post-filters for AND semantics
         try {
           console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}", terms=[${searchTerms.join(', ')}]`);
 
