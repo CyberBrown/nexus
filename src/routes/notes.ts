@@ -193,6 +193,55 @@ notes.get('/', async (c) => {
             }
           }
         }
+
+        // Fix notes with corrupted search_text by comparing against actual decrypted content
+        // If the title doesn't appear in search_text, the data is corrupted and needs repair
+        const notesNeedingRepair = await c.env.DB.prepare(`
+          SELECT n.id, n.title, n.content, n.tags, n.search_text FROM notes n
+          WHERE n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
+            AND n.search_text IS NOT NULL AND n.search_text != ''
+          LIMIT 50
+        `).bind(tenantId, userId).all<{ id: string; title: string | null; content: string | null; tags: string | null; search_text: string }>();
+
+        if (notesNeedingRepair.results && notesNeedingRepair.results.length > 0) {
+          for (const note of notesNeedingRepair.results) {
+            try {
+              // Decrypt actual content
+              let decryptedTitle = '';
+              let decryptedContent = '';
+              try {
+                const { decryptField } = await import('../lib/encryption.ts');
+                decryptedTitle = note.title ? await decryptField(note.title, encryptionKey) : '';
+                decryptedContent = note.content ? await decryptField(note.content, encryptionKey) : '';
+              } catch {
+                decryptedTitle = note.title || '';
+                decryptedContent = note.content || '';
+              }
+              const tagsText = note.tags ? String(note.tags) : '';
+
+              // Build expected search_text from decrypted content
+              const expectedSearchText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.trim().toLowerCase();
+
+              // Check if current search_text contains the decrypted title
+              const searchTextLower = note.search_text.toLowerCase();
+              const titleLower = decryptedTitle.toLowerCase().substring(0, 20);
+              const isCorrupted = titleLower.length > 0 && !searchTextLower.includes(titleLower);
+
+              if (isCorrupted && expectedSearchText) {
+                // Update notes table with correct search_text
+                await c.env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                  .bind(expectedSearchText, note.id).run();
+
+                // Update FTS index
+                await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                  .bind(note.id, expectedSearchText).run();
+              }
+            } catch {
+              // Ignore errors for individual notes
+            }
+          }
+        }
       } catch {
         // Table check/creation failed, will fall back to in-memory search
       }
