@@ -343,13 +343,14 @@ notes.get('/', async (c) => {
         }
 
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
+        // Use sqlite_master instead of pragma_table_info (more reliable for virtual tables)
         try {
-          const tableInfo = await c.env.DB.prepare(
-            `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
-          ).first<{ name: string } | null>();
+          const ftsTable = await c.env.DB.prepare(
+            `SELECT name, sql FROM sqlite_master WHERE type='table' AND name='notes_fts'`
+          ).first<{ name: string; sql: string } | null>();
 
-          if (!tableInfo) {
-            // FTS table either doesn't exist or has old schema - recreate with correct schema
+          // Recreate FTS5 table if it doesn't exist or has old schema (missing note_id column)
+          if (!ftsTable || !ftsTable.sql || !ftsTable.sql.includes('note_id')) {
             await c.env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
             await c.env.DB.prepare(`
               CREATE VIRTUAL TABLE notes_fts USING fts5(
@@ -358,6 +359,15 @@ notes.get('/', async (c) => {
                 tokenize='porter unicode61'
               )
             `).run();
+
+            // CRITICAL: Immediately populate FTS index when table is recreated
+            // This ensures search works on the very first query after table creation
+            await c.env.DB.prepare(`
+              INSERT INTO notes_fts (note_id, search_text)
+              SELECT id, search_text FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND search_text IS NOT NULL AND search_text != ''
+            `).bind(tenantId, userId).run();
           }
         } catch {
           // Schema check failed, FTS may not be available - will fall back to in-memory search
@@ -804,12 +814,14 @@ notes.post('/rebuild-fts', async (c) => {
     }
 
     // Ensure FTS5 table exists with correct schema
+    // Use sqlite_master instead of pragma_table_info (more reliable for virtual tables)
     try {
-      const tableInfo = await c.env.DB.prepare(
-        `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
-      ).first<{ name: string } | null>();
+      const ftsTable = await c.env.DB.prepare(
+        `SELECT name, sql FROM sqlite_master WHERE type='table' AND name='notes_fts'`
+      ).first<{ name: string; sql: string } | null>();
 
-      if (!tableInfo) {
+      // Recreate FTS5 table if it doesn't exist or has old schema (missing note_id column)
+      if (!ftsTable || !ftsTable.sql || !ftsTable.sql.includes('note_id')) {
         await c.env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
         await c.env.DB.prepare(`
           CREATE VIRTUAL TABLE notes_fts USING fts5(

@@ -3545,12 +3545,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             await env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
           }
 
-          // Check if notes_fts has correct schema (note_id column)
-          const tableInfo = await env.DB.prepare(
-            `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
-          ).first<{ name: string } | null>();
-          if (!tableInfo) {
-            // FTS table either doesn't exist or has old schema - recreate with correct schema
+          // Check if notes_fts exists using sqlite_master (more reliable for virtual tables)
+          // pragma_table_info doesn't work reliably for FTS5 virtual tables
+          const ftsTable = await env.DB.prepare(
+            `SELECT name, sql FROM sqlite_master WHERE type='table' AND name='notes_fts'`
+          ).first<{ name: string; sql: string } | null>();
+
+          // Recreate FTS5 table if it doesn't exist or has old schema (missing note_id column)
+          if (!ftsTable || !ftsTable.sql || !ftsTable.sql.includes('note_id')) {
             await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
             await env.DB.prepare(`
               CREATE VIRTUAL TABLE notes_fts USING fts5(
@@ -3559,6 +3561,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 tokenize='porter unicode61'
               )
             `).run();
+
+            // CRITICAL: Immediately populate FTS index when table is recreated
+            // This ensures search works on the very first query after table creation
+            // Use SQL-based bulk insert from notes.search_text where available
+            await env.DB.prepare(`
+              INSERT INTO notes_fts (note_id, search_text)
+              SELECT id, search_text FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND search_text IS NOT NULL AND search_text != ''
+            `).bind(tenantId, userId).run();
           }
         } catch {
           // Schema check failed, continue anyway - search will use fallbacks
@@ -4232,13 +4244,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Ensure FTS5 table exists with correct schema
-        // This fixes schema mismatch if old migration (0017) was applied
-        const tableInfo = await env.DB.prepare(
-          `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
-        ).first<{ name: string } | null>();
+        // Use sqlite_master instead of pragma_table_info (more reliable for virtual tables)
+        const ftsTable = await env.DB.prepare(
+          `SELECT name, sql FROM sqlite_master WHERE type='table' AND name='notes_fts'`
+        ).first<{ name: string; sql: string } | null>();
 
-        if (!tableInfo) {
-          // Table either doesn't exist or has old schema - drop and recreate
+        // Recreate FTS5 table if it doesn't exist or has old schema (missing note_id column)
+        if (!ftsTable || !ftsTable.sql || !ftsTable.sql.includes('note_id')) {
           await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
           await env.DB.prepare(`
             CREATE VIRTUAL TABLE notes_fts USING fts5(
