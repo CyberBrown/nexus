@@ -187,19 +187,32 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
       const now = new Date().toISOString();
       const key = await getEncryptionKey(this.env.KV, tenant_id);
 
+      // Check if this is a dispatched async workflow (INTAKE code tasks)
+      // These should be marked as 'dispatched', not 'completed' or 'failed'
+      // The callback from DE will update the final status
+      const isDispatched = result.output?.startsWith('DISPATCHED:');
+
       // Encrypt result if present
       const encryptedResult = result.output
         ? await encryptField(JSON.stringify(result), key)
         : null;
 
-      const newStatus = result.success ? 'completed' : 'failed';
+      // Determine status: dispatched tasks stay in 'dispatched' state until callback
+      let newStatus: string;
+      if (isDispatched) {
+        newStatus = 'dispatched';
+      } else if (result.success) {
+        newStatus = 'completed';
+      } else {
+        newStatus = 'failed';
+      }
 
       await this.env.DB.prepare(`
         UPDATE idea_tasks
         SET status = ?,
             result = ?,
             completed_at = CASE WHEN ? = 'completed' THEN ? ELSE NULL END,
-            error_message = CASE WHEN ? = 'failed' THEN ? ELSE NULL END,
+            error_message = CASE WHEN ? = 'failed' AND ? NOT LIKE 'DISPATCHED:%' THEN ? ELSE NULL END,
             updated_at = ?
         WHERE id = ?
       `).bind(
@@ -208,25 +221,27 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
         newStatus,
         now,
         newStatus,
+        result.output || '',
         result.success ? null : result.output,
         now,
         task_id
       ).run();
 
-      // Update execution counts
-      if (result.success) {
+      // Update execution counts - only for final states (not dispatched)
+      if (result.success && !isDispatched) {
         await this.env.DB.prepare(`
           UPDATE idea_executions
           SET completed_tasks = completed_tasks + 1, updated_at = ?
           WHERE id = ?
         `).bind(now, execution_id).run();
-      } else {
+      } else if (!result.success && !isDispatched) {
         await this.env.DB.prepare(`
           UPDATE idea_executions
           SET failed_tasks = failed_tasks + 1, updated_at = ?
           WHERE id = ?
         `).bind(now, execution_id).run();
       }
+      // Note: dispatched tasks will have their counts updated by the workflow callback
     });
 
     // Step 6: Check if all tasks are done
@@ -237,6 +252,7 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
           SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
           SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) as blocked,
+          SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END) as dispatched,
           SUM(CASE WHEN status IN ('pending', 'ready', 'in_progress') THEN 1 ELSE 0 END) as remaining
         FROM idea_tasks
         WHERE idea_id = ? AND deleted_at IS NULL
@@ -245,14 +261,18 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
         completed: number;
         failed: number;
         blocked: number;
+        dispatched: number;
         remaining: number;
       }>();
 
       const now = new Date().toISOString();
 
       if (stats) {
-        if (stats.remaining === 0) {
-          // All tasks done
+        // Include dispatched tasks as "still in progress" - they haven't finished yet
+        const stillPending = stats.remaining + stats.dispatched;
+
+        if (stillPending === 0) {
+          // All tasks done (no pending or dispatched tasks remaining)
           const finalStatus = stats.blocked > 0 ? 'blocked' :
                              stats.failed > 0 ? 'completed' : // completed with failures
                              'completed';
@@ -269,6 +289,13 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
             SET execution_status = ?, updated_at = ?
             WHERE id = ?
           `).bind(ideaStatus, now, idea_id).run();
+        } else if (stats.dispatched > 0) {
+          // Some tasks are dispatched (running async) - mark execution as 'executing'
+          await this.env.DB.prepare(`
+            UPDATE idea_executions
+            SET status = 'executing', updated_at = ?
+            WHERE id = ? AND status != 'executing'
+          `).bind(now, execution_id).run();
         }
       }
     });
@@ -420,10 +447,12 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
           throw new Error(data.error || 'INTAKE returned failure');
         }
 
-        // INTAKE triggers async workflow - we return success and the callback will update the task
+        // INTAKE triggers async workflow - mark as 'dispatched' (not completed)
+        // The workflow callback will update the final status when execution completes
+        // IMPORTANT: Return success=false with a special status to prevent premature completion
         return {
-          success: true,
-          output: `Workflow triggered via INTAKE: ${data.workflow_instance_id || data.request_id}. Results will be delivered via callback.`,
+          success: false, // Not yet complete - workflow is async
+          output: `DISPATCHED:${data.workflow_instance_id || data.request_id}`, // Special marker for dispatched state
         };
       }
     );

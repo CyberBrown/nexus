@@ -1543,6 +1543,123 @@ app.post('/workflow-callback', async (c) => {
 
     const now = new Date().toISOString();
 
+    // ========================================
+    // Check for idea_tasks first (from TaskExecutorWorkflow)
+    // These are dispatched async and need callback handling
+    // ========================================
+    if (body.task_id) {
+      const ideaTask = await c.env.DB.prepare(`
+        SELECT id, idea_id, tenant_id, status FROM idea_tasks
+        WHERE id = ? AND status = 'dispatched' AND deleted_at IS NULL
+      `).bind(body.task_id).first<{ id: string; idea_id: string; tenant_id: string; status: string }>();
+
+      if (ideaTask) {
+        console.log(`Workflow callback: found idea_task ${ideaTask.id} in dispatched state`);
+
+        if (isSuccess) {
+          // Validate that work was actually done - check for failure indicators
+          const resultLower = (resultText || '').toLowerCase();
+          const failureIndicators = [
+            "couldn't find",
+            "could not find",
+            "doesn't have",
+            "does not have",
+            "not found",
+            "failed to",
+            "error:",
+            "unable to",
+            "no such file",
+            "doesn't exist",
+          ];
+          const isActualFailure = failureIndicators.some(indicator => resultLower.includes(indicator));
+
+          if (isActualFailure) {
+            console.log(`Workflow callback: idea_task ${ideaTask.id} result contains failure indicators, marking as failed`);
+            // Mark as failed - the result indicates no actual work was done
+            await c.env.DB.prepare(`
+              UPDATE idea_tasks
+              SET status = 'failed', error_message = ?, completed_at = NULL, updated_at = ?
+              WHERE id = ?
+            `).bind((resultText || 'Execution failed - no deliverables produced').substring(0, 2000), now, ideaTask.id).run();
+
+            await c.env.DB.prepare(`
+              UPDATE idea_executions
+              SET failed_tasks = failed_tasks + 1, updated_at = ?
+              WHERE idea_id = ?
+            `).bind(now, ideaTask.idea_id).run();
+          } else {
+            // Mark as completed
+            await c.env.DB.prepare(`
+              UPDATE idea_tasks
+              SET status = 'completed', result = ?, completed_at = ?, updated_at = ?
+              WHERE id = ?
+            `).bind((resultText || 'Task completed via workflow').substring(0, 10000), now, now, ideaTask.id).run();
+
+            await c.env.DB.prepare(`
+              UPDATE idea_executions
+              SET completed_tasks = completed_tasks + 1, updated_at = ?
+              WHERE idea_id = ?
+            `).bind(now, ideaTask.idea_id).run();
+          }
+        } else {
+          // Mark as failed
+          const error = body.error || resultText || 'Workflow execution failed';
+          await c.env.DB.prepare(`
+            UPDATE idea_tasks
+            SET status = 'failed', error_message = ?, updated_at = ?
+            WHERE id = ?
+          `).bind(error.substring(0, 2000), now, ideaTask.id).run();
+
+          await c.env.DB.prepare(`
+            UPDATE idea_executions
+            SET failed_tasks = failed_tasks + 1, updated_at = ?
+            WHERE idea_id = ?
+          `).bind(now, ideaTask.idea_id).run();
+        }
+
+        // Check if all idea tasks are now complete
+        const stats = await c.env.DB.prepare(`
+          SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+            SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) as blocked,
+            SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END) as dispatched,
+            SUM(CASE WHEN status IN ('pending', 'ready', 'in_progress') THEN 1 ELSE 0 END) as remaining
+          FROM idea_tasks
+          WHERE idea_id = ? AND deleted_at IS NULL
+        `).bind(ideaTask.idea_id).first<{
+          total: number; completed: number; failed: number; blocked: number; dispatched: number; remaining: number;
+        }>();
+
+        if (stats) {
+          const stillPending = stats.remaining + stats.dispatched;
+          if (stillPending === 0) {
+            const finalStatus = stats.blocked > 0 ? 'blocked' : 'completed';
+            await c.env.DB.prepare(`
+              UPDATE idea_executions
+              SET status = ?, completed_at = ?, updated_at = ?
+              WHERE idea_id = ?
+            `).bind(finalStatus, now, now, ideaTask.idea_id).run();
+
+            const ideaStatus = stats.blocked > 0 ? 'blocked' : 'done';
+            await c.env.DB.prepare(`
+              UPDATE ideas SET execution_status = ?, updated_at = ? WHERE id = ?
+            `).bind(ideaStatus, now, ideaTask.idea_id).run();
+
+            console.log(`Workflow callback: idea ${ideaTask.idea_id} execution ${finalStatus}`);
+          }
+        }
+
+        console.log(`Workflow callback: idea_task ${ideaTask.id} ${isSuccess ? 'completed' : 'failed'}`);
+        return c.json({ success: true, type: 'idea_task' });
+      }
+    }
+
+    // ========================================
+    // Handle regular tasks (from execution_queue)
+    // ========================================
+
     // Find the queue entry - try by queue_entry_id first, then by task_id
     let entry: { id: string; tenant_id: string; task_id: string; status: string } | null = null;
 
@@ -1573,46 +1690,94 @@ app.post('/workflow-callback', async (c) => {
     }
 
     if (isSuccess) {
-      // Mark as completed
-      const result = resultText || 'Task completed via workflow';
+      // Validate that work was actually done - check for failure indicators in "success" responses
+      const resultLower = (resultText || '').toLowerCase();
+      const failureIndicators = [
+        "couldn't find",
+        "could not find",
+        "doesn't have",
+        "does not have",
+        "not found",
+        "failed to",
+        "error:",
+        "unable to",
+        "no such file",
+        "doesn't exist",
+      ];
+      const isActualFailure = failureIndicators.some(indicator => resultLower.includes(indicator));
 
-      await c.env.DB.prepare(`
-        UPDATE execution_queue
-        SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
-        WHERE id = ?
-      `).bind(now, result.substring(0, 10000), now, entry.id).run();
+      if (isActualFailure) {
+        console.log(`Workflow callback: task ${entry.task_id} result contains failure indicators, marking as failed`);
+        // Treat as failure - the AI said "success" but the content indicates failure
+        const error = resultText || 'Execution reported success but no deliverables were produced';
 
-      // Update task status to completed
-      await c.env.DB.prepare(`
-        UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?
-      `).bind(now, now, entry.task_id).run();
+        await c.env.DB.prepare(`
+          UPDATE execution_queue
+          SET status = 'failed', error = ?, updated_at = ?
+          WHERE id = ?
+        `).bind(error.substring(0, 2000), now, entry.id).run();
 
-      // Log completion
-      await c.env.DB.prepare(`
-        INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
-        VALUES (?, ?, ?, ?, 'workflow', 'completed', ?, ?)
-      `).bind(
-        crypto.randomUUID(),
-        entry.tenant_id,
-        entry.id,
-        entry.task_id,
-        JSON.stringify({
-          workflow_instance_id: body.workflow_instance_id,
-          source: 'workflow_callback',
-          result_preview: result.substring(0, 200),
-        }),
-        now
-      ).run();
+        await c.env.DB.prepare(`
+          INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+          VALUES (?, ?, ?, ?, 'workflow', 'failed', ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          entry.tenant_id,
+          entry.id,
+          entry.task_id,
+          JSON.stringify({
+            workflow_instance_id: body.workflow_instance_id,
+            source: 'workflow_callback',
+            error: error.substring(0, 500),
+            reason: 'false_positive_success',
+          }),
+          now
+        ).run();
 
-      // Archive the completed queue entry
-      await archiveQueueEntry(c.env.DB, entry.id, entry.tenant_id);
+        await archiveQueueEntry(c.env.DB, entry.id, entry.tenant_id);
+        console.log(`Workflow callback: task ${entry.task_id} failed (false positive success detected)`);
+      } else {
+        // Genuine success - mark as completed
+        const result = resultText || 'Task completed via workflow';
 
-      console.log(`Workflow callback: task ${entry.task_id} completed successfully`);
+        await c.env.DB.prepare(`
+          UPDATE execution_queue
+          SET status = 'completed', completed_at = ?, result = ?, updated_at = ?
+          WHERE id = ?
+        `).bind(now, result.substring(0, 10000), now, entry.id).run();
 
-      // Promote dependent tasks that are now unblocked
-      const promotionResult = await promoteDependentTasks(c.env, entry.task_id, entry.tenant_id);
-      if (promotionResult.promoted > 0) {
-        console.log(`Workflow callback: promoted ${promotionResult.promoted} dependent tasks (${promotionResult.dispatched} auto-dispatched)`);
+        // Update task status to completed
+        await c.env.DB.prepare(`
+          UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?
+        `).bind(now, now, entry.task_id).run();
+
+        // Log completion
+        await c.env.DB.prepare(`
+          INSERT INTO dispatch_log (id, tenant_id, queue_entry_id, task_id, executor_type, action, details, created_at)
+          VALUES (?, ?, ?, ?, 'workflow', 'completed', ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          entry.tenant_id,
+          entry.id,
+          entry.task_id,
+          JSON.stringify({
+            workflow_instance_id: body.workflow_instance_id,
+            source: 'workflow_callback',
+            result_preview: result.substring(0, 200),
+          }),
+          now
+        ).run();
+
+        // Archive the completed queue entry
+        await archiveQueueEntry(c.env.DB, entry.id, entry.tenant_id);
+
+        console.log(`Workflow callback: task ${entry.task_id} completed successfully`);
+
+        // Promote dependent tasks that are now unblocked
+        const promotionResult = await promoteDependentTasks(c.env, entry.task_id, entry.tenant_id);
+        if (promotionResult.promoted > 0) {
+          console.log(`Workflow callback: promoted ${promotionResult.promoted} dependent tasks (${promotionResult.dispatched} auto-dispatched)`);
+        }
       }
     } else {
       // Mark as failed
