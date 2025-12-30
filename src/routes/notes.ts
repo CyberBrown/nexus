@@ -63,11 +63,12 @@ notes.get('/', async (c) => {
 
         const whereClause = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
 
+        // Note: FTS5 MATCH uses the table name directly, not an alias
         const result = await c.env.DB.prepare(`
           SELECT n.*
           FROM notes n
           INNER JOIN notes_fts fts ON n.id = fts.note_id
-          WHERE fts.notes_fts MATCH ?
+          WHERE notes_fts MATCH ?
             AND n.tenant_id = ?
             AND n.user_id = ?
             AND n.deleted_at IS NULL

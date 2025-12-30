@@ -3441,11 +3441,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // Use FTS5 MATCH query with JOIN on note_id to get full note data
         // Filter by tenant/user and non-deleted
+        // Note: FTS5 MATCH uses the table name directly, not an alias
         const notes = await env.DB.prepare(`
           SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
           FROM notes n
           INNER JOIN notes_fts fts ON n.id = fts.note_id
-          WHERE fts.notes_fts MATCH ?
+          WHERE notes_fts MATCH ?
             AND n.tenant_id = ?
             AND n.user_id = ?
             AND n.deleted_at IS NULL
