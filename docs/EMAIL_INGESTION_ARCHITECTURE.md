@@ -1330,3 +1330,337 @@ new_classes = ["EmailManager"]
 - Calendar event extraction and creation
 - Newsletter auto-unsubscribe
 - Spam detection and filtering
+
+---
+
+## Appendix A: Integration Options Research (December 2025)
+
+This appendix provides detailed research on email integration options including rate limits, quota costs, and authentication requirements.
+
+### A.1 Gmail API - Detailed Analysis
+
+#### Authentication Requirements
+
+| Requirement | Details |
+|-------------|---------|
+| Protocol | OAuth 2.0 |
+| Scopes Required | `gmail.readonly` (read), `gmail.modify` (mark read/labels) |
+| Token Lifetime | Access token: ~1 hour, Refresh token: indefinite |
+| Security Audit | Required for production apps accessing >100 users ($15k+) |
+| Consent Screen | Required; must pass Google verification for public apps |
+
+#### Rate Limits
+
+| Limit Type | Value |
+|------------|-------|
+| **Daily Quota** | 1,000,000,000 quota units per project per day |
+| **Per-User Rate** | 250 quota units per user per second (moving average) |
+| **Per-Project Rate** | 1,200,000 quota units per minute |
+| **Per-User Per-Minute** | 15,000 quota units per user per minute |
+
+#### Quota Units Per Operation
+
+| Method | Quota Units | Notes |
+|--------|-------------|-------|
+| `messages.list` | 5 | Per request, paginated |
+| `messages.get` | 5 | Full message with content |
+| `threads.list` | 10 | List threads |
+| `threads.get` | 10 | Get full thread |
+| `history.list` | 2 | Incremental sync (efficient) |
+| `watch` | 100 | Setup push notifications |
+| `labels.list` | 1 | Get all labels |
+| `getProfile` | 1 | User profile info |
+| `messages.modify` | 5 | Change labels/read state |
+| `messages.send` | 100 | Send email |
+| `drafts.send` | 100 | Send draft |
+
+**Practical Capacity Estimates:**
+- Full sync of 1,000 messages: ~5,000 quota units
+- Incremental sync check: ~2 quota units
+- Daily capacity per user: ~3,000 full message fetches per second (burst)
+- Sustained sync: ~50 quota units per second = 4.3M operations per day
+
+#### Integration Complexity: Medium
+
+**Setup Steps:**
+1. Create Google Cloud project
+2. Enable Gmail API
+3. Configure OAuth consent screen
+4. Create OAuth 2.0 credentials
+5. (Optional) Set up Pub/Sub topic and subscription
+6. Implement token refresh logic
+7. Handle rate limiting with exponential backoff
+
+**Pros:**
+- Best performance and feature support for Gmail
+- Native threading, labels, and search
+- Push notifications via Pub/Sub (near real-time)
+- Passed security audit = user trust
+- Official Google integration
+
+**Cons:**
+- Gmail-only (no other providers)
+- $15k+ security audit for production
+- Pub/Sub adds infrastructure complexity
+- Google can revoke API access (warmup services example)
+- Must renew `watch` every 7 days
+
+---
+
+### A.2 IMAP - Detailed Analysis
+
+#### Authentication Requirements
+
+| Provider | Auth Method | Notes |
+|----------|-------------|-------|
+| Gmail | OAuth 2.0 (XOAUTH2) | App passwords deprecated for Workspace |
+| Outlook/O365 | OAuth 2.0 (XOAUTH2) | Client credentials NOT supported for IMAP |
+| Generic IMAP | Username/Password | Less secure, often blocked |
+
+**Gmail IMAP via OAuth:**
+- Requires same OAuth setup as Gmail API
+- Uses SASL XOAUTH2 mechanism
+- Session limited to ~24 hours (1 hour with OAuth tokens)
+- Must use OAuth2 token, not password
+
+**Microsoft 365 IMAP via OAuth:**
+- Requires Azure AD app registration
+- Use `IMAP.AccessAsApp` permission
+- Object ID must be from Enterprise Applications (not App Registrations)
+- Client credentials flow NOT supported (requires user consent)
+
+#### Rate Limits
+
+| Provider | Limit | Details |
+|----------|-------|---------|
+| Gmail | 2,500 MB/day download | Per user |
+| Gmail | 500 MB/day upload | Per user |
+| Gmail | 1 GB/day total | Bandwidth cap |
+| Gmail | ~15 simultaneous connections | Per account |
+| O365 | No published limits | Generally more permissive |
+
+**IMAP IDLE Limitations:**
+- Requires persistent TCP connection
+- Not suitable for serverless (Cloudflare Workers)
+- Must reconnect every 29 minutes (RFC recommendation)
+- Some servers drop IDLE after 10-15 minutes
+
+#### Integration Complexity: High
+
+**Challenges:**
+1. **Connection Management**: Persistent connections don't work in serverless
+2. **Protocol Complexity**: IMAP is stateful and connection-based
+3. **Threading**: No native threading; must use References/In-Reply-To headers
+4. **Label Mapping**: Gmail labels → IMAP folders is lossy
+5. **OAuth Complexity**: Must implement XOAUTH2 SASL for modern providers
+6. **Session Limits**: Gmail sessions expire after 24 hours
+
+**Libraries for Node.js:**
+
+| Library | OAuth Support | Maintenance | Notes |
+|---------|---------------|-------------|-------|
+| [node-imap](https://github.com/mscdex/node-imap) | Yes (xoauth2) | Moderate | Most popular |
+| [ImapFlow](https://imapflow.com/) | Yes | Active | Modern, Promise-based |
+| [Chilkat](https://www.chilkatsoft.com/refdoc/nodejsImapRef.html) | Yes | Commercial | Full-featured |
+
+**Recommended Architecture for Serverless:**
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│   IMAP Server   │────▶│  Dedicated VM/   │────▶│  Cloudflare     │
+│   (Gmail, etc)  │     │  Container with  │     │  Queue          │
+└─────────────────┘     │  IMAP client     │     └────────┬────────┘
+                        └──────────────────┘              │
+                                                          ▼
+                                               ┌─────────────────┐
+                                               │  Worker         │
+                                               │  (Process)      │
+                                               └─────────────────┘
+```
+
+**Pros:**
+- Works with any email provider
+- No vendor lock-in
+- Standard protocol
+
+**Cons:**
+- Not serverless-friendly
+- Complex connection management
+- OAuth setup required for modern providers anyway
+- Limited metadata compared to Gmail API
+- No push notifications without IDLE (persistent connection)
+
+---
+
+### A.3 Webhook/Push Options - Detailed Analysis
+
+#### Option 1: Gmail Pub/Sub Push
+
+**How It Works:**
+1. User connects Gmail account via OAuth
+2. Call Gmail API `watch()` to register for notifications
+3. Google sends push to Cloud Pub/Sub topic
+4. Pub/Sub pushes to your webhook endpoint
+5. Webhook fetches full message via Gmail API
+
+**Setup Requirements:**
+- Google Cloud project with Pub/Sub enabled
+- Topic: `projects/{project}/topics/{topic-name}`
+- Subscription: Push to `https://your-domain.com/api/email/push`
+- Grant `gmail-api-push@system.gserviceaccount.com` Pub/Sub Publisher role
+
+**Watch Renewal:**
+- Must call `watch()` every 7 days (Google recommends daily)
+- Returns `historyId` for incremental sync
+- Only notifies of mailbox changes, not full message content
+
+**Notification Format:**
+```json
+{
+  "message": {
+    "data": "base64-encoded { emailAddress, historyId }",
+    "messageId": "...",
+    "publishTime": "..."
+  },
+  "subscription": "projects/.../subscriptions/..."
+}
+```
+
+**Latency:** 1-5 seconds typically
+
+**Complexity:** Medium-High (requires GCP infrastructure)
+
+#### Option 2: Cloudflare Email Workers
+
+**How It Works:**
+1. User sets up email forwarding rule to your domain
+2. Cloudflare Email Routing receives the email
+3. Email Worker processes the raw email
+4. Worker stores and classifies
+
+**Setup Requirements:**
+- Domain with Cloudflare DNS
+- Email Routing enabled
+- Email Worker script deployed
+
+**Email Worker Example:**
+```typescript
+export default {
+  async email(message: EmailMessage, env: Env) {
+    const raw = await new Response(message.raw).text();
+
+    // Parse email
+    const parsed = parseEmail(raw);
+
+    // Store in Nexus
+    await storeEmail(env, {
+      from: message.from,
+      to: message.to,
+      subject: parsed.subject,
+      body: parsed.text,
+      raw: raw,
+    });
+
+    // Forward to original destination
+    await message.forward(message.to);
+  }
+};
+```
+
+**Limitations:**
+- User must configure forwarding
+- May not receive all emails (forwarding rules)
+- Limited to incoming mail
+- No access to historical emails
+- Some email headers may be modified
+
+**Complexity:** Low
+
+**Pros:**
+- Very simple implementation
+- No OAuth complexity
+- Works with any provider
+- No API quotas
+
+**Cons:**
+- Requires user action (forwarding setup)
+- Can't access existing emails
+- May miss emails if forwarding fails
+- Less control over sync timing
+
+#### Option 3: Third-Party Email APIs
+
+| Service | Features | Pricing | Notes |
+|---------|----------|---------|-------|
+| [Nylas](https://nylas.com) | Unified API for all providers | $0.05-0.10/account/month | Enterprise-focused |
+| [Mailgun](https://mailgun.com) | Inbound webhooks | Pay per email | Email service provider |
+| [SendGrid](https://sendgrid.com) | Inbound parse | Pay per email | Primarily outbound |
+| [Postmark](https://postmarkapp.com) | Inbound webhooks | Pay per email | Transactional focus |
+
+**Nylas Unified API:**
+- Handles OAuth for Gmail, Outlook, IMAP
+- Provides webhooks for email events
+- Thread management built-in
+- Abstracts provider differences
+
+**Complexity:** Low (they handle the hard parts)
+**Cost:** Higher than direct integration
+
+---
+
+### A.4 Comparison Matrix
+
+| Factor | Gmail API | IMAP | Pub/Sub Webhook | Email Forwarding | Third-Party API |
+|--------|-----------|------|-----------------|------------------|-----------------|
+| **Setup Complexity** | Medium | High | Medium-High | Low | Low |
+| **Serverless Compatible** | Yes | No | Yes | Yes | Yes |
+| **Real-time Notifications** | Yes (Pub/Sub) | Yes (IDLE)* | Yes | Yes | Yes |
+| **Provider Support** | Gmail only | Any | Gmail only | Any | Multiple |
+| **Historical Email Access** | Yes | Yes | Yes | No | Yes |
+| **Threading Support** | Native | Manual | Via API | Manual | Varies |
+| **Rate Limits** | Well-documented | Varies | Gmail limits apply | None | Service limits |
+| **Cost** | Free + GCP | Free | Free + GCP | Free | $/account |
+| **OAuth Required** | Yes | Usually | Yes | No | Handled |
+| **Security Audit** | Required ($15k+) | N/A | Same as API | N/A | Service handles |
+
+*IDLE not serverless compatible
+
+---
+
+### A.5 Recommendations
+
+#### For MVP (Phase 1)
+**Gmail API Polling** - Start here
+- Simple implementation
+- No Pub/Sub infrastructure needed
+- 5-minute cron interval acceptable for MVP
+- Quota usage minimal with `history.list` (2 units per call)
+
+#### For Production (Phase 2)
+**Gmail Pub/Sub Push** - Upgrade to this
+- Near-instant email notifications
+- More efficient than polling
+- Requires GCP infrastructure investment
+- Keep polling as fallback
+
+#### For Broader Provider Support (Phase 3+)
+**Consider:**
+1. **Email Forwarding** for users who want simple setup
+2. **Third-party API (Nylas)** if IMAP support demand is high
+3. **Direct IMAP** only if running dedicated infrastructure
+
+#### Not Recommended
+- **IMAP on Cloudflare Workers** - Connection model incompatible
+- **Gmail API without Pub/Sub at scale** - Wasteful polling
+- **Custom IMAP server** - High maintenance burden
+
+---
+
+### A.6 References
+
+- [Gmail API Usage Limits](https://developers.google.com/workspace/gmail/api/reference/quota)
+- [Gmail API Push Notifications](https://developers.google.com/workspace/gmail/api/guides/push)
+- [Gmail API Essentials](https://rollout.com/integration-guides/gmail/api-essentials)
+- [ImapFlow - Modern IMAP Client](https://imapflow.com/)
+- [node-imap OAuth2 Example](https://github.com/mscdex/node-imap/issues/881)
+- [Microsoft IMAP OAuth Authentication](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)
+- [Cloudflare Email Workers](https://developers.cloudflare.com/email-routing/email-workers/)
