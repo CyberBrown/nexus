@@ -255,11 +255,12 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query for multi-word search
-      // D1's FTS5 requires explicit AND operators for reliable multi-word matching
-      // Space-separated terms may not work consistently across D1 implementations
-      // Use: "term1" AND "term2" for reliable conjunction queries
+      // Use simple space-separated terms for implicit AND behavior
+      // FTS5 treats space-separated terms as implicit AND (all must match)
+      // Only quoted phrases (already in ftsTerms) need the quotes preserved
+      // Example: "mcp validation" -> matches docs with both "mcp" AND "validation"
       const ftsQuery = ftsTerms.length > 0
-        ? ftsTerms.map(term => term.startsWith('"') ? term : `"${term}"`).join(' AND ')
+        ? ftsTerms.join(' ')
         : '';
 
       if (ftsQuery) {
