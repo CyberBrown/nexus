@@ -3628,26 +3628,23 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             console.log('[nexus_search_notes] Created FTS5 table');
           }
 
-          // Check FTS index completeness - compare counts
-          const ftsCount = await env.DB.prepare(`
-            SELECT COUNT(*) as cnt FROM notes_fts WHERE note_id IN (
-              SELECT id FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-            )
+          // Check for notes that need search_text populated
+          // This catches notes where search_text is NULL OR notes not in FTS index
+          const notesNeedingRebuild = await env.DB.prepare(`
+            SELECT COUNT(*) as cnt FROM notes
+            WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+              AND (search_text IS NULL OR search_text = '' OR id NOT IN (SELECT note_id FROM notes_fts))
           `).bind(tenantId, userId).first<{ cnt: number }>();
 
-          const notesCount = await env.DB.prepare(`
-            SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-          `).bind(tenantId, userId).first<{ cnt: number }>();
+          // Auto-rebuild if any notes need it
+          if ((notesNeedingRebuild?.cnt || 0) > 0) {
+            console.log(`[nexus_search_notes] ${notesNeedingRebuild?.cnt || 0} notes need search index rebuild`);
 
-          // Auto-rebuild if FTS has fewer entries than notes
-          if ((ftsCount?.cnt || 0) < (notesCount?.cnt || 0)) {
-            console.log(`[nexus_search_notes] FTS index incomplete (${ftsCount?.cnt || 0}/${notesCount?.cnt || 0}), rebuilding...`);
-
-            // Get notes missing from FTS
+            // Get notes that need rebuilding (NULL search_text OR missing from FTS)
             const missingNotes = await env.DB.prepare(`
               SELECT id, title, content, tags FROM notes
               WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-                AND id NOT IN (SELECT note_id FROM notes_fts)
+                AND (search_text IS NULL OR search_text = '' OR id NOT IN (SELECT note_id FROM notes_fts))
               LIMIT 100
             `).bind(tenantId, userId).all<{
               id: string; title: string | null; content: string | null; tags: string | null;
@@ -3660,16 +3657,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
               if (searchText) {
                 try {
-                  // Update search_text column
+                  // Update search_text column in notes table
                   await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
                     .bind(searchText, note.id).run();
-                  // Insert into FTS index
+                  // Upsert into FTS index (delete + insert to handle duplicates)
+                  await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
                   await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
                     .bind(note.id, searchText).run();
                 } catch { /* ignore individual insert errors */ }
               }
             }
-            console.log(`[nexus_search_notes] Rebuilt FTS index for ${missingNotes.results?.length || 0} notes`);
+            console.log(`[nexus_search_notes] Rebuilt search index for ${missingNotes.results?.length || 0} notes`);
           }
         } catch (err) {
           console.error('[nexus_search_notes] FTS setup/rebuild error (will continue to fallback):', err);
