@@ -1953,8 +1953,34 @@ app.post('/workflow-callback', async (c) => {
       // Determine if this is a quarantine situation
       // Quarantine means we should stop retrying - set task to 'cancelled'
       // Check both body.status === 'quarantined' and body.quarantine boolean flag
-      const isQuarantine = body.status === 'quarantined' || body.quarantine === true;
-      const queueStatus = isQuarantine ? 'quarantine' : 'failed';
+      const isExplicitQuarantine = body.status === 'quarantined' || body.quarantine === true;
+
+      // AUTO-QUARANTINE: Check for repeated failures and auto-quarantine
+      // Count recent failed entries for this task (in both queue and archive)
+      // This prevents runaway retry loops where the same failing task is re-dispatched forever
+      const MAX_FAILURES_BEFORE_QUARANTINE = 3;
+      const FAILURE_WINDOW_HOURS = 24;
+
+      const failureCountResult = await c.env.DB.prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM execution_queue
+           WHERE task_id = ? AND status IN ('failed', 'quarantine')
+           AND updated_at > datetime('now', '-${FAILURE_WINDOW_HOURS} hours')) +
+          (SELECT COUNT(*) FROM execution_archive
+           WHERE task_id = ? AND status IN ('failed', 'quarantine')
+           AND archived_at > datetime('now', '-${FAILURE_WINDOW_HOURS} hours'))
+        AS count
+      `).bind(entry.task_id, entry.task_id).first<{ count: number }>();
+
+      const recentFailures = (failureCountResult?.count || 0) + 1; // +1 for current failure
+      const shouldAutoQuarantine = !isExplicitQuarantine && recentFailures >= MAX_FAILURES_BEFORE_QUARANTINE;
+      const shouldQuarantine = isExplicitQuarantine || shouldAutoQuarantine;
+
+      if (shouldAutoQuarantine) {
+        console.log(`Workflow callback: task ${entry.task_id} has ${recentFailures} failures in ${FAILURE_WINDOW_HOURS}h, auto-quarantining`);
+      }
+
+      const queueStatus = shouldQuarantine ? 'quarantine' : 'failed';
 
       await c.env.DB.prepare(`
         UPDATE execution_queue
@@ -1962,14 +1988,18 @@ app.post('/workflow-callback', async (c) => {
         WHERE id = ?
       `).bind(queueStatus, error.substring(0, 2000), now, entry.id).run();
 
-      // If quarantined, update the task status to prevent re-dispatch
+      // If quarantined (explicit or auto), update the task status to prevent re-dispatch
       // Setting to 'cancelled' stops the dispatcher from picking it up again
-      if (isQuarantine) {
+      if (shouldQuarantine) {
+        const quarantineReason = isExplicitQuarantine
+          ? `Quarantined via workflow callback: ${error.substring(0, 450)}`
+          : `Auto-quarantined after ${recentFailures} failures in ${FAILURE_WINDOW_HOURS}h: ${error.substring(0, 350)}`;
+
         await c.env.DB.prepare(`
           UPDATE tasks
           SET status = 'cancelled', completion_notes = ?, updated_at = ?
           WHERE id = ?
-        `).bind(`Quarantined via workflow callback: ${error.substring(0, 500)}`, now, entry.task_id).run();
+        `).bind(quarantineReason, now, entry.task_id).run();
 
         console.log(`Workflow callback: task ${entry.task_id} quarantined - task status set to 'cancelled'`);
       }
@@ -1983,12 +2013,14 @@ app.post('/workflow-callback', async (c) => {
         entry.tenant_id,
         entry.id,
         entry.task_id,
-        isQuarantine ? 'quarantined' : 'failed',
+        shouldQuarantine ? 'quarantined' : 'failed',
         JSON.stringify({
           workflow_instance_id: body.workflow_instance_id,
           source: 'workflow_callback',
           error: error.substring(0, 500),
-          quarantine: isQuarantine,
+          quarantine: shouldQuarantine,
+          auto_quarantine: shouldAutoQuarantine,
+          recent_failures: recentFailures,
         }),
         now
       ).run();
