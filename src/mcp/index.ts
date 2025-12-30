@@ -3482,13 +3482,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Build FTS5 query - AND all terms together
         // For phrases, use double quotes; for single words, just the word
         // FTS5 uses implicit AND between terms
+        // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
+        // Prefix queries use raw (pre-tokenized) form, so "validation*" won't match
+        // the stemmed "valid" in the index. Let FTS5 handle stemming naturally.
         const ftsQuery = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match exactly in sequence
             return `"${term}"`;
           } else {
-            // Single word - add wildcard for prefix matching
-            return `${term}*`;
+            // Single word - let FTS5 porter stemmer handle matching
+            return term;
           }
         }).join(' ');
 
