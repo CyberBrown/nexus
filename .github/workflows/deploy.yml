@@ -32,13 +32,6 @@ jobs:
       - name: Verify wrangler installation
         run: npx wrangler --version
 
-      - name: Deploy Nexus Worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          wranglerVersion: "4.54.0"
-          command: deploy
-
       - name: Deploy Nexus MCP Worker
         uses: cloudflare/wrangler-action@v3
         with:

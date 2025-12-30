@@ -3607,6 +3607,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }> = [];
 
         let searchMethod = 'none';
+        let notesRebuilt = 0;
         const archivedCondition = include_archived ? '' : 'AND archived_at IS NULL';
 
         // Ensure FTS5 infrastructure exists and is populated
@@ -3642,11 +3643,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             console.log(`[nexus_search_notes] ${notesNeedingRebuild?.cnt || 0} notes need search index rebuild`);
 
             // Get notes that need rebuilding (NULL search_text OR missing from FTS)
+            // Use higher limit (500) for faster initial population - will be batched across searches
             const missingNotes = await env.DB.prepare(`
               SELECT id, title, content, tags FROM notes
               WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
                 AND (search_text IS NULL OR search_text = '' OR id NOT IN (SELECT note_id FROM notes_fts))
-              LIMIT 100
+              LIMIT 500
             `).bind(tenantId, userId).all<{
               id: string; title: string | null; content: string | null; tags: string | null;
             }>();
@@ -3668,7 +3670,8 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 } catch { /* ignore individual insert errors */ }
               }
             }
-            console.log(`[nexus_search_notes] Rebuilt search index for ${missingNotes.results?.length || 0} notes`);
+            notesRebuilt = missingNotes.results?.length || 0;
+            console.log(`[nexus_search_notes] Rebuilt search index for ${notesRebuilt} notes`);
           }
         } catch (err) {
           console.error('[nexus_search_notes] FTS setup/rebuild error (will continue to fallback):', err);
@@ -3914,6 +3917,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           count: matchingNotes.length,
           notes: matchingNotes,
           search_method: searchMethod,
+          notes_rebuilt: notesRebuilt,  // How many notes were auto-indexed during this search
         };
 
         // Add helpful hints and diagnostic info
@@ -3937,11 +3941,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           if (totalNotes === 0) {
             response.hint = 'No notes found for this user. Create some notes first.';
           } else if (notesInFts < totalNotes) {
-            response.hint = `No matching notes found. Index incomplete (${notesInFts}/${totalNotes} indexed). Run nexus_rebuild_notes_fts to fix.`;
+            const stillNeeded = totalNotes - notesInFts;
+            response.hint = notesRebuilt > 0
+              ? `Index building in progress (${notesInFts}/${totalNotes} indexed, ${notesRebuilt} rebuilt this call). Try searching again to continue indexing.`
+              : `No matching notes found. Index incomplete (${notesInFts}/${totalNotes} indexed). Run nexus_rebuild_notes_fts to fix.`;
             response.diagnostics = {
               total_notes: totalNotes,
               in_fts_index: notesInFts,
-              recommendation: 'Run nexus_rebuild_notes_fts with passphrase to rebuild the search index',
+              notes_still_needing_index: stillNeeded,
+              recommendation: stillNeeded > 100
+                ? 'Run nexus_rebuild_notes_fts with passphrase to fully rebuild the search index'
+                : 'Try searching again - auto-indexing will continue',
             };
           } else {
             response.hint = `No matching notes found. ${totalNotes} notes exist. Try simpler search terms or check spelling.`;

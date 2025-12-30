@@ -1,7 +1,7 @@
 name = "nexus-mcp"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
+compatibility_flags = ["nodejs_compat"]
 account_id = "52b1c60ff2a24fb21c1ef9a429e63261"
 
 [dev]
@@ -83,10 +83,9 @@ tag = "v7"
 [[migrations]]
 tag = "v8"
 
-# v9 adds IdeaExecutor as a new class
+# v9 - IdeaExecutor already exists in nexus-mcp
 [[migrations]]
 tag = "v9"
-new_sqlite_classes = ["IdeaExecutor"]
 
 # Service Bindings - Worker-to-Worker communication
 [[services]]
@@ -106,10 +105,6 @@ service = "intake"  # DE intake for workflow-based execution (parallel, durable)
 name = "idea-execution-workflow"
 binding = "IDEA_EXECUTION_WORKFLOW"
 class_name = "IdeaExecutionWorkflow"
-
-# v10 - Empty migration to match remote state
-[[migrations]]
-tag = "v10"
 
 # Cron Triggers
 [triggers]
