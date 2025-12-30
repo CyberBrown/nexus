@@ -3598,12 +3598,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // Uses implicit AND (space-separated terms) for SQLite FTS5
-        // In FTS5 MATCH, space-separated terms are implicitly ANDed together
-        // Example: "mcp validation" matches docs containing BOTH terms
-        // Example: '"exact phrase" term' matches docs with the phrase AND the term
+        // IMPORTANT: Use OR to get broad results, then post-filter for AND semantics
+        // D1's FTS5 implementation has inconsistent behavior with implicit AND
+        // By using OR, we get all notes containing ANY term, then filter in code
+        // This is more reliable and ensures multi-word searches work correctly
         const ftsQuery = ftsTerms.length > 0
-          ? ftsTerms.join(' ')
+          ? ftsTerms.join(' OR ')
           : '';
 
         // Helper to check if all search terms match in a text
@@ -3828,7 +3828,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 const tagsText = note.tags ? String(note.tags) : '';
 
                 // Post-filter FTS5 results to ensure ALL search terms match
-                // (Extra safety layer in case FTS5 behavior varies)
+                // FTS5 query uses OR for broad matching, post-filter enforces AND semantics
                 const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
                 if (!matchesAllTerms(combinedText)) {
                   continue; // Skip notes that don't match all terms

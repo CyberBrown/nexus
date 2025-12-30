@@ -255,12 +255,12 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query for multi-word search
-      // Uses implicit AND (space-separated terms) - SQLite FTS5 treats space-separated
-      // terms as implicitly ANDed together. This is more reliable than explicit AND.
-      // Example: "mcp validation" matches docs with BOTH terms (implicit AND)
-      // Example: '"exact phrase" term' matches phrase AND term
+      // IMPORTANT: Use OR to get broad results, then post-filter for AND semantics
+      // D1's FTS5 implementation has inconsistent behavior with implicit AND
+      // By using OR, we get all notes containing ANY term, then filter in code
+      // This is more reliable and ensures multi-word searches work correctly
       const ftsQuery = ftsTerms.length > 0
-        ? ftsTerms.join(' ')
+        ? ftsTerms.join(' OR ')
         : '';
 
       if (ftsQuery) {
@@ -327,7 +327,7 @@ notes.get('/', async (c) => {
         `).bind(...bindings).all<Note>();
 
         // Post-filter FTS5 results to ensure ALL search terms match
-        // D1's FTS5 may use OR instead of AND for space-separated terms
+        // FTS5 query uses OR for broad matching, post-filter enforces AND semantics
         const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
         const filteredResults: Note[] = [];
         for (const note of result.results) {
