@@ -249,17 +249,19 @@ notes.get('/', async (c) => {
 
         const whereClause = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
 
-        // Note: FTS5 MATCH uses the table name directly, not an alias
+        // Use subquery approach for D1 FTS5 compatibility
+        // D1's FTS5 MATCH works more reliably when the FTS table is queried directly
         const result = await c.env.DB.prepare(`
           SELECT n.*
           FROM notes n
-          INNER JOIN notes_fts ON n.id = notes_fts.note_id
-          WHERE notes_fts MATCH ?
+          WHERE n.id IN (
+            SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
+          )
             AND n.tenant_id = ?
             AND n.user_id = ?
             AND n.deleted_at IS NULL
             ${whereClause}
-          ORDER BY n.pinned DESC, bm25(notes_fts) ASC, n.created_at DESC
+          ORDER BY n.pinned DESC, n.created_at DESC
         `).bind(...bindings).all<Note>();
 
         items = result.results;
