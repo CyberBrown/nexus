@@ -411,6 +411,26 @@ export const FAILURE_INDICATORS = [
   "no repo was created", "no repository was created",
   "no worker deployed", "no database created",
   "completion result says", // meta-pattern for reflection about failed execution
+  // Additional patterns added 2024-12-30 to catch more edge cases
+  "haven't found", "have not found", "hasn't found", "has not found",
+  "haven't set up", "have not set up", "hasn't set up", "has not set up",
+  "setup yet", "not initialized", "not been initialized",
+  "no setup", "no configuration", "not configured",
+  "doesn't appear", "does not appear", "didn't find", "did not find",
+  "looked for", // often followed by "but" in failure messages
+  "searched for", // often followed by "but" in failure messages
+  "need to create", "needs to be created", "must be created",
+  "should be created", "would need to", "will need to",
+  "before i can", "before we can", "in order to",
+  "prerequisite", "prerequisites", "first need",
+  "no code", "no files", "no implementation",
+  "empty repo", "empty repository", "blank project",
+  "scaffold", "scaffolding", "boilerplate",
+  "set up the project", "set up the repo", "create the project",
+  "initialize the project", "initialize the repo",
+  "project structure", "folder structure", "directory structure",
+  "does not have any", "doesn't have any", "don't have any",
+  "nothing has been", "nothing was", "nothing is",
 ] as const;
 
 /**

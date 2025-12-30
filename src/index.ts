@@ -1579,6 +1579,13 @@ app.post('/workflow-callback', async (c) => {
 
     console.log(`Workflow callback received: task_id=${body.task_id}, status=${body.status}, success=${isSuccess}`);
     console.log(`Workflow callback: resultText length=${resultText.length}, allTextToCheck length=${allTextToCheck.length}`);
+    // Log more details for debugging false completions
+    if (isSuccess && allTextToCheck.length > 0) {
+      console.log(`Workflow callback: output preview (first 500): ${allTextToCheck.substring(0, 500)}`);
+    }
+    if (isSuccess && resultText.length < 100) {
+      console.warn(`Workflow callback: WARNING - success reported with short output (${resultText.length} chars)`);
+    }
 
     // Validate required fields
     if (!body.queue_entry_id && !body.task_id) {
