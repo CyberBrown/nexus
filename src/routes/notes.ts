@@ -214,10 +214,10 @@ notes.get('/', async (c) => {
         if (before) {
           for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
             // Escape special FTS5 characters and lowercase for porter tokenizer
-            // Do NOT quote individual terms - use implicit AND with space separation
+            // Add search_text: column prefix for D1 FTS5 reliability
             const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              ftsTerms.push(escaped);
+              ftsTerms.push(`search_text:${escaped}`);
               searchTerms.push(escaped);
             }
           }
@@ -227,8 +227,8 @@ notes.get('/', async (c) => {
         if (phrase.length > 0) {
           // Escape any quotes within the phrase and lowercase for porter tokenizer
           const escapedPhrase = phrase.replace(/"/g, '').toLowerCase();
-          // Quoted phrase for exact sequence matching
-          ftsTerms.push(`"${escapedPhrase}"`);
+          // Quoted phrase for exact sequence matching with column prefix
+          ftsTerms.push(`search_text:"${escapedPhrase}"`);
           searchTerms.push(escapedPhrase);
         }
         lastIndex = match.index + match[0].length;
@@ -239,10 +239,10 @@ notes.get('/', async (c) => {
       if (remaining) {
         for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
           // Escape special FTS5 characters and lowercase for porter tokenizer
-          // Do NOT quote individual terms - use implicit AND with space separation
+          // Add search_text: column prefix for D1 FTS5 reliability
           const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            ftsTerms.push(escaped);
+            ftsTerms.push(`search_text:${escaped}`);
             searchTerms.push(escaped);
           }
         }
@@ -255,10 +255,10 @@ notes.get('/', async (c) => {
       };
 
       // Build FTS5 query for multi-word search
-      // CRITICAL: FTS5 default is OR for space-separated terms, NOT AND!
-      // We must use explicit AND operator between terms.
-      // Example: "mcp AND validation" matches docs with BOTH terms
-      // Example: '"exact phrase" AND term' matches exact phrase AND term
+      // Uses search_text: column prefix AND explicit AND operators for D1 FTS5
+      // The column prefix ensures terms target the correct column
+      // Example: "search_text:mcp AND search_text:validation" matches docs with BOTH terms
+      // Example: 'search_text:"exact phrase" AND search_text:term' matches phrase AND term
       const ftsQuery = ftsTerms.length > 0
         ? ftsTerms.join(' AND ')
         : '';

@@ -3549,11 +3549,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
               const lowerWord = word.toLowerCase();
               searchTerms.push(lowerWord);
-              // Escape special FTS5 characters - do NOT quote individual terms
-              // D1's FTS5 works better with unquoted terms for simple word matching
+              // Escape special FTS5 characters and add search_text: column prefix
+              // D1's FTS5 requires column prefix for reliable multi-word AND queries
               const escaped = lowerWord.replace(/[*^"():'"]/g, '');
               if (escaped.length > 0) {
-                ftsTerms.push(escaped);
+                ftsTerms.push(`search_text:${escaped}`);
               }
             }
           }
@@ -3561,9 +3561,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           const phrase = match[1]!.trim().toLowerCase();
           if (phrase.length > 0) {
             searchTerms.push(phrase);
-            // Quoted phrase for exact sequence matching in FTS5
+            // Quoted phrase for exact sequence matching in FTS5 with column prefix
             const escapedPhrase = phrase.replace(/"/g, '');
-            ftsTerms.push(`"${escapedPhrase}"`);
+            ftsTerms.push(`search_text:"${escapedPhrase}"`);
           }
           lastIndex = match.index + match[0].length;
         }
@@ -3574,10 +3574,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
             const lowerWord = word.toLowerCase();
             searchTerms.push(lowerWord);
-            // Escape special FTS5 characters - do NOT quote individual terms
+            // Escape special FTS5 characters and add search_text: column prefix
             const escaped = lowerWord.replace(/[*^"():'"]/g, '');
             if (escaped.length > 0) {
-              ftsTerms.push(escaped);
+              ftsTerms.push(`search_text:${escaped}`);
             }
           }
         }
@@ -3598,10 +3598,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // CRITICAL: FTS5 default is OR for space-separated terms, NOT AND!
-        // We must use explicit AND operator between terms.
-        // Example: "mcp AND validation" matches docs with BOTH terms
-        // Example: '"exact phrase" AND term' matches exact phrase AND term
+        // Uses search_text: column prefix AND explicit AND operators for D1 FTS5
+        // The column prefix ensures terms target the correct column
+        // Example: "search_text:mcp AND search_text:validation" matches docs with BOTH terms
+        // Example: 'search_text:"exact phrase" AND search_text:term' matches phrase AND term
         const ftsQuery = ftsTerms.length > 0
           ? ftsTerms.join(' AND ')
           : '';
