@@ -3901,34 +3901,22 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             created_at: string;
             search_text: string | null;
           }>) {
-            let searchableText: string;
-            let decryptedTitle: string;
-            let decryptedContent: string;
+            // Always decrypt title and content for matching
+            // Don't trust search_text as it may be corrupted/stale
+            const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+            const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+            const tagsText = note.tags ? String(note.tags) : '';
 
-            if (note.search_text && typeof note.search_text === 'string' && note.search_text.length > 0) {
-              searchableText = note.search_text;
+            // Build fresh searchable text from decrypted content
+            const searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
 
-              // Check if all search terms match
-              if (!matchesAllTerms(searchableText)) {
-                continue;
-              }
+            // Check if all search terms match
+            if (!matchesAllTerms(searchableText)) {
+              continue;
+            }
 
-              // Decrypt for display (only if we match)
-              decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-              decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-            } else {
-              // No search_text - decrypt and build it on-the-fly
-              decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-              decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-              const tagsText = note.tags ? String(note.tags) : '';
-              searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
-
-              // Check if all search terms match
-              if (!matchesAllTerms(searchableText)) {
-                continue;
-              }
-
-              // Auto-repair: populate search_text and FTS for this note
+            // Auto-repair: update search_text and FTS if needed
+            if (!note.search_text || note.search_text !== searchableText) {
               try {
                 await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
                   .bind(searchableText, note.id).run();

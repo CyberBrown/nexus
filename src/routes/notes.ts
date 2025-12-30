@@ -359,27 +359,21 @@ notes.get('/', async (c) => {
           // Get encryption key for decrypting content when search_text is NULL
           const encryptionKey = await getEncryptionKey(c.env.KV, tenantId);
 
-          // Filter items - need to handle both search_text column and encrypted content
+          // Filter items - always check actual content, don't trust search_text
+          // search_text may be corrupted/stale from old migrations
           const filteredItems: Note[] = [];
           for (const item of items) {
-            let searchableText: string;
+            // Try raw values first (encryption is now disabled)
+            const rawTitle = item.title ? String(item.title) : '';
+            const rawContent = item.content ? String(item.content) : '';
+            const tagsText = item.tags ? String(item.tags) : '';
 
-            if ((item as any).search_text) {
-              // Use plaintext search_text column
-              searchableText = String((item as any).search_text).toLowerCase();
-            } else {
-              // search_text is NULL - try raw values first (encryption is now disabled)
-              const rawTitle = item.title ? String(item.title) : '';
-              const rawContent = item.content ? String(item.content) : '';
-              const tagsText = item.tags ? String(item.tags) : '';
+            let searchableText = `${rawTitle} ${rawContent} ${tagsText}`.toLowerCase();
 
-              // First, try matching against raw values (for notes created after encryption was disabled)
-              searchableText = `${rawTitle} ${rawContent} ${tagsText}`.toLowerCase();
-              if (!searchTerms.every((term) => searchableText.includes(term))) {
-                // If raw values don't match, try decryption (for older encrypted notes)
-                const decrypted = await decryptFields(item, ENCRYPTED_FIELDS, encryptionKey);
-                searchableText = `${decrypted.title || ''} ${decrypted.content || ''} ${tagsText}`.toLowerCase();
-              }
+            // If raw values don't match, try decryption (for older encrypted notes)
+            if (!searchTerms.every((term) => searchableText.includes(term))) {
+              const decrypted = await decryptFields(item, ENCRYPTED_FIELDS, encryptionKey);
+              searchableText = `${decrypted.title || ''} ${decrypted.content || ''} ${tagsText}`.toLowerCase();
             }
 
             if (searchTerms.every((term) => searchableText.includes(term))) {
