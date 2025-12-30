@@ -273,20 +273,33 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
       // The callback from DE will update the final status
       const isDispatched = result.output?.startsWith('DISPATCHED:');
 
-      // Encrypt result if present
-      const encryptedResult = result.output
-        ? await encryptField(JSON.stringify(result), key)
-        : null;
-
       // Determine status: dispatched tasks stay in 'dispatched' state until callback
+      // IMPORTANT: Even if result.success is true, we MUST validate the output doesn't contain
+      // failure indicators. This is a secondary check to catch edge cases where the AI "succeeds"
+      // but actually reports it couldn't complete the task. This matches the validation in the
+      // /workflow-callback handler in index.ts (lines 1674-1687).
       let newStatus: string;
       if (isDispatched) {
         newStatus = 'dispatched';
       } else if (result.success) {
-        newStatus = 'completed';
+        // Secondary validation: check if "successful" output actually contains failure indicators
+        // This catches cases where executeWithClaude returned success but the content indicates failure
+        const hasFailureIndicators = result.output ? containsFailureIndicators(result.output) : false;
+        if (hasFailureIndicators) {
+          console.log(`Task ${task_id} marked success but output contains failure indicators - marking as failed`);
+          newStatus = 'failed';
+          result.success = false; // Update result object to reflect actual failure
+        } else {
+          newStatus = 'completed';
+        }
       } else {
         newStatus = 'failed';
       }
+
+      // Encrypt result AFTER status validation (so result.success reflects actual outcome)
+      const encryptedResult = result.output
+        ? await encryptField(JSON.stringify(result), key)
+        : null;
 
       await this.env.DB.prepare(`
         UPDATE idea_tasks
