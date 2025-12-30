@@ -3579,11 +3579,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query using space-separated terms (implicit AND in FTS5)
-        // SQLite FTS5 treats space-separated terms as implicit AND by default.
-        // Don't use explicit AND or OR operators - they can cause issues with D1.
-        // Post-filter ensures all terms match in case FTS behavior differs.
-        const ftsQuery = ftsTerms.join(' ');
+        // Build FTS5 query using explicit AND operators for multi-word search
+        // D1's FTS5 implementation may not treat space-separated terms as AND by default,
+        // so we use explicit AND operators to ensure all terms must match.
+        // Post-filter still ensures all terms match after decryption.
+        const ftsQuery = ftsTerms.join(' AND ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
@@ -3753,7 +3753,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 const tagsText = note.tags ? String(note.tags) : '';
 
                 // Post-filter FTS5 results to ensure ALL search terms match
-                // D1's FTS5 may use OR instead of AND for space-separated terms
+                // (Extra safety layer in case FTS5 behavior varies)
                 const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
                 if (!matchesAllTerms(combinedText)) {
                   continue; // Skip notes that don't match all terms
