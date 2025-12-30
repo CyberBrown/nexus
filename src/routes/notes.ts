@@ -247,7 +247,18 @@ notes.post('/', async (c) => {
   await insert(c.env.DB, 'notes', encrypted);
 
   // Insert into FTS5 index for full-text search
-  await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(id, searchText).run();
+  try {
+    await c.env.DB.prepare(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+        note_id UNINDEXED,
+        search_text,
+        tokenize='porter unicode61'
+      )
+    `).run();
+    await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(id, searchText).run();
+  } catch {
+    // FTS insert is non-critical
+  }
 
   return c.json({ success: true, data: { id } }, 201);
 });
@@ -299,8 +310,19 @@ notes.patch('/:id', async (c) => {
     updates.search_text = searchText;
 
     // Update FTS index
-    await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
-    await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(id, searchText).run();
+    try {
+      await c.env.DB.prepare(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+          note_id UNINDEXED,
+          search_text,
+          tokenize='porter unicode61'
+        )
+      `).run();
+      await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
+      await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(id, searchText).run();
+    } catch {
+      // FTS update is non-critical
+    }
   }
 
   if (Object.keys(updates).length > 0) {

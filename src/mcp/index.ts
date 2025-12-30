@@ -3013,9 +3013,21 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         ).run();
 
         // Insert into FTS5 index for full-text search
-        await env.DB.prepare(`
-          INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
-        `).bind(id, searchText).run();
+        // Create table if it doesn't exist (ensures FTS works even if schema not fully migrated)
+        try {
+          await env.DB.prepare(`
+            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+              note_id UNINDEXED,
+              search_text,
+              tokenize='porter unicode61'
+            )
+          `).run();
+          await env.DB.prepare(`
+            INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
+          `).bind(id, searchText).run();
+        } catch {
+          // FTS insert is non-critical, note is already saved
+        }
 
         return {
           content: [{
@@ -3253,8 +3265,19 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           bindings.push(searchText);
 
           // Update FTS index
-          await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
-          await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(note_id, searchText).run();
+          try {
+            await env.DB.prepare(`
+              CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                note_id UNINDEXED,
+                search_text,
+                tokenize='porter unicode61'
+              )
+            `).run();
+            await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
+            await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(note_id, searchText).run();
+          } catch {
+            // FTS update is non-critical
+          }
         }
 
         bindings.push(note_id, tenantId);
@@ -3623,6 +3646,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
       try {
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
+
+        // Create FTS5 table if it doesn't exist
+        await env.DB.prepare(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+            note_id UNINDEXED,
+            search_text,
+            tokenize='porter unicode61'
+          )
+        `).run();
 
         // Get all non-deleted notes for this tenant/user
         const notes = await env.DB.prepare(`
