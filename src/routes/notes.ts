@@ -24,6 +24,20 @@ notes.get('/', async (c) => {
   // If search query is provided, use FTS5
   if (search && search.trim()) {
     try {
+      // Ensure search_text column exists in notes table (added in migration 0018)
+      // This is critical - without this column, FTS5 search cannot work
+      try {
+        const searchTextCol = await c.env.DB.prepare(
+          `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
+        ).first<{ name: string } | null>();
+
+        if (!searchTextCol) {
+          await c.env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
+        }
+      } catch {
+        // Column check failed, continue and hope for the best
+      }
+
       // Ensure FTS5 table exists with correct schema before searching
       // This fixes schema mismatch if old migration (0017) was applied
       let ftsTableCreatedEmpty = false;
@@ -314,6 +328,20 @@ notes.get('/', async (c) => {
         : '';
 
       if (ftsQuery) {
+        // Ensure search_text column exists in notes table (added in migration 0018)
+        // This is critical - without this column, FTS5 search cannot work
+        try {
+          const searchTextCol = await c.env.DB.prepare(
+            `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
+          ).first<{ name: string } | null>();
+
+          if (!searchTextCol) {
+            await c.env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
+          }
+        } catch {
+          // Column check failed, continue and hope for the best
+        }
+
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
         try {
           const tableInfo = await c.env.DB.prepare(

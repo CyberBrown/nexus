@@ -3631,6 +3631,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // STEP 1: Try FTS5 search (fastest and most reliable for multi-word)
         if (ftsQuery) {
           try {
+            // Ensure search_text column exists in notes table (added in migration 0018)
+            // This is critical - without this column, FTS5 auto-repair cannot work
+            const searchTextCol = await env.DB.prepare(
+              `SELECT name FROM pragma_table_info('notes') WHERE name = 'search_text'`
+            ).first<{ name: string } | null>();
+
+            if (!searchTextCol) {
+              await env.DB.prepare(`ALTER TABLE notes ADD COLUMN search_text TEXT`).run();
+            }
+
             // Ensure FTS5 table exists with correct schema
             const tableInfo = await env.DB.prepare(
               `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
@@ -3855,9 +3865,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
         }
 
-        // STEP 2: If FTS5 found nothing, do full scan with decryption
-        // This handles notes where search_text is not populated or FTS index is stale
-        if (matchingNotes.length === 0) {
+        // STEP 2: ALWAYS do full scan with decryption for reliable multi-word search
+        // FTS5 can miss results due to index staleness, porter stemming, or D1 quirks
+        // Full scan guarantees correct results by searching actual decrypted content
+        // Only skip if FTS5 already found enough results
+        if (matchingNotes.length < maxLimit) {
           try {
             const allNotes = await env.DB.prepare(`
               SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
@@ -3867,8 +3879,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               ORDER BY pinned DESC, created_at DESC
             `).bind(tenantId, userId).all();
 
-            searchMethod = 'full_scan';
+            // Track IDs already found by FTS5 to avoid duplicates
+            const foundIds = new Set(matchingNotes.map(n => n.id));
             let notesRepaired = 0;
+            const wasEmpty = matchingNotes.length === 0;
 
             for (const note of (allNotes.results || []) as Array<{
               id: string;
@@ -3882,6 +3896,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               created_at: string;
               search_text: string | null;
             }>) {
+              // Skip notes already found by FTS5
+              if (foundIds.has(note.id)) continue;
+
               // Decrypt title and content for matching
               const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
               const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
@@ -3932,8 +3949,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               if (matchingNotes.length >= maxLimit) break;
             }
 
-            if (notesRepaired > 0) {
-              searchMethod = `full_scan_repaired_${notesRepaired}`;
+            // Update search method to reflect what happened
+            if (wasEmpty) {
+              searchMethod = notesRepaired > 0 ? `full_scan_repaired_${notesRepaired}` : 'full_scan';
+            } else if (notesRepaired > 0) {
+              searchMethod = `${searchMethod}+full_scan_repaired_${notesRepaired}`;
             }
           } catch (err) {
             console.error('Full scan search failed:', err);
