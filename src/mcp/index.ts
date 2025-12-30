@@ -3569,12 +3569,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // FTS5 uses implicit AND for space-separated terms
-        // Since notes_fts only has one indexed column (search_text), we can use simple
-        // space-separated terms without column prefixes. This is more reliable than
-        // prefixing each term individually.
-        // Example: "mcp validation" becomes "mcp validation" (implicit AND)
-        // Example: '"exact phrase"' stays as '"exact phrase"'
-        const ftsQuery = ftsTerms.join(' ');
+        // Use explicit column prefix "search_text:" for proper FTS5 matching
+        // This ensures multi-word queries work correctly by targeting the indexed column
+        // Example: "mcp validation" becomes "search_text:mcp search_text:validation"
+        // Example: '"exact phrase"' becomes 'search_text:"exact phrase"'
+        const ftsQuery = ftsTerms.map(term => {
+          if (term.startsWith('"') && term.endsWith('"')) {
+            return `search_text:${term}`;
+          }
+          return `search_text:${term}`;
+        }).join(' ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
