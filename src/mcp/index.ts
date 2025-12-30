@@ -3578,9 +3578,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query with column prefix for D1 FTS5 compatibility
-        // Format: "search_text:term1 search_text:term2" - terms are implicitly ANDed
-        const ftsQuery = ftsTerms.map(term => `search_text:${term}`).join(' ');
+        // Build FTS5 query - terms separated by space are implicitly ANDed in FTS5
+        // No column prefix needed since notes_fts has only one searchable column (search_text)
+        // Wrap each term in parentheses to ensure proper grouping for multi-word search
+        // Example: "mcp validation" becomes "(mcp) (validation)"
+        const ftsQuery = ftsTerms.map(term => `(${term})`).join(' ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
