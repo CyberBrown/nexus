@@ -3425,17 +3425,27 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
-        // Ensure FTS5 table exists before searching
+        // Ensure FTS5 table exists with correct schema before searching
+        // This fixes schema mismatch if old migration (0017) was applied
         try {
-          await env.DB.prepare(`
-            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-              note_id UNINDEXED,
-              search_text,
-              tokenize='porter unicode61'
-            )
-          `).run();
+          // Check if table exists and has correct schema by looking for note_id column
+          const tableInfo = await env.DB.prepare(
+            `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
+          ).first<{ name: string } | null>();
+
+          if (!tableInfo) {
+            // Table either doesn't exist or has old schema - drop and recreate
+            await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+            await env.DB.prepare(`
+              CREATE VIRTUAL TABLE notes_fts USING fts5(
+                note_id UNINDEXED,
+                search_text,
+                tokenize='porter unicode61'
+              )
+            `).run();
+          }
         } catch {
-          // Table creation failed, will fall back to search_text column
+          // Table check/creation failed, will fall back to search_text column
         }
 
         // Convert search query to FTS5 format
@@ -3845,14 +3855,23 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
-        // Create FTS5 table if it doesn't exist
-        await env.DB.prepare(`
-          CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-            note_id UNINDEXED,
-            search_text,
-            tokenize='porter unicode61'
-          )
-        `).run();
+        // Ensure FTS5 table exists with correct schema
+        // This fixes schema mismatch if old migration (0017) was applied
+        const tableInfo = await env.DB.prepare(
+          `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
+        ).first<{ name: string } | null>();
+
+        if (!tableInfo) {
+          // Table either doesn't exist or has old schema - drop and recreate
+          await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+          await env.DB.prepare(`
+            CREATE VIRTUAL TABLE notes_fts USING fts5(
+              note_id UNINDEXED,
+              search_text,
+              tokenize='porter unicode61'
+            )
+          `).run();
+        }
 
         // Get all non-deleted notes for this tenant/user
         const notes = await env.DB.prepare(`

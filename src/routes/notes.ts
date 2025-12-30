@@ -24,6 +24,28 @@ notes.get('/', async (c) => {
   // If search query is provided, use FTS5
   if (search && search.trim()) {
     try {
+      // Ensure FTS5 table exists with correct schema before searching
+      // This fixes schema mismatch if old migration (0017) was applied
+      try {
+        const tableInfo = await c.env.DB.prepare(
+          `SELECT name FROM pragma_table_info('notes_fts') WHERE name = 'note_id'`
+        ).first<{ name: string } | null>();
+
+        if (!tableInfo) {
+          // Table either doesn't exist or has old schema - drop and recreate
+          await c.env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+          await c.env.DB.prepare(`
+            CREATE VIRTUAL TABLE notes_fts USING fts5(
+              note_id UNINDEXED,
+              search_text,
+              tokenize='porter unicode61'
+            )
+          `).run();
+        }
+      } catch {
+        // Table check/creation failed, will fall back to in-memory search
+      }
+
       // Convert search query to FTS5 format
       // FTS5 uses implicit AND when terms are space-separated
       // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
