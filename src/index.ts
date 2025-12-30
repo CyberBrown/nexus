@@ -1586,11 +1586,12 @@ app.post('/workflow-callback', async (c) => {
         console.log(`Workflow callback: found idea_task ${ideaTask.id} in dispatched state`);
 
         if (isSuccess) {
-          // Validate that work was actually done - check for failure indicators
+          // Validate that work was actually done:
+          // 1. Check for failure indicators (AI says "I couldn't find...")
+          // 2. Check for minimum output length (short outputs are usually errors)
           // Uses shared utility from lib/validation.ts that handles curly quote normalization
-          // IMPORTANT: Check allTextToCheck (includes error field) not just resultText
-          // This catches cases where DE reports success but the actual output is in body.error
           const matchedIndicator = findFailureIndicator(allTextToCheck);
+          const hasSubstantialOutput = resultText.trim().length >= 100;
 
           if (matchedIndicator) {
             console.log(`Workflow callback: idea_task ${ideaTask.id} result contains failure indicator: "${matchedIndicator}", marking as failed`);
@@ -1601,6 +1602,21 @@ app.post('/workflow-callback', async (c) => {
               SET status = 'failed', error_message = ?, completed_at = NULL, updated_at = ?
               WHERE id = ?
             `).bind((resultText || 'Execution failed - no deliverables produced').substring(0, 2000), now, ideaTask.id).run();
+
+            await c.env.DB.prepare(`
+              UPDATE idea_executions
+              SET failed_tasks = failed_tasks + 1, updated_at = ?
+              WHERE idea_id = ?
+            `).bind(now, ideaTask.idea_id).run();
+          } else if (!hasSubstantialOutput) {
+            console.log(`Workflow callback: idea_task ${ideaTask.id} output too short (${resultText.length} chars), marking as failed`);
+            console.log(`Workflow callback: Short output: ${resultText}`);
+            // Mark as failed - output is too short to be a real completion
+            await c.env.DB.prepare(`
+              UPDATE idea_tasks
+              SET status = 'failed', error_message = ?, completed_at = NULL, updated_at = ?
+              WHERE id = ?
+            `).bind(`Output too short (${resultText.length} chars): ${resultText.substring(0, 200)}`, now, ideaTask.id).run();
 
             await c.env.DB.prepare(`
               UPDATE idea_executions
