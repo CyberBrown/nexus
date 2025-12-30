@@ -3598,12 +3598,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // FTS5 uses implicit AND for space-separated terms by default
-        // Example: "mcp validation" matches docs with BOTH terms
-        // Example: '"exact phrase" term' matches exact phrase AND term
-        // Note: Cloudflare D1's FTS5 may handle explicit AND differently
+        // CRITICAL: FTS5 default is OR for space-separated terms, NOT AND!
+        // We must use explicit AND operator between terms.
+        // Example: "mcp AND validation" matches docs with BOTH terms
+        // Example: '"exact phrase" AND term' matches exact phrase AND term
         const ftsQuery = ftsTerms.length > 0
-          ? ftsTerms.join(' ')
+          ? ftsTerms.join(' AND ')
           : '';
 
         // Helper to check if all search terms match in a text
