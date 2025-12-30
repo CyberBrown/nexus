@@ -3489,9 +3489,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
         // FTS5 uses implicit AND for space-separated terms
         // Note: "AND" is NOT a valid FTS5 operator - it would be treated as a literal term
-        // Simple space-separated terms work best with D1/FTS5
-        // No column prefix needed since there's only one searchable column
-        const ftsQuery = ftsTerms.join(' ');
+        // IMPORTANT: Must use search_text: column prefix for each term because D1's FTS5
+        // requires explicit column specification when the table has UNINDEXED columns
+        const ftsQuery = ftsTerms.map(term => {
+          // Quoted phrases already have quotes, just add column prefix
+          if (term.startsWith('"') && term.endsWith('"')) {
+            return `search_text:${term}`;
+          }
+          // Regular terms get column prefix
+          return `search_text:${term}`;
+        }).join(' ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
