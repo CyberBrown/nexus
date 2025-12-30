@@ -3549,7 +3549,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             return term;
           }
         }).join(' ');
-        const ftsQuery = `search_text:(${terms})`;
+        // FTS5 query: space-separated terms are implicitly ANDed
+        // Since notes_fts only has one indexed column (search_text), no column filter needed
+        const ftsQuery = terms;
 
         // Helper to check if all search terms match in a text (for fallback)
         const matchesAllTerms = (text: string): boolean => {

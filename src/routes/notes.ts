@@ -176,9 +176,9 @@ notes.get('/', async (c) => {
         }
       }
 
-      // FTS5 column filter syntax: "column:(terms)" - NO spaces around colon
-      // Terms are implicitly ANDed when space-separated
-      const ftsQuery = ftsTerms.length > 0 ? `search_text:(${ftsTerms.join(' ')})` : '';
+      // FTS5 query: space-separated terms are implicitly ANDed
+      // Since notes_fts only has one indexed column (search_text), no column filter needed
+      const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' ') : '';
 
       if (ftsQuery) {
         // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
