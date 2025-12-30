@@ -1789,18 +1789,67 @@ app.post('/workflow-callback', async (c) => {
 
     if (isSuccess) {
       // Validate that work was actually done - check for failure indicators in "success" responses
+      // IMPORTANT: Keep this in sync with the idea_tasks check above (lines 1613-1671)
+      // and DE's nexus-callback.ts FAILURE_INDICATORS
       const resultLower = (resultText || '').toLowerCase();
       const failureIndicators = [
+        // Resource not found patterns
         "couldn't find",
         "could not find",
+        "can't find",
+        "cannot find",
         "doesn't have",
         "does not have",
         "not found",
-        "failed to",
-        "error:",
-        "unable to",
         "no such file",
         "doesn't exist",
+        "does not exist",
+        "file not found",
+        "directory not found",
+        "repo not found",
+        "repository not found",
+        "project not found",
+        "reference not found",
+        "idea not found",
+        // Failure action patterns
+        "failed to",
+        "unable to",
+        "i can't",
+        "i cannot",
+        "i'm unable",
+        "i am unable",
+        "cannot locate",
+        "couldn't locate",
+        "couldn't create",
+        "could not create",
+        "wasn't able",
+        "was not able",
+        // Empty/missing result patterns
+        "no matching",
+        "nothing found",
+        "no results",
+        "empty result",
+        "no data",
+        // Explicit error indicators
+        "error:",
+        "error occurred",
+        "exception:",
+        // Task incomplete patterns
+        "task incomplete",
+        "could not complete",
+        "couldn't complete",
+        "unable to complete",
+        "did not complete",
+        "didn't complete",
+        // Missing reference patterns (for idea-based tasks)
+        "reference doesn't have",
+        "reference does not have",
+        "doesn't have a corresponding",
+        "does not have a corresponding",
+        "no corresponding file",
+        "no corresponding project",
+        "missing reference",
+        "invalid reference",
       ];
       const isActualFailure = failureIndicators.some(indicator => resultLower.includes(indicator));
 
