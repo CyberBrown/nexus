@@ -1557,9 +1557,13 @@ app.post('/workflow-callback', async (c) => {
 
     // Normalize success from status field if not provided
     const isSuccess = body.success ?? (body.status === 'completed');
-    const resultText = body.result || body.output || body.logs;
+    // Check ALL possible text fields for failure indicators - not just the "happy path" fields
+    // DE might send the actual output in different fields depending on the execution path
+    const resultText = body.result || body.output || body.logs || '';
+    const allTextToCheck = [body.result, body.output, body.logs, body.error].filter(Boolean).join('\n');
 
     console.log(`Workflow callback received: task_id=${body.task_id}, status=${body.status}, success=${isSuccess}`);
+    console.log(`Workflow callback: resultText length=${resultText.length}, allTextToCheck length=${allTextToCheck.length}`);
 
     // Validate required fields
     if (!body.queue_entry_id && !body.task_id) {
@@ -1584,10 +1588,13 @@ app.post('/workflow-callback', async (c) => {
         if (isSuccess) {
           // Validate that work was actually done - check for failure indicators
           // Uses shared utility from lib/validation.ts that handles curly quote normalization
-          const matchedIndicator = findFailureIndicator(resultText);
+          // IMPORTANT: Check allTextToCheck (includes error field) not just resultText
+          // This catches cases where DE reports success but the actual output is in body.error
+          const matchedIndicator = findFailureIndicator(allTextToCheck);
 
           if (matchedIndicator) {
             console.log(`Workflow callback: idea_task ${ideaTask.id} result contains failure indicator: "${matchedIndicator}", marking as failed`);
+            console.log(`Workflow callback: Full text checked (first 500): ${allTextToCheck.substring(0, 500)}`);
             // Mark as failed - the result indicates no actual work was done
             await c.env.DB.prepare(`
               UPDATE idea_tasks
@@ -1705,10 +1712,12 @@ app.post('/workflow-callback', async (c) => {
     if (isSuccess) {
       // Validate that work was actually done - check for failure indicators in "success" responses
       // Uses shared utility from lib/validation.ts that handles curly quote normalization
-      const execMatchedIndicator = findFailureIndicator(resultText);
+      // IMPORTANT: Check allTextToCheck (includes error field) not just resultText
+      const execMatchedIndicator = findFailureIndicator(allTextToCheck);
 
       if (execMatchedIndicator) {
         console.log(`Workflow callback: task ${entry.task_id} result contains failure indicator: "${execMatchedIndicator}", marking as failed`);
+        console.log(`Workflow callback: Full text checked (first 500): ${allTextToCheck.substring(0, 500)}`);
         // Treat as failure - the AI said "success" but the content indicates failure
         const error = resultText || 'Execution reported success but no deliverables were produced';
 
