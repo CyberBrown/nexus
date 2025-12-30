@@ -58,6 +58,13 @@ export interface Env {
   IDEA_PLANNING_WORKFLOW: Workflow;
   // Note: CodeExecutionWorkflow is triggered via HTTP to DE_WORKFLOWS_URL
   // Cross-worker workflow bindings are NOT supported by CF Workflows
+  // Cloudflare AI - Workers AI for embeddings, inference, and AI Search
+  // Usage: env.AI.autorag("nexus-ai-search").aiSearch({ query: "..." })
+  AI: Ai;
+  // R2 Storage - For AI Search documents (auto-indexed by AI Search)
+  AI_SEARCH_BUCKET: R2Bucket;
+  // Vectorize - For custom embeddings (separate from AI Search's built-in index)
+  VECTORIZE: VectorizeIndex;
 }
 
 // Cloudflare Scheduled Event

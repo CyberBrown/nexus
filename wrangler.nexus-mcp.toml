@@ -126,3 +126,26 @@ class_name = "TaskExecutorWorkflow"
 name = "idea-planning-workflow"
 binding = "IDEA_PLANNING_WORKFLOW"
 class_name = "IdeaPlanningWorkflow"
+
+# AI Binding - Cloudflare Workers AI for embeddings, inference, and AI Search
+# AI Search is accessed via: env.AI.autorag("nexus-ai-search").aiSearch({ query: "..." })
+# Create AI Search index in Cloudflare Dashboard: AI > AI Search > Create
+# Link it to the R2 bucket below and it will auto-index documents
+[ai]
+binding = "AI"
+
+# R2 Bucket - Storage for AI Search documents
+# Upload documents here and AI Search will automatically index them
+# Supported formats: PDF, HTML, TXT, MD, DOCX, CSV, JSON
+# Create bucket: npx wrangler r2 bucket create nexus-ai-search
+[[r2_buckets]]
+binding = "AI_SEARCH_BUCKET"
+bucket_name = "nexus-ai-search"
+
+# Vectorize Index - For custom embeddings (separate from AI Search)
+# AI Search has its own built-in vector index
+# This is for manual embedding operations if needed
+# Create with: npx wrangler vectorize create nexus-ai-search --dimensions=384 --metric=cosine
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "nexus-ai-search"
