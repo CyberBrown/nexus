@@ -474,8 +474,15 @@ notes.post('/', async (c) => {
   const encrypted = await encryptFields(note, ENCRYPTED_FIELDS, key);
   await insert(c.env.DB, 'notes', encrypted);
 
-  // FTS5 index is automatically updated by the notes_fts_sync_insert trigger
-  // (see migration 0020_add_notes_fts_triggers.sql)
+  // Explicitly insert into FTS index (don't rely on triggers - D1 triggers can be unreliable)
+  if (searchText) {
+    try {
+      await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+        .bind(id, searchText).run();
+    } catch {
+      // FTS insert failed, but note was created - search will use fallback
+    }
+  }
 
   return c.json({ success: true, data: { id } }, 201);
 });
@@ -527,8 +534,24 @@ notes.patch('/:id', async (c) => {
     const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim().toLowerCase();
     updates.search_text = searchText;
 
-    // FTS5 index is automatically updated by the notes_fts_sync_update trigger
-    // (see migration 0020_add_notes_fts_triggers.sql)
+    // Explicitly update FTS index after the note update (don't rely on triggers)
+    if (Object.keys(updates).length > 0) {
+      const encrypted = await encryptFields(updates, ENCRYPTED_FIELDS, key);
+      await update(c.env.DB, 'notes', id, encrypted, { tenantId });
+    }
+
+    // Update FTS index
+    if (searchText) {
+      try {
+        await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
+        await c.env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+          .bind(id, searchText).run();
+      } catch {
+        // FTS update failed, search will use fallback
+      }
+    }
+
+    return c.json({ success: true, data: { id } });
   }
 
   if (Object.keys(updates).length > 0) {
@@ -552,8 +575,12 @@ notes.delete('/:id', async (c) => {
 
   await softDelete(c.env.DB, 'notes', id, { tenantId });
 
-  // FTS5 index is automatically updated by the notes_fts_sync_update trigger
-  // (soft delete sets deleted_at, which triggers removal from FTS)
+  // Explicitly remove from FTS index (don't rely on triggers - D1 triggers can be unreliable)
+  try {
+    await c.env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
+  } catch {
+    // FTS delete failed, but note was soft deleted - search will filter it out anyway
+  }
 
   return c.json({ success: true, data: { id } });
 });

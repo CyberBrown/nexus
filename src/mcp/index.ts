@@ -3104,8 +3104,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           now
         ).run();
 
-        // FTS5 index is automatically updated by the notes_fts_sync_insert trigger
-        // (see migration 0020_add_notes_fts_triggers.sql)
+        // Explicitly insert into FTS index (don't rely on triggers)
+        if (searchText) {
+          try {
+            await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+              .bind(id, searchText).run();
+          } catch {
+            // FTS insert failed, but note was created - search will use fallback
+          }
+        }
 
         return {
           content: [{
@@ -3337,14 +3344,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Rebuild search_text if title, content, or tags changed
+        let newSearchText: string | null = null;
         if (title !== undefined || content !== undefined || tags !== undefined) {
           // MUST lowercase because D1's FTS5 is case-sensitive and query terms are lowercased
-          const searchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim().toLowerCase();
+          newSearchText = [plaintextTitle || '', plaintextContent || '', plaintextTags || ''].join(' ').trim().toLowerCase();
           updates.push('search_text = ?');
-          bindings.push(searchText);
-
-          // FTS5 index is automatically updated by the notes_fts_sync_update trigger
-          // (see migration 0020_add_notes_fts_triggers.sql)
+          bindings.push(newSearchText);
         }
 
         bindings.push(note_id, tenantId);
@@ -3352,6 +3357,17 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         await env.DB.prepare(`
           UPDATE notes SET ${updates.join(', ')} WHERE id = ? AND tenant_id = ?
         `).bind(...bindings).run();
+
+        // Explicitly update FTS index (don't rely on triggers)
+        if (newSearchText) {
+          try {
+            await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
+            await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+              .bind(note_id, newSearchText).run();
+          } catch {
+            // FTS update failed, search will use fallback
+          }
+        }
 
         return {
           content: [{
@@ -3403,8 +3419,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ?
         `).bind(now, now, note_id, tenantId).run();
 
-        // FTS5 index is automatically updated by the notes_fts_sync_update trigger
-        // (soft delete sets deleted_at, which triggers removal from FTS)
+        // Explicitly remove from FTS index (don't rely on triggers)
+        try {
+          await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
+        } catch {
+          // FTS delete failed, but note was soft-deleted
+        }
 
         return {
           content: [{
@@ -4197,9 +4217,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           tags: string | null;
         }>();
 
-        // Rebuild FTS index
-        // With migration 0020+, triggers automatically sync search_text to notes_fts
-        // So we just need to update search_text and the trigger handles the rest
+        // Rebuild FTS index - explicitly insert to FTS table
+        // We don't rely on triggers because D1 trigger execution can be unreliable
+        // Instead, we directly manage both notes.search_text and notes_fts
+
+        // First, clear the FTS index for a clean rebuild
+        await env.DB.prepare(`DELETE FROM notes_fts`).run();
+
         let indexed = 0;
         let errors = 0;
         const errorDetails: string[] = [];
@@ -4214,13 +4238,19 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             // Build search text - MUST lowercase for D1's case-sensitive FTS5
             const searchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
 
-            // Update notes table search_text column
-            // The UPDATE trigger (notes_fts_sync_update) will sync to notes_fts
-            await env.DB.prepare(`
-              UPDATE notes SET search_text = ? WHERE id = ?
-            `).bind(searchText, note.id).run();
+            if (searchText) {
+              // Update notes table search_text column
+              await env.DB.prepare(`
+                UPDATE notes SET search_text = ? WHERE id = ?
+              `).bind(searchText, note.id).run();
 
-            indexed++;
+              // Explicitly insert into FTS index (don't rely on triggers)
+              await env.DB.prepare(`
+                INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
+              `).bind(note.id, searchText).run();
+
+              indexed++;
+            }
           } catch (err: any) {
             errors++;
             errorDetails.push(`Note ${note.id}: ${err.message}`);
