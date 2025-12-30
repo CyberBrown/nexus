@@ -3474,8 +3474,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
         }
 
-        // Join with AND for explicit boolean AND (more reliable than implicit space-separated AND)
-        const ftsQuery = ftsTerms.join(' AND ');
+        // FTS5 uses implicit AND for space-separated terms
+        // Note: "AND" is NOT a valid FTS5 operator - it would be treated as a literal term
+        const ftsQuery = ftsTerms.join(' ');
 
         // If no valid search terms, return empty results
         if (!ftsQuery) {
