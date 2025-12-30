@@ -3017,11 +3017,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               tokenize='porter unicode61'
             )
           `).run();
+          // Use DELETE + INSERT to ensure clean entry (avoids duplicates)
+          await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(id).run();
           await env.DB.prepare(`
             INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)
           `).bind(id, searchText).run();
-        } catch {
-          // FTS insert is non-critical, note is already saved
+        } catch (ftsError) {
+          // Log FTS error but don't fail the note creation
+          console.error(`FTS insert failed for note ${id}:`, ftsError);
         }
 
         return {
@@ -3271,8 +3274,9 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             `).run();
             await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note_id).run();
             await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(note_id, searchText).run();
-          } catch {
-            // FTS update is non-critical
+          } catch (ftsError) {
+            // Log FTS error but don't fail the update
+            console.error(`FTS update failed for note ${note_id}:`, ftsError);
           }
         }
 
@@ -3421,6 +3425,19 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
       try {
         const encryptionKey = await getEncryptionKey(env.KV, tenantId);
 
+        // Ensure FTS5 table exists before searching
+        try {
+          await env.DB.prepare(`
+            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+              note_id UNINDEXED,
+              search_text,
+              tokenize='porter unicode61'
+            )
+          `).run();
+        } catch {
+          // Table creation failed, will fall back to search_text column
+        }
+
         // Convert search query to FTS5 format
         // FTS5 uses implicit AND when terms are space-separated
         // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
@@ -3497,6 +3514,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         // Use FTS5 MATCH query with JOIN on note_id to get full note data
         // Filter by tenant/user and non-deleted
         // FTS5 requires table name (not alias) in MATCH and bm25() calls
+        // Wrap query in search_text: prefix to ensure column-specific matching
         const notes = await env.DB.prepare(`
           SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
           FROM notes n
@@ -3553,6 +3571,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           // Track diagnostic info for debugging
           let notesWithSearchText = 0;
           let notesWithoutSearchText = 0;
+          let notesRepaired = 0;
 
           // Helper to check if all search terms match
           const matchesAllTerms = (text: string): boolean => {
@@ -3580,29 +3599,31 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               if (!matchesAllTerms(searchableText)) {
                 continue;
               }
-              decryptedTitle = note.title ? await decryptField(note.title as string, encryptionKey) : '';
-              decryptedContent = note.content ? await decryptField(note.content as string, encryptionKey) : '';
+              // Use safeDecrypt for robustness with mixed encrypted/plain notes
+              decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
+              decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
             } else {
               notesWithoutSearchText++;
-              // search_text is NULL - try raw values first (encryption is now disabled)
-              // Note: title/content should be plaintext now, but older notes may have encrypted data
-              const rawTitle = note.title ? String(note.title) : '';
-              const rawContent = note.content ? String(note.content) : '';
+              // search_text is NULL - decrypt title/content to build searchable text
+              // Use safeDecrypt which returns plain text if decryption fails
+              decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
+              decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
               const tagsText = note.tags ? String(note.tags) : '';
 
-              // First, try matching against raw values (for notes created after encryption was disabled)
-              searchableText = `${rawTitle} ${rawContent} ${tagsText}`.toLowerCase();
-              if (matchesAllTerms(searchableText)) {
-                decryptedTitle = rawTitle;
-                decryptedContent = rawContent;
-              } else {
-                // If raw values don't match, try decryption (for older encrypted notes)
-                decryptedTitle = note.title ? await safeDecrypt(note.title as string, encryptionKey) : '';
-                decryptedContent = note.content ? await safeDecrypt(note.content as string, encryptionKey) : '';
-                searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
-                if (!matchesAllTerms(searchableText)) {
-                  continue;
-                }
+              // Build searchable text from decrypted values
+              searchableText = `${decryptedTitle} ${decryptedContent} ${tagsText}`.toLowerCase();
+              if (!matchesAllTerms(searchableText)) {
+                continue;
+              }
+
+              // Auto-repair: populate search_text and FTS index for this note
+              try {
+                await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`).bind(searchableText, note.id).run();
+                await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`).bind(note.id, searchableText).run();
+                notesRepaired++;
+              } catch {
+                // Repair failed, continue anyway since we have the match
               }
             }
 
@@ -3624,18 +3645,24 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
 
           if (matchingNotes.length > 0) {
+            const result: Record<string, unknown> = {
+              success: true,
+              query: query,
+              fts_query: ftsQuery,
+              count: matchingNotes.length,
+              notes: matchingNotes,
+              fallback: true,
+            };
+            if (notesRepaired > 0) {
+              result.repaired = notesRepaired;
+              result.hint = `Auto-repaired ${notesRepaired} notes. Future searches will be faster.`;
+            } else {
+              result.hint = 'FTS index may need rebuilding. Run nexus_rebuild_notes_fts to improve search performance.';
+            }
             return {
               content: [{
                 type: 'text',
-                text: JSON.stringify({
-                  success: true,
-                  query: query,
-                  fts_query: ftsQuery,
-                  count: matchingNotes.length,
-                  notes: matchingNotes,
-                  fallback: true,
-                  hint: 'FTS index may need rebuilding. Run nexus_rebuild_notes_fts to improve search performance.',
-                }, null, 2)
+                text: JSON.stringify(result, null, 2)
               }]
             };
           }
