@@ -25,7 +25,10 @@ notes.get('/', async (c) => {
   if (search && search.trim()) {
     try {
       // Convert search query to FTS5 format
-      // Properly handle quoted phrases vs individual words
+      // FTS5 uses implicit AND when terms are space-separated
+      // NOTE: Do NOT use prefix matching (word*) with porter stemmer!
+      // Prefix queries use raw (pre-tokenized) form, so "validation*" won't match
+      // the stemmed "valid" in the index. Let FTS5 handle stemming naturally.
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -39,16 +42,15 @@ notes.get('/', async (c) => {
         const before = trimmedSearch.slice(lastIndex, match.index).trim();
         if (before) {
           for (const word of before.split(/\s+/).filter((w: string) => w.length > 0)) {
-            // Escape special FTS5 characters and use prefix matching
-            // FTS5 prefix syntax: word* (no quotes for prefix search)
+            // Escape special FTS5 characters, no prefix matching
             // MUST lowercase because porter tokenizer normalizes to lowercase
             const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              ftsTerms.push(`${escaped}*`);
+              ftsTerms.push(escaped);
             }
           }
         }
-        // Add the quoted phrase (exact match, no prefix)
+        // Add the quoted phrase (exact match)
         const phrase = match[1]!.trim();
         if (phrase.length > 0) {
           // Escape any quotes within the phrase and lowercase for porter tokenizer
@@ -62,12 +64,11 @@ notes.get('/', async (c) => {
       const remaining = trimmedSearch.slice(lastIndex).trim();
       if (remaining) {
         for (const word of remaining.split(/\s+/).filter((w: string) => w.length > 0)) {
-          // Escape special FTS5 characters and use prefix matching
-          // FTS5 prefix syntax: word* (no quotes for prefix search)
+          // Escape special FTS5 characters, no prefix matching
           // MUST lowercase because porter tokenizer normalizes to lowercase
           const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            ftsTerms.push(`${escaped}*`);
+            ftsTerms.push(escaped);
           }
         }
       }
