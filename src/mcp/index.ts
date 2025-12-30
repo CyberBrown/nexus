@@ -3517,10 +3517,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
     }
   );
 
-  // Tool: nexus_search_notes - Search notes with LIKE-based multi-word search
-  // PRIMARY: Use LIKE on search_text column (simple, reliable, works on D1)
-  // FALLBACK: Full scan with decryption for notes missing search_text
-  // NOTE: FTS5 removed as primary method due to D1 reliability issues with multi-word queries
+  // Tool: nexus_search_notes - Search notes using FTS5 with multi-word support
+  // PRIMARY: Use FTS5 with OR operator, then post-filter for AND semantics
+  // FALLBACK 1: LIKE-based search on search_text column
+  // FALLBACK 2: Full scan with decryption for notes missing search_text
+  // NOTE: D1's FTS5 has issues with implicit AND (space-separated terms can silently fail)
+  //       Using OR + post-filter is the ONLY reliable approach for multi-word search
   server.tool(
     'nexus_search_notes',
     'Search notes by title, content, or tags. Supports multi-word search (all terms must match) and quoted phrases for exact matching.',
@@ -3547,8 +3549,38 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           // Column check failed, continue anyway
         }
 
+        // Check and fix FTS5 schema if needed (old migration 0017 created incompatible schema)
+        try {
+          const ftsTable = await env.DB.prepare(
+            `SELECT name, sql FROM sqlite_master WHERE type='table' AND name='notes_fts'`
+          ).first<{ name: string; sql: string } | null>();
+
+          // Recreate FTS5 table if it doesn't exist or has old schema (missing note_id column)
+          if (!ftsTable || !ftsTable.sql || !ftsTable.sql.includes('note_id')) {
+            await env.DB.prepare(`DROP TABLE IF EXISTS notes_fts`).run();
+            await env.DB.prepare(`
+              CREATE VIRTUAL TABLE notes_fts USING fts5(
+                note_id UNINDEXED,
+                search_text,
+                tokenize='porter unicode61'
+              )
+            `).run();
+
+            // Immediately populate FTS index when table is recreated
+            await env.DB.prepare(`
+              INSERT INTO notes_fts (note_id, search_text)
+              SELECT id, search_text FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND search_text IS NOT NULL AND search_text != ''
+            `).bind(tenantId, userId).run();
+          }
+        } catch {
+          // Schema check failed, FTS may not be available - will fall back to LIKE/full scan
+        }
+
         // Parse search terms - handle quoted phrases and individual words
         const searchTerms: string[] = [];
+        const ftsTerms: string[] = []; // For FTS5 query
         const phraseRegex = /"([^"]+)"/g;
         let lastIndex = 0;
         let match: RegExpExecArray | null;
@@ -3558,13 +3590,19 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           const before = trimmedQuery.slice(lastIndex, match.index).trim();
           if (before) {
             for (const word of before.split(/\s+/).filter(w => w.length > 0)) {
-              searchTerms.push(word.toLowerCase());
+              const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
+              if (escaped.length > 0) {
+                searchTerms.push(escaped);
+                ftsTerms.push(escaped);
+              }
             }
           }
           // Add the quoted phrase as a single term (for exact sequence matching)
           const phrase = match[1]!.trim().toLowerCase();
           if (phrase.length > 0) {
-            searchTerms.push(phrase);
+            const escapedPhrase = phrase.replace(/"/g, '');
+            searchTerms.push(escapedPhrase);
+            ftsTerms.push(`"${escapedPhrase}"`); // Quoted phrase for FTS5
           }
           lastIndex = match.index + match[0].length;
         }
@@ -3573,7 +3611,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         const remaining = trimmedQuery.slice(lastIndex).trim();
         if (remaining) {
           for (const word of remaining.split(/\s+/).filter(w => w.length > 0)) {
-            searchTerms.push(word.toLowerCase());
+            const escaped = word.replace(/[*^"():'"]/g, '').toLowerCase();
+            if (escaped.length > 0) {
+              searchTerms.push(escaped);
+              ftsTerms.push(escaped);
+            }
           }
         }
 
@@ -3613,33 +3655,37 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let searchMethod = 'none';
         const archivedCondition = include_archived ? '' : 'AND archived_at IS NULL';
 
-        // STEP 1: LIKE-based search on search_text column (PRIMARY method)
-        // This is simple, reliable, and works correctly on D1
-        // Uses SQL LIKE with % wildcards for substring matching
+        // Build FTS5 query with OR operator
+        // CRITICAL: Use OR to get broad results, then post-filter for AND semantics
+        // D1's FTS5 has INCONSISTENT behavior with implicit AND (space-separated terms)
+        // Some queries work, others silently return 0 results. Using OR is reliable.
+        const ftsQuery = ftsTerms.join(' OR ');
+
+        // STEP 1: FTS5 search (PRIMARY method)
+        // Uses OR operator for broad matching, then post-filters for AND semantics
         try {
-          // Build LIKE conditions for each search term
-          // Each term must appear somewhere in search_text (AND semantics)
-          const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
-          const likeBindings = searchTerms.map(term => `%${term}%`);
+          console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}", terms=[${searchTerms.join(', ')}]`);
 
-          console.log(`[nexus_search_notes] LIKE search: terms=[${searchTerms.join(', ')}]`);
-          const likeSearchResults = await env.DB.prepare(`
-            SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
-            FROM notes
-            WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
-              AND search_text IS NOT NULL AND search_text != ''
-              AND (${likeConditions})
+          const ftsResults = await env.DB.prepare(`
+            SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at, n.search_text
+            FROM notes n
+            WHERE n.id IN (
+              SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
+            )
+              AND n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
               ${archivedCondition}
-            ORDER BY pinned DESC, created_at DESC
-            LIMIT ?
-          `).bind(tenantId, userId, ...likeBindings, maxLimit * 2).all();
+            ORDER BY n.pinned DESC, n.created_at DESC
+            LIMIT 200
+          `).bind(ftsQuery, tenantId, userId).all();
 
-          console.log(`[nexus_search_notes] LIKE search returned ${likeSearchResults.results?.length || 0} results`);
-          if (likeSearchResults.results && likeSearchResults.results.length > 0) {
-            searchMethod = 'like';
+          console.log(`[nexus_search_notes] FTS5 search returned ${ftsResults.results?.length || 0} results`);
+
+          if (ftsResults.results && ftsResults.results.length > 0) {
+            searchMethod = 'fts5';
             const foundIds = new Set<string>();
 
-            for (const note of likeSearchResults.results as Array<{
+            // Post-filter FTS5 results to ensure all terms match (AND semantics)
+            for (const note of ftsResults.results as Array<{
               id: string;
               title: string | null;
               content: string | null;
@@ -3657,7 +3703,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
               const tagsText = note.tags ? String(note.tags) : '';
 
-              // Verify all terms match in decrypted content (search_text should be lowercase plaintext)
+              // Verify all terms match in decrypted content
               const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
               if (!matchesAllTerms(combinedText)) continue;
 
@@ -3680,11 +3726,99 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }
           }
         } catch (err: any) {
-          console.error('LIKE search failed:', err);
-          searchMethod = `like_error: ${err.message || String(err)}`;
+          console.error('FTS5 search failed:', err);
+          searchMethod = `fts5_error: ${err.message || String(err)}`;
         }
 
-        // STEP 2: Full scan with decryption for notes missing search_text
+        // STEP 2: LIKE-based search fallback (if FTS5 returns no results)
+        // This handles cases where FTS5 index is stale but search_text is populated
+        if (matchingNotes.length === 0) {
+          try {
+            // Build LIKE conditions for each search term
+            const likeConditions = searchTerms.map(() => 'search_text LIKE ?').join(' AND ');
+            const likeBindings = searchTerms.map(term => `%${term}%`);
+
+            console.log(`[nexus_search_notes] LIKE search fallback: terms=[${searchTerms.join(', ')}]`);
+            const likeSearchResults = await env.DB.prepare(`
+              SELECT id, title, content, category, tags, source_type, pinned, archived_at, created_at, search_text
+              FROM notes
+              WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND search_text IS NOT NULL AND search_text != ''
+                AND (${likeConditions})
+                ${archivedCondition}
+              ORDER BY pinned DESC, created_at DESC
+              LIMIT ?
+            `).bind(tenantId, userId, ...likeBindings, maxLimit * 2).all();
+
+            console.log(`[nexus_search_notes] LIKE search returned ${likeSearchResults.results?.length || 0} results`);
+            if (likeSearchResults.results && likeSearchResults.results.length > 0) {
+              searchMethod = searchMethod.startsWith('fts5_error') ? `${searchMethod}+like` : 'like';
+              const foundIds = new Set<string>();
+
+              for (const note of likeSearchResults.results as Array<{
+                id: string;
+                title: string | null;
+                content: string | null;
+                category: string;
+                tags: string | null;
+                source_type: string | null;
+                pinned: number;
+                archived_at: string | null;
+                created_at: string;
+                search_text: string | null;
+              }>) {
+                if (foundIds.has(note.id)) continue;
+
+                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
+                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
+                const tagsText = note.tags ? String(note.tags) : '';
+
+                // Verify all terms match in decrypted content
+                const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
+                if (!matchesAllTerms(combinedText)) continue;
+
+                matchingNotes.push({
+                  id: note.id,
+                  title: decryptedTitle,
+                  content_preview: decryptedContent
+                    ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                    : '',
+                  category: note.category,
+                  tags: note.tags,
+                  source_type: note.source_type,
+                  pinned: note.pinned === 1,
+                  archived: !!note.archived_at,
+                  created_at: note.created_at,
+                });
+                foundIds.add(note.id);
+
+                if (matchingNotes.length >= maxLimit) break;
+              }
+
+              // If LIKE found results but FTS5 didn't, auto-repair FTS5 index
+              if (matchingNotes.length > 0) {
+                try {
+                  for (const note of matchingNotes) {
+                    await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                    const searchText = `${note.title} ${note.content_preview} ${note.tags || ''}`.toLowerCase();
+                    await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                      .bind(note.id, searchText).run();
+                  }
+                  searchMethod += '+fts_repaired';
+                } catch {
+                  // FTS repair failed, but we have results anyway
+                }
+              }
+            }
+          } catch (err: any) {
+            console.error('LIKE search failed:', err);
+            if (!searchMethod.includes('like')) {
+              searchMethod = searchMethod === 'none' ? `like_error: ${err.message}` : `${searchMethod}+like_error`;
+            }
+          }
+        }
+
+        // STEP 3: Full scan with decryption for notes missing search_text
         // This catches notes where search_text is not populated
         // Also auto-repairs by populating search_text for future searches
         if (matchingNotes.length < maxLimit) {
@@ -3741,8 +3875,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               if (!note.search_text || note.search_text.trim() === '' || !matchesAllTerms(note.search_text)) {
                 notesRepaired++;
                 try {
+                  // Update search_text column
                   await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
                     .bind(searchableText, note.id).run();
+                  // Also update FTS5 index
+                  await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                  await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                    .bind(note.id, searchableText).run();
                 } catch {
                   // Repair failed, but we found the note anyway
                 }
@@ -3775,7 +3914,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               const fullScanInfo = notesRepaired > 0
                 ? `full_scan_repaired_${notesRepaired}`
                 : 'full_scan';
-              searchMethod = searchMethod === 'none' || searchMethod.startsWith('like_error')
+              searchMethod = searchMethod === 'none' || searchMethod.includes('error')
                 ? fullScanInfo
                 : `${searchMethod}+${fullScanInfo}`;
             }
@@ -3798,6 +3937,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         if (matchingNotes.length === 0) {
           let totalNotes = 0;
           let notesWithSearchText = 0;
+          let notesInFts = 0;
           try {
             const countResult = await env.DB.prepare(`
               SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
@@ -3809,15 +3949,23 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 AND search_text IS NOT NULL AND search_text != ''
             `).bind(tenantId, userId).first<{ cnt: number }>();
             notesWithSearchText = searchTextCountResult?.cnt || 0;
+
+            const ftsCountResult = await env.DB.prepare(`
+              SELECT COUNT(*) as cnt FROM notes_fts WHERE note_id IN (
+                SELECT id FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+              )
+            `).bind(tenantId, userId).first<{ cnt: number }>();
+            notesInFts = ftsCountResult?.cnt || 0;
           } catch { /* ignore */ }
 
           if (totalNotes === 0) {
             response.hint = 'No notes found for this user. Create some notes first.';
-          } else if (notesWithSearchText < totalNotes) {
-            response.hint = `No matching notes found. Some notes need indexing. Run nexus_rebuild_notes_fts to fix. (notes: ${totalNotes}, indexed: ${notesWithSearchText})`;
+          } else if (notesWithSearchText < totalNotes || notesInFts < totalNotes) {
+            response.hint = `No matching notes found. Index incomplete. Run nexus_rebuild_notes_fts to fix. (notes: ${totalNotes}, indexed: ${notesWithSearchText}, in_fts: ${notesInFts})`;
             response.diagnostics = {
               total_notes: totalNotes,
               with_search_text: notesWithSearchText,
+              in_fts_index: notesInFts,
               recommendation: 'Run nexus_rebuild_notes_fts with passphrase to rebuild the search index',
             };
           } else {
