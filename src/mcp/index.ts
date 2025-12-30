@@ -3546,22 +3546,22 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query for multi-word search
-        // For single words: use unquoted terms (porter stemmer will normalize)
+        // For single words: use column prefix for reliable matching in D1
         // For phrases: quote them to require exact sequence
-        // FTS5 uses implicit AND - space-separated terms require ALL to match
+        // D1's FTS5 requires column prefix for reliable multi-word matching
         const terms = searchTerms.map(({ term, isPhrase }) => {
           if (isPhrase) {
             // Quoted phrase - must match words in sequence
-            return `"${term}"`;
+            // Use column prefix for reliability
+            return `search_text:"${term}"`;
           } else {
-            // Single word - unquoted allows porter stemmer to work
-            // FTS5 will tokenize and stem the word for matching
-            return term;
+            // Single word with column prefix - porter stemmer will normalize
+            return `search_text:${term}`;
           }
         });
-        // Use implicit AND (space-separated terms) for FTS5 multi-word search
-        // Per SQLite FTS5 docs: "sequences separated by whitespace have implicit AND"
-        // This is the standard approach for matching documents containing ALL terms
+        // Use space-separated column-prefixed terms for FTS5 multi-word search
+        // Column prefix ensures each term is matched against the search_text column
+        // Space separation provides implicit AND (all terms must match)
         const ftsQuery = terms.join(' ');
 
         // Helper to check if all search terms match in a text (for fallback)

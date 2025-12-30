@@ -198,9 +198,9 @@ notes.get('/', async (c) => {
       }
 
       // Convert search query to FTS5 format
-      // For single words: use unquoted terms (porter stemmer will normalize)
+      // For single words: use column prefix for reliable matching in D1
       // For phrases: quote them to require exact sequence
-      // Use explicit AND operator between terms for maximum compatibility
+      // D1's FTS5 requires column prefix for reliable multi-word matching
       const ftsTerms: string[] = [];
       const trimmedSearch = search.trim();
 
@@ -218,8 +218,8 @@ notes.get('/', async (c) => {
             // MUST lowercase because porter tokenizer normalizes to lowercase
             const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
             if (escaped.length > 0) {
-              // Unquoted single words - porter stemmer will normalize
-              ftsTerms.push(escaped);
+              // Use column prefix for reliable matching in D1
+              ftsTerms.push(`search_text:${escaped}`);
             }
           }
         }
@@ -227,8 +227,9 @@ notes.get('/', async (c) => {
         const phrase = match[1]!.trim();
         if (phrase.length > 0) {
           // Escape any quotes within the phrase and lowercase for porter tokenizer
+          // Use column prefix for reliability
           const escapedPhrase = phrase.replace(/"/g, '').toLowerCase();
-          ftsTerms.push(`"${escapedPhrase}"`);
+          ftsTerms.push(`search_text:"${escapedPhrase}"`);
         }
         lastIndex = match.index + match[0].length;
       }
@@ -241,14 +242,15 @@ notes.get('/', async (c) => {
           // MUST lowercase because porter tokenizer normalizes to lowercase
           const escaped = word.replace(/[*^"():]/g, '').toLowerCase();
           if (escaped.length > 0) {
-            // Unquoted single words - porter stemmer will normalize
-            ftsTerms.push(escaped);
+            // Use column prefix for reliable matching in D1
+            ftsTerms.push(`search_text:${escaped}`);
           }
         }
       }
 
-      // FTS5 query with implicit AND (space-separated terms) for multi-word search
-      // Per SQLite FTS5 docs: "sequences separated by whitespace have implicit AND"
+      // FTS5 query with space-separated column-prefixed terms for multi-word search
+      // Column prefix ensures each term is matched against the search_text column
+      // Space separation provides implicit AND (all terms must match)
       const ftsQuery = ftsTerms.length > 0 ? ftsTerms.join(' ') : '';
 
       if (ftsQuery) {
