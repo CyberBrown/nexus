@@ -78,6 +78,41 @@ const CODE_TASK_PATTERNS = [
   /^\[CC\]/i,
 ];
 
+// Failure indicators in AI responses that indicate the task wasn't actually completed
+// These phrases suggest the AI couldn't accomplish the task even if it responded successfully
+const FAILURE_INDICATORS = [
+  "couldn't find",
+  "could not find",
+  "doesn't have",
+  "does not have",
+  "not found",
+  "failed to",
+  "error:",
+  "unable to",
+  "no such file",
+  "doesn't exist",
+  "does not exist",
+  "cannot find",
+  "can't find",
+  "missing",
+  "not available",
+  "no access",
+  "permission denied",
+  "i don't have access",
+  "i cannot access",
+  "isn't available",
+  "is not available",
+];
+
+/**
+ * Check if an AI response contains failure indicators
+ * Returns true if the response suggests the task wasn't actually completed
+ */
+function containsFailureIndicators(text: string): boolean {
+  const lowerText = text.toLowerCase();
+  return FAILURE_INDICATORS.some(indicator => lowerText.includes(indicator));
+}
+
 export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorParams> {
   override async run(event: WorkflowEvent<TaskExecutorParams>, step: WorkflowStep) {
     const { task_id, tenant_id, user_id, idea_id, execution_id } = event.payload;
@@ -363,6 +398,16 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
 
         if (!data.success || !data.text) {
           throw new Error('DE returned empty response');
+        }
+
+        // Check if the AI response contains failure indicators
+        // This catches cases where the AI "succeeds" but says "I couldn't find..." or similar
+        if (containsFailureIndicators(data.text)) {
+          console.log(`Task execution response contains failure indicators: ${data.text.substring(0, 200)}`);
+          return {
+            success: false,
+            output: data.text,
+          };
         }
 
         return {
