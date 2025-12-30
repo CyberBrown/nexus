@@ -3579,11 +3579,12 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           };
         }
 
-        // Build FTS5 query with explicit AND operator
-        // SQLite FTS5 defaults to OR for space-separated terms, so we must use explicit AND
-        // Example: 'mcp AND validation' matches documents containing BOTH terms
-        // Quoted phrases (for exact matching) are already quoted in ftsTerms
-        const ftsQuery = ftsTerms.join(' AND ');
+        // Build FTS5 query using OR (implicit with space separation)
+        // D1's FTS5 has issues with explicit AND operator, so we use OR for broad matching
+        // then rely on post-filtering (matchesAllTerms) to ensure all terms match.
+        // This approach is more reliable: FTS5 finds candidates, post-filter verifies all terms.
+        // Quoted phrases (for exact matching) are already quoted in ftsTerms.
+        const ftsQuery = ftsTerms.join(' OR ');
 
         // Helper to check if all search terms match in a text
         const matchesAllTerms = (text: string): boolean => {
