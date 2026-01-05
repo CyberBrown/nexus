@@ -3760,13 +3760,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           // Query FTS5 index using subquery approach (more reliable in D1)
           // Filter by tenant_id and user_id for security
-          // IMPORTANT: Explicitly use search_text column in MATCH for D1 compatibility
-          // D1's FTS5 can have issues with implicit column matching for multi-term queries
+          // IMPORTANT: Use table name (notes_fts) in MATCH for D1 compatibility
+          // When FTS5 has a single indexed column, match against the table name directly
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
             FROM notes n
             WHERE n.id IN (
-              SELECT note_id FROM notes_fts WHERE search_text MATCH ?
+              SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
             )
               AND n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
               ${archivedCondition}
