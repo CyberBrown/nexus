@@ -3735,33 +3735,32 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         }
 
         // Build FTS5 query outside try block so it's available in response for debugging
-        // FTS5 syntax: {column}:{term} ensures D1 properly routes to the indexed column
+        // FTS5 with explicit AND operators for multi-term search
         // Porter stemmer handles word variations (e.g., "validate" matches "validation")
         // IMPORTANT: FTS5 space-separated terms match as a PHRASE (adjacent words in order).
         // To match terms appearing ANYWHERE in the document, use explicit AND operators.
+        // NOTE: Do NOT use column prefix (search_text:term) - it can cause issues with AND queries in D1.
         const ftsQueryString = searchTerms
           .map(term => {
             const cleaned = term.replace(/["']/g, '');
             // Check if this was originally a quoted phrase (contains space)
             if (term.includes(' ')) {
               // Quoted phrase - wrap in quotes for exact phrase matching
-              // Use column prefix for D1 compatibility
-              return `search_text:"${cleaned}"`;
+              return `"${cleaned}"`;
             }
-            // Plain term with column prefix - FTS5 will apply porter stemmer
-            return `search_text:${cleaned}`;
+            // Plain term - FTS5 will apply porter stemmer
+            return cleaned;
           })
           .join(' AND ');  // Use explicit AND for multi-term searches
 
         // PRIMARY SEARCH: FTS5 MATCH query for efficient multi-word search
         // Uses the notes_fts virtual table with porter stemming for word matching
-        // FTS5 requires explicit AND operators for multi-term searches
+        // Query format: "term1 AND term2" (no column prefix) for D1 compatibility
         try {
           console.log(`[nexus_search_notes] FTS5 search: query="${ftsQueryString}"`);
 
           // Query FTS5 index using subquery approach (more reliable in D1)
           // Filter by tenant_id and user_id for security
-          // The MATCH clause uses the full FTS5 query with column prefixes
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
             FROM notes n
