@@ -41,6 +41,49 @@ async function safeDecrypt(value: unknown, key: CryptoKey | null): Promise<strin
   }
 }
 
+/**
+ * Detect if a string looks like encrypted content (base64-encoded AES-GCM).
+ * Old encrypted content was stored as base64 with 12-byte IV prefix.
+ * This helps identify notes that can't be searched due to lost encryption keys.
+ */
+function looksLikeEncryptedContent(value: string | null | undefined): boolean {
+  if (!value || typeof value !== 'string') return false;
+
+  // Encrypted content is base64-encoded, typically 20+ chars for even short text
+  // Check if it's a valid base64 string that doesn't look like natural text
+  if (value.length < 20) return false;
+
+  // Base64 regex: only contains A-Za-z0-9+/= and has proper padding
+  const base64Regex = /^[A-Za-z0-9+/]+=*$/;
+  if (!base64Regex.test(value)) return false;
+
+  // If it passes base64 check, verify it doesn't look like normal text
+  // Normal text has spaces, punctuation, lowercase letters more than uppercase
+  const hasSpaces = value.includes(' ');
+  const hasCommonPunctuation = /[.,!?;:\-'"]/.test(value);
+  const lowercaseRatio = (value.match(/[a-z]/g) || []).length / value.length;
+
+  // If it has spaces, common punctuation, or high lowercase ratio, it's probably text
+  if (hasSpaces || hasCommonPunctuation || lowercaseRatio > 0.5) return false;
+
+  // Likely encrypted base64 content
+  return true;
+}
+
+/**
+ * Get searchable text from a note, handling both plaintext and encrypted content.
+ * Returns the text if searchable, or null if the content appears to be encrypted.
+ */
+function getSearchableText(title: string | null, content: string | null, tags: string | null): string | null {
+  // Check if title or content looks encrypted
+  if (looksLikeEncryptedContent(title) || looksLikeEncryptedContent(content)) {
+    return null; // Can't search encrypted content
+  }
+
+  // Build searchable text from plaintext fields
+  return [title || '', content || '', tags || ''].join(' ').trim().toLowerCase();
+}
+
 // ========================================
 // EXECUTOR ROUTING NOTES
 // ========================================
@@ -3606,14 +3649,19 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
             }>();
 
             if (sampleNote && sampleNote.search_text) {
-              // Decrypt and check if search_text matches actual content
-              const decryptedTitle = sampleNote.title ? await safeDecrypt(sampleNote.title, encryptionKey) : '';
+              // Use getSearchableText to get plaintext content
+              const expectedSearchText = getSearchableText(sampleNote.title, sampleNote.content, sampleNote.tags);
 
-              // If search_text doesn't contain key words from decrypted content, it's likely corrupted
-              const titleWords = decryptedTitle.toLowerCase().split(/\s+/).filter(w => w.length > 3);
-              if (titleWords.length > 0 && !titleWords.some(word => sampleNote.search_text!.includes(word))) {
-                console.log(`[nexus_search_notes] Sample note search_text appears corrupted, triggering rebuild`);
-                needsContentValidation = true;
+              if (expectedSearchText === null) {
+                // Content is encrypted - can't validate, skip
+              } else if (expectedSearchText) {
+                // Extract significant words from expected search text
+                const expectedWords = expectedSearchText.split(/\s+/).filter(w => w.length > 3);
+                // Check if search_text contains these words
+                if (expectedWords.length > 0 && !expectedWords.some(word => sampleNote.search_text!.includes(word))) {
+                  console.log(`[nexus_search_notes] Sample note search_text appears corrupted, triggering rebuild`);
+                  needsContentValidation = true;
+                }
               }
             }
           }
@@ -3637,10 +3685,16 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               id: string; title: string | null; content: string | null; tags: string | null; search_text: string | null;
             }>();
 
+            let encryptedSkipped = 0;
             for (const note of missingNotes.results || []) {
-              const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-              const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-              const searchText = [decryptedTitle, decryptedContent, note.tags || ''].join(' ').trim().toLowerCase();
+              // Use getSearchableText to detect and skip encrypted content
+              const searchText = getSearchableText(note.title, note.content, note.tags);
+
+              if (searchText === null) {
+                // Content appears encrypted - skip this note
+                encryptedSkipped++;
+                continue;
+              }
 
               if (searchText) {
                 try {
@@ -3651,11 +3705,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                   await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
                   await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
                     .bind(note.id, searchText).run();
+                  notesRebuilt++;
                 } catch { /* ignore individual insert errors */ }
               }
             }
-            notesRebuilt = missingNotes.results?.length || 0;
-            console.log(`[nexus_search_notes] Rebuilt search index for ${notesRebuilt} notes`);
+            console.log(`[nexus_search_notes] Rebuilt search index for ${notesRebuilt} notes (${encryptedSkipped} skipped as encrypted)`);
           }
         } catch (err) {
           console.error('[nexus_search_notes] FTS setup/rebuild error (will continue to fallback):', err);
@@ -3820,8 +3874,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           }
         }
 
-        // FALLBACK 2: Full scan with decryption if both FTS5 and LIKE failed
+        // FALLBACK 2: Full scan if both FTS5 and LIKE failed
         // This handles cases where search_text is not populated for some notes
+        // Also detects encrypted content that can't be searched
+        let encryptedNotesSkipped = 0;
         if (matchingNotes.length === 0 && searchTerms.length > 0) {
           try {
             console.log(`[nexus_search_notes] Full-scan fallback: scanning all notes`);
@@ -3851,18 +3907,43 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               }>) {
                 if (foundIds.has(note.id)) continue;
 
-                const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-                const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-                const tagsText = note.tags ? String(note.tags) : '';
+                // Check if content looks encrypted (base64) - if so, skip it
+                // Old encrypted notes can't be searched without the lost encryption key
+                const contentLooksEncrypted = looksLikeEncryptedContent(note.title) ||
+                                              looksLikeEncryptedContent(note.content);
 
-                const combinedText = `${decryptedTitle} ${decryptedContent} ${tagsText}`;
-                if (!matchesAllTerms(combinedText)) continue;
+                let searchableText: string;
+                let displayTitle: string;
+                let displayContent: string;
+
+                if (contentLooksEncrypted) {
+                  // Content is encrypted - check if search_text is usable (plaintext)
+                  if (note.search_text && !looksLikeEncryptedContent(note.search_text)) {
+                    // search_text is plaintext, use it for matching
+                    searchableText = note.search_text;
+                    // For display, show placeholder since actual content is encrypted
+                    displayTitle = '[Encrypted Note]';
+                    displayContent = 'This note has encrypted content that cannot be displayed.';
+                  } else {
+                    // Both content and search_text are encrypted - skip this note
+                    encryptedNotesSkipped++;
+                    continue;
+                  }
+                } else {
+                  // Content is plaintext - use it directly
+                  displayTitle = note.title || '';
+                  displayContent = note.content || '';
+                  const tagsText = note.tags ? String(note.tags) : '';
+                  searchableText = `${displayTitle} ${displayContent} ${tagsText}`.toLowerCase();
+                }
+
+                if (!matchesAllTerms(searchableText)) continue;
 
                 matchingNotes.push({
                   id: note.id,
-                  title: decryptedTitle,
-                  content_preview: decryptedContent
-                    ? decryptedContent.substring(0, 200) + (decryptedContent.length > 200 ? '...' : '')
+                  title: displayTitle,
+                  content_preview: displayContent
+                    ? displayContent.substring(0, 200) + (displayContent.length > 200 ? '...' : '')
                     : '',
                   category: note.category,
                   tags: note.tags,
@@ -3873,21 +3954,23 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
                 });
                 foundIds.add(note.id);
 
-                // Auto-repair: populate search_text and FTS index for this note
-                const searchText = combinedText.toLowerCase();
-                if (!note.search_text || note.search_text !== searchText) {
-                  try {
-                    await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
-                      .bind(searchText, note.id).run();
-                    await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
-                    await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
-                      .bind(note.id, searchText).run();
-                  } catch { /* ignore auto-repair errors */ }
+                // Auto-repair: populate search_text and FTS index for plaintext notes only
+                if (!contentLooksEncrypted) {
+                  const normalizedSearchText = searchableText.toLowerCase();
+                  if (!note.search_text || note.search_text !== normalizedSearchText) {
+                    try {
+                      await env.DB.prepare(`UPDATE notes SET search_text = ? WHERE id = ?`)
+                        .bind(normalizedSearchText, note.id).run();
+                      await env.DB.prepare(`DELETE FROM notes_fts WHERE note_id = ?`).bind(note.id).run();
+                      await env.DB.prepare(`INSERT INTO notes_fts (note_id, search_text) VALUES (?, ?)`)
+                        .bind(note.id, normalizedSearchText).run();
+                    } catch { /* ignore auto-repair errors */ }
+                  }
                 }
 
                 if (matchingNotes.length >= maxLimit) break;
               }
-              console.log(`[nexus_search_notes] Full-scan found ${matchingNotes.length} results`);
+              console.log(`[nexus_search_notes] Full-scan found ${matchingNotes.length} results (${encryptedNotesSkipped} encrypted notes skipped)`);
             }
           } catch (err: any) {
             console.error('[nexus_search_notes] Full-scan fallback failed:', err);
@@ -3905,6 +3988,11 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           search_method: searchMethod,
           notes_rebuilt: notesRebuilt,  // How many notes were auto-indexed during this search
         };
+
+        // Include encrypted notes count if any were skipped
+        if (encryptedNotesSkipped > 0) {
+          response.encrypted_notes_skipped = encryptedNotesSkipped;
+        }
 
         // Add helpful hints and diagnostic info
         if (matchingNotes.length === 0) {
@@ -3926,6 +4014,14 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           if (totalNotes === 0) {
             response.hint = 'No notes found for this user. Create some notes first.';
+          } else if (encryptedNotesSkipped > 0 && encryptedNotesSkipped === totalNotes) {
+            // All notes are encrypted
+            response.hint = `All ${totalNotes} notes have encrypted content that cannot be searched (encryption key was lost). These notes need to be re-created.`;
+            response.diagnostics = {
+              total_notes: totalNotes,
+              encrypted_notes: encryptedNotesSkipped,
+              recommendation: 'Old encrypted notes cannot be recovered. Create new notes to replace them.',
+            };
           } else if (notesInFts < totalNotes) {
             const stillNeeded = totalNotes - notesInFts;
             response.hint = notesRebuilt > 0
@@ -3935,12 +4031,15 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               total_notes: totalNotes,
               in_fts_index: notesInFts,
               notes_still_needing_index: stillNeeded,
+              encrypted_notes_skipped: encryptedNotesSkipped,
               recommendation: stillNeeded > 100
                 ? 'Run nexus_rebuild_notes_fts with passphrase to fully rebuild the search index'
                 : 'Try searching again - auto-indexing will continue',
             };
           } else {
-            response.hint = `No matching notes found. ${totalNotes} notes exist. Try simpler search terms or check spelling.`;
+            response.hint = encryptedNotesSkipped > 0
+              ? `No matching notes found. ${totalNotes} notes exist (${encryptedNotesSkipped} encrypted and unsearchable). Try simpler search terms or check spelling.`
+              : `No matching notes found. ${totalNotes} notes exist. Try simpler search terms or check spelling.`;
           }
         }
 
@@ -4028,15 +4127,18 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
         let errors = 0;
         const errorDetails: string[] = [];
 
+        let skippedEncrypted = 0;
         for (const note of notes.results || []) {
           try {
-            // Decrypt fields
-            const decryptedTitle = note.title ? await safeDecrypt(note.title, encryptionKey) : '';
-            const decryptedContent = note.content ? await safeDecrypt(note.content, encryptionKey) : '';
-            const tags = note.tags || '';
+            // Use getSearchableText to detect and skip encrypted content
+            // This handles notes that were stored when encryption was enabled
+            const searchText = getSearchableText(note.title, note.content, note.tags);
 
-            // Build search text - MUST lowercase for D1's case-sensitive FTS5
-            const searchText = [decryptedTitle, decryptedContent, tags].join(' ').trim().toLowerCase();
+            if (searchText === null) {
+              // Content appears encrypted - skip this note
+              skippedEncrypted++;
+              continue;
+            }
 
             if (searchText) {
               // Update notes table search_text column
@@ -4064,9 +4166,10 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               success: true,
               total_notes: notes.results?.length || 0,
               indexed,
+              skipped_encrypted: skippedEncrypted,
               errors,
               error_details: errorDetails.length > 0 ? errorDetails.slice(0, 10) : undefined,
-              message: `FTS index rebuilt. ${indexed} notes indexed, ${errors} errors.`,
+              message: `FTS index rebuilt. ${indexed} notes indexed, ${skippedEncrypted} skipped (encrypted), ${errors} errors.`,
             }, null, 2)
           }]
         };
