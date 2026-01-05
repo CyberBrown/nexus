@@ -3734,34 +3734,33 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           console.error('[nexus_search_notes] FTS setup/rebuild error (will continue to fallback):', err);
         }
 
+        // Build FTS5 query outside try block so it's available in response for debugging
+        // FTS5 with explicit AND operators for multi-term search
+        // Porter stemmer handles word variations (e.g., "validate" matches "validation")
+        // IMPORTANT: FTS5 space-separated terms match as a PHRASE (adjacent words in order).
+        // To match terms appearing ANYWHERE in the document, use explicit AND operators.
+        // NOTE: Do NOT use column prefix (search_text:term) - it can cause issues with AND queries in D1.
+        const ftsQueryString = searchTerms
+          .map(term => {
+            const cleaned = term.replace(/["']/g, '');
+            // Check if this was originally a quoted phrase (contains space)
+            if (term.includes(' ')) {
+              // Quoted phrase - wrap in quotes for exact phrase matching
+              return `"${cleaned}"`;
+            }
+            // Plain term - FTS5 will apply porter stemmer
+            return cleaned;
+          })
+          .join(' AND ');  // Use explicit AND for multi-term searches
+
         // PRIMARY SEARCH: FTS5 MATCH query for efficient multi-word search
         // Uses the notes_fts virtual table with porter stemming for word matching
-        // FTS5 requires explicit AND operators for multi-term searches
+        // Query format: "term1 AND term2" (no column prefix) for D1 compatibility
         try {
-          // Build FTS5 query using explicit AND operators for multi-word search
-          // Since notes_fts only has one indexed column (search_text), FTS5 searches it by default
-          // Porter stemmer handles word variations (e.g., "validate" matches "validation")
-          // IMPORTANT: FTS5 space-separated terms match as a PHRASE (adjacent words in order).
-          // To match terms appearing ANYWHERE in the document, use explicit AND operators.
-          const ftsQuery = searchTerms
-            .map(term => {
-              const cleaned = term.replace(/["']/g, '');
-              // Check if this was originally a quoted phrase (contains space)
-              if (term.includes(' ')) {
-                // Quoted phrase - wrap in quotes for exact phrase matching
-                return `"${cleaned}"`;
-              }
-              // Plain term - FTS5 will apply porter stemmer
-              return cleaned;
-            })
-            .join(' AND ');  // Use explicit AND for multi-term searches
-
-          console.log(`[nexus_search_notes] FTS5 search: query="${ftsQuery}"`);
+          console.log(`[nexus_search_notes] FTS5 search: query="${ftsQueryString}"`);
 
           // Query FTS5 index using subquery approach (more reliable in D1)
           // Filter by tenant_id and user_id for security
-          // IMPORTANT: Use table name (notes_fts) in MATCH for D1 compatibility
-          // When FTS5 has a single indexed column, match against the table name directly
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
             FROM notes n
@@ -3772,7 +3771,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               ${archivedCondition}
             ORDER BY n.pinned DESC, n.created_at DESC
             LIMIT ?
-          `).bind(ftsQuery, tenantId, userId, maxLimit * 2).all();
+          `).bind(ftsQueryString, tenantId, userId, maxLimit * 2).all();
 
           console.log(`[nexus_search_notes] FTS5 search returned ${ftsResults.results?.length || 0} results`);
 
@@ -4004,6 +4003,7 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
           success: true,
           query: query,
           search_terms: searchTerms,
+          fts_query: ftsQueryString,  // The actual FTS5 query used (for debugging)
           count: matchingNotes.length,
           notes: matchingNotes,
           search_method: searchMethod,

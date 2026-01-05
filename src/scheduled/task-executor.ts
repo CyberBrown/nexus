@@ -13,7 +13,7 @@
 
 import type { Env, Task } from '../types/index.ts';
 import { getEncryptionKey, decryptField } from '../lib/encryption.ts';
-import { isOAuthError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
+import { isOAuthError, isRoutingError, sendOAuthExpirationAlert, sendQuarantineAlert } from '../lib/notifications.ts';
 import {
   type ExecutorType,
   hasUnmetDependencies,
@@ -312,7 +312,7 @@ export async function promoteDependentTasks(
   `).bind(tenantId, completedTaskId).all<{ task_id: string }>();
 
   if (!dependents.results || dependents.results.length === 0) {
-    return { promoted, dispatched };
+    return { promoted, dispatched: 0 };
   }
 
   console.log(`Found ${dependents.results.length} tasks depending on completed task ${completedTaskId}`);
