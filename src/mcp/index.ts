@@ -3636,10 +3636,29 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
               AND (search_text IS NULL OR search_text = '' OR TRIM(search_text) = '' OR id NOT IN (SELECT note_id FROM notes_fts))
           `).bind(tenantId, userId).first<{ cnt: number }>();
 
+          // Also check if FTS index is completely empty while notes exist
+          // This catches cases where migrations ran but FTS never got populated
+          const totalNotes = await env.DB.prepare(`
+            SELECT COUNT(*) as cnt FROM notes WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL
+          `).bind(tenantId, userId).first<{ cnt: number }>();
+
+          const ftsIndexCount = await env.DB.prepare(`
+            SELECT COUNT(*) as cnt FROM notes_fts WHERE note_id IN (
+              SELECT id FROM notes WHERE tenant_id = ? AND user_id = ?
+            )
+          `).bind(tenantId, userId).first<{ cnt: number }>();
+
           // Also check if search_text content is valid by sampling a note
           // This catches cases where search_text contains encrypted/garbage data
           let needsContentValidation = false;
-          if ((notesNeedingRebuild?.cnt || 0) === 0) {
+
+          // Force rebuild if FTS index is empty but notes exist
+          if ((totalNotes?.cnt || 0) > 0 && (ftsIndexCount?.cnt || 0) === 0) {
+            console.log(`[nexus_search_notes] FTS index is empty but ${totalNotes?.cnt} notes exist - forcing rebuild`);
+            needsContentValidation = true;
+          }
+
+          if (!needsContentValidation && (notesNeedingRebuild?.cnt || 0) === 0) {
             const sampleNote = await env.DB.prepare(`
               SELECT id, title, content, tags, search_text FROM notes
               WHERE tenant_id = ? AND user_id = ? AND deleted_at IS NULL AND search_text IS NOT NULL
@@ -3741,11 +3760,13 @@ export function createNexusMcpServer(env: Env, tenantId: string, userId: string)
 
           // Query FTS5 index using subquery approach (more reliable in D1)
           // Filter by tenant_id and user_id for security
+          // IMPORTANT: Explicitly use search_text column in MATCH for D1 compatibility
+          // D1's FTS5 can have issues with implicit column matching for multi-term queries
           const ftsResults = await env.DB.prepare(`
             SELECT n.id, n.title, n.content, n.category, n.tags, n.source_type, n.pinned, n.archived_at, n.created_at
             FROM notes n
             WHERE n.id IN (
-              SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?
+              SELECT note_id FROM notes_fts WHERE search_text MATCH ?
             )
               AND n.tenant_id = ? AND n.user_id = ? AND n.deleted_at IS NULL
               ${archivedCondition}
