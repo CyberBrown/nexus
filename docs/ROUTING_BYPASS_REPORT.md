@@ -1,11 +1,18 @@
 # Nexus → DE Routing Architecture Investigation
 
 **Date:** 2025-12-27
-**Status:** CONFIRMED BYPASS
+**Status:** ✅ FIXED (2026-01-05)
 
 ## Summary
 
-Nexus is **bypassing PrimeWorkflow** in two locations. There are **zero references** to calling `de-workflows.../execute` anywhere in the codebase.
+~~Nexus is **bypassing PrimeWorkflow** in two locations. There are **zero references** to calling `de-workflows.../execute` anywhere in the codebase.~~
+
+**FIXED:** Nexus now routes all code execution through `POST /execute` on de-workflows, which goes through PrimeWorkflow for proper classification and sub-workflow routing.
+
+### Changes Made:
+1. `src/workflows/TaskExecutorWorkflow.ts` - Changed from INTAKE_URL/intake to DE_WORKFLOWS_URL/execute
+2. `wrangler.toml` and `wrangler.nexus-mcp.toml` - Enabled DE_WORKFLOWS_URL, deprecated INTAKE_URL
+3. `src/types/index.ts` - Updated comments to reflect DE_WORKFLOWS_URL as primary entry point
 
 ---
 

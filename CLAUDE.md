@@ -82,26 +82,37 @@ console.log(response.content);
 
 **Important:** Never call LLM providers directly. Always use the DE client.
 
-## DE Routing Architecture (Dec 2024)
+## DE Routing Architecture (Updated Jan 2026)
 
 **CRITICAL: All code execution must go through the correct routing path.**
 
 ### Correct Path
 ```
-Nexus → POST /execute → PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
-       (de-workflows)
+Nexus → POST /execute (de-workflows) → PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
 ```
 
 ### How Nexus Triggers Code Execution
 
-1. **Via Intake Service Binding (preferred):**
-   - `src/scheduled/task-executor.ts` uses `IntakeClient`
-   - Calls `env.INTAKE.fetch('https://intake/intake', ...)` via service binding
-   - Intake routes to PrimeWorkflow automatically
+**Primary Method - DE Workflows URL:**
+- `src/workflows/TaskExecutorWorkflow.ts` calls `${env.DE_WORKFLOWS_URL}/execute`
+- Routes through PrimeWorkflow for proper task classification
+- PrimeWorkflow determines task type and routes to appropriate sub-workflow
 
-2. **Via HTTP to de-workflows (fallback):**
-   - `src/mcp/index.ts` auto_dispatch uses `${env.DE_WORKFLOWS_URL}/execute`
-   - Must always call `/execute`, NEVER `/workflows/*` endpoints
+**Request Format (PrimeWorkflowParams):**
+```typescript
+{
+  id: task_id,
+  params: {
+    task_id: string,
+    title: string,
+    description: string,
+    context: { repo?: string, branch?: string },
+    hints: { workflow?: 'code-execution' },
+    callback_url: string,
+    timeout_ms: number
+  }
+}
+```
 
 ### Blocked Endpoints (403)
 
@@ -110,17 +121,23 @@ Direct calls to workflow endpoints are BLOCKED:
 - ❌ `POST /workflows/text-generation` → Returns 403 `USE_EXECUTE_ENDPOINT`
 - ✅ `POST /execute` → Correct single entry point
 
+### Deprecated Methods
+
+The following are DEPRECATED and should NOT be used:
+- ❌ INTAKE_URL/intake - Bypasses PrimeWorkflow, routes directly to CodeExecutionWorkflow
+- ❌ SANDBOX_EXECUTOR_URL - Direct sandbox access, bypasses all workflow routing
+
 ### Error Indicators
 
-These errors suggest routing issues (Nexus calling wrong endpoints):
+These errors suggest routing issues:
 - `ALL_RUNNERS_FAILED` - Sandbox-executor exhausted retries
 - `RUNNER_UNREACHABLE` - Both Claude and Gemini runners failed
 - `USE_EXECUTE_ENDPOINT` - Direct 403 from blocked endpoint
 
 If you see these errors, check:
-1. Nexus is calling `/execute` not `/workflows/*`
+1. Nexus is calling `/execute` not `/workflows/*` or `/intake`
 2. DE_WORKFLOWS_URL is set correctly in wrangler.toml
-3. Intake service binding is configured
+3. Request payload matches PrimeWorkflowParams format
 
 ### Reference
 See Nexus note `8915b506-1caa-46d7-8f42-b6ba2c282788` for full architecture details.

@@ -18,11 +18,14 @@ ENVIRONMENT = "development"
 NEXUS_URL = "https://nexus-mcp.solamp.workers.dev"
 # DE text-gen URL for workflows (workflows can't use service bindings)
 TEXT_GEN_URL = "https://de-text-gen.solamp.workers.dev"
-# INTAKE URL for workflows (workflows can't use service bindings)
-INTAKE_URL = "https://intake.solamp.workers.dev"
-# DEPRECATED: Use INTAKE service binding or INTAKE_URL instead
+# DE Workflows URL - PRIMARY entry point for all task execution
+# Routes through PrimeWorkflow for proper classification and routing
+# Nexus → POST /execute (de-workflows) → PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
+DE_WORKFLOWS_URL = "https://de-workflows.solamp.workers.dev"
+# DEPRECATED: Use DE_WORKFLOWS_URL instead - intake bypasses PrimeWorkflow
+# INTAKE_URL = "https://intake.solamp.workers.dev"
+# DEPRECATED: Use DE_WORKFLOWS_URL instead
 # SANDBOX_EXECUTOR_URL = "https://sandbox-executor.solamp.workers.dev"
-# DE_WORKFLOWS_URL = "https://de-workflows.solamp.workers.dev"
 # Cloudflare Access - set these for production auth
 # TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 # POLICY_AUD = "your-application-audience-tag"

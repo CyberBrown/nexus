@@ -36,13 +36,16 @@ export interface Env {
   NEXUS_URL?: string;
   // DE text-gen URL (for workflows that can't use service bindings)
   TEXT_GEN_URL?: string;
-  // INTAKE URL for workflows (HTTP fallback when service binding unavailable)
+  // DE Workflows URL - PRIMARY entry point for all task execution
+  // Routes through PrimeWorkflow which handles classification and sub-workflow routing
+  // Nexus → POST /execute (de-workflows) → PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
+  DE_WORKFLOWS_URL?: string;
+  // INTAKE URL for workflows (DEPRECATED - use DE_WORKFLOWS_URL instead)
+  // The intake worker bypasses PrimeWorkflow; use DE_WORKFLOWS_URL for proper routing
   INTAKE_URL?: string;
-  // Sandbox executor URL for task execution (DEPRECATED - use INTAKE)
+  // Sandbox executor URL for task execution (DEPRECATED - use DE_WORKFLOWS_URL)
   SANDBOX_EXECUTOR_URL?: string;
   SANDBOX_AUTH_TOKEN?: string;
-  // DE Workflows URL (DEPRECATED - use INTAKE)
-  DE_WORKFLOWS_URL?: string;
   // Fallback Anthropic API key (for environments without DE)
   ANTHROPIC_API_KEY?: string;
   // Write passphrase for MCP destructive operations

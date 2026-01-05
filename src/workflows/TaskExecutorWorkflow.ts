@@ -455,8 +455,12 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
   }
 
   /**
-   * Execute a code task via INTAKE (routes to PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor)
-   * Workflows can't use service bindings, so we use INTAKE_URL for HTTP access.
+   * Execute a code task via DE Workflows (routes to PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor)
+   * Workflows can't use service bindings, so we use DE_WORKFLOWS_URL for HTTP access.
+   *
+   * ROUTING ARCHITECTURE:
+   * Nexus → POST /execute (de-workflows) → PrimeWorkflow → CodeExecutionWorkflow → sandbox-executor
+   * This ensures all requests go through the unified entry point with proper classification.
    */
   private async executeWithSandbox(
     step: WorkflowStep,
@@ -464,7 +468,7 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
     ideaContext: IdeaContext
   ): Promise<ExecutionResult> {
     return step.do(
-      'execute-with-intake',
+      'execute-with-de-workflows',
       {
         retries: {
           limit: 2,
@@ -474,9 +478,9 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
         timeout: '10 minutes', // Code tasks can take longer
       },
       async () => {
-        const intakeUrl = this.env.INTAKE_URL;
-        if (!intakeUrl) {
-          throw new Error('INTAKE_URL not configured. Set INTAKE_URL in wrangler.toml [vars]');
+        const deWorkflowsUrl = this.env.DE_WORKFLOWS_URL;
+        if (!deWorkflowsUrl) {
+          throw new Error('DE_WORKFLOWS_URL not configured. Set DE_WORKFLOWS_URL in wrangler.toml [vars]');
         }
 
         // Parse repo/branch from task fields or description
@@ -485,55 +489,58 @@ export class TaskExecutorWorkflow extends WorkflowEntrypoint<Env, TaskExecutorPa
         // Build the task prompt
         const taskPrompt = buildCodeTaskPrompt(task, ideaContext);
 
-        // INTAKE request format
-        const intakeRequest = {
-          query: `Execute code task: ${task.title}`,
-          task_type: 'code',
-          task_id: task.id,
-          prompt: taskPrompt,
-          repo_url: repoInfo.repo ? `https://github.com/${repoInfo.repo}` : undefined,
-          callback_url: `${this.env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev'}/workflow-callback`,
-          timeout_ms: 600000, // 10 minutes
-          metadata: {
-            idea_id: task.idea_id,
-            idea_title: ideaContext.title,
-            branch: repoInfo.branch || 'main',
-            commit_message: task.commit_message || task.title.slice(0, 50),
+        // PrimeWorkflow request format (POST /execute)
+        // This routes through PrimeWorkflow which handles classification and sub-workflow routing
+        const primeWorkflowRequest = {
+          id: task.id,
+          params: {
+            task_id: task.id,
+            title: task.title,
+            description: taskPrompt,
+            context: {
+              repo: repoInfo.repo || undefined,
+              branch: repoInfo.branch || 'main',
+            },
+            hints: {
+              workflow: 'code-execution',
+            },
+            callback_url: `${this.env.NEXUS_URL || 'https://nexus-mcp.solamp.workers.dev'}/workflow-callback`,
+            timeout_ms: 600000, // 10 minutes
           },
         };
 
-        console.log(`Calling INTAKE for code task: ${task.id}, repo: ${repoInfo.repo}`);
+        console.log(`Calling DE Workflows /execute for code task: ${task.id}, repo: ${repoInfo.repo}`);
 
-        const response = await fetch(`${intakeUrl}/intake`, {
+        const response = await fetch(`${deWorkflowsUrl}/execute`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify(intakeRequest),
+          body: JSON.stringify(primeWorkflowRequest),
         });
 
         if (!response.ok) {
           const error = await response.text();
-          throw new Error(`INTAKE error: ${response.status} - ${error}`);
+          throw new Error(`DE Workflows error: ${response.status} - ${error}`);
         }
 
         const data = await response.json() as {
           success: boolean;
-          request_id?: string;
-          workflow_instance_id?: string;
+          execution_id?: string;
+          status?: string;
           error?: string;
         };
 
         if (!data.success) {
-          throw new Error(data.error || 'INTAKE returned failure');
+          throw new Error(data.error || 'DE Workflows returned failure');
         }
 
-        // INTAKE triggers async workflow - mark as 'dispatched' (not completed)
+        // PrimeWorkflow triggers async execution - mark as 'dispatched' (not completed)
         // The workflow callback will update the final status when execution completes
         // IMPORTANT: Return success=false with a special status to prevent premature completion
         return {
           success: false, // Not yet complete - workflow is async
-          output: `DISPATCHED:${data.workflow_instance_id || data.request_id}`, // Special marker for dispatched state
+          output: `DISPATCHED:${data.execution_id}`, // Special marker for dispatched state
         };
       }
     );
